@@ -1,0 +1,11 @@
+[package]
+name = "kademlia-packet-manager-d7024e"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dashmap = "6.2.1"
+env_logger = "0.11.11"
+log = "0.4.34"
+rand = "0.10.2"
+tokio = {version = "1.53.*", features = ["full"]}
