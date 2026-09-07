@@ -7,7 +7,7 @@ use tokio::net::UdpSocket;
 const ID_LEN: usize = size_of::<u64>();
 
 #[non_exhaustive]
-struct UdpTransport {
+pub struct UdpTransport {
     socket: std::sync::Arc<UdpSocket>,
     pending: std::sync::Arc<Pending>,
 }
