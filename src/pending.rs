@@ -14,11 +14,19 @@ use tokio::sync::oneshot;
 #[derive(Default)]
 pub struct Pending {
     slots: DashMap<u64, oneshot::Sender<Vec<u8>>>,
+    counter: std::sync::atomic::AtomicU64,
 }
 
 impl Pending {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// Hand out the next request id. A counter rather than a random draw: ids
+    /// only have to be unique among this node's in-flight requests.
+    pub fn next_id(&self) -> u64 {
+        self.counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Register `id` as in-flight. Await the returned future to get the response.
@@ -56,7 +64,7 @@ impl Future for PendingResponse {
     type Output = Option<Vec<u8>>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Pin::new(&mut self.rx).poll(cx).map(Result::ok)
+        Pin::new(&mut self.rx).poll(cx).map(|res| res.ok())
     }
 }
 

@@ -42,7 +42,7 @@ impl UdpTransport {
 impl RpcTransport for UdpTransport {
     // TODO deal with unwrap properly ie change the transport to return Result instead of unwrapping
     async fn send_receive(&self, payload: Vec<u8>, address: SocketAddr) -> Vec<u8> {
-        let id = rand::random::<u64>();
+        let id = self.pending.next_id();
         let msg = self.pending.register(id);
         let mut datagram = Vec::with_capacity(ID_LEN + payload.len());
         datagram.extend_from_slice(&id.to_be_bytes());

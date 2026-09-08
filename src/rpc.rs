@@ -1,4 +1,4 @@
-use crate::close_nodes::{Contact, Key, NodeId};
+use crate::close_nodes::{CloseNodes, Contact, Key, NodeId};
 use crate::rpc_transport::RpcTransport;
 use std::net::SocketAddr;
 
@@ -12,26 +12,53 @@ pub enum FindValue {
 
 /// The four Kademlia RPCs, issued over some [`RpcTransport`].
 #[non_exhaustive]
-pub struct Rpc<T> {
+pub struct Rpc<T, A>
+where
+    T: RpcTransport,
+    A: CloseNodes,
+{
     transport: T,
+    close_nodes: A,
 }
 
-impl<T> Rpc<T> {
-    pub fn new(transport: T) -> Self {
-        Self { transport }
+impl<T, A> Rpc<T, A>
+where
+    T: RpcTransport,
+    A: CloseNodes,
+{
+    pub fn new(transport: T, close_nodes: A) -> Self {
+        Self {
+            transport,
+            close_nodes,
+        }
     }
 
     pub fn transport(&self) -> &T {
         &self.transport
     }
+
+    pub fn close_nodes(&self) -> &A {
+        &self.close_nodes
+    }
 }
 
 // TODO: drop this once the stubs below have real bodies.
 #[allow(unused_variables)]
-impl<T: RpcTransport> Rpc<T> {
+impl<T: RpcTransport, A: CloseNodes> Rpc<T, A> {
     /// Probe `peer` for liveness.
-    pub async fn ping(&self, peer: SocketAddr) {
-        todo!("encode PING, send_receive, decode the reply")
+    pub async fn ping(&self, peer: SocketAddr) -> bool {
+        // No request id in the body: the transport frames one and only ever
+        // resolves this future with the reply that carried it back.
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.transport.send_receive(b"PING".to_vec(), peer),
+        )
+        .await;
+
+        match res {
+            Ok(receive_payload) => receive_payload == b"PONG",
+            Err(_) => false,
+        }
     }
 
     /// Ask `peer` to store `value` under `key`.
