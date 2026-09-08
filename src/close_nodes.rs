@@ -1,3 +1,5 @@
+pub mod dumb_bucket;
+
 use std::net::SocketAddr;
 
 /// 160-bit Kademlia node id.
@@ -15,4 +17,32 @@ pub struct Contact {
 
 pub trait CloseNodes {
     fn close_nodes(&self, id: NodeId) -> Vec<Contact>;
+
+    fn maybe_add_contact(&self, contact: Contact);
+}
+
+/// Kademlia's replication parameter: how many contacts a lookup returns.
+pub const K: usize = 20;
+
+/// The XOR distance between `id` and `target`.
+///
+/// Byte 0 is the most significant: an id is a big-endian 160-bit unsigned
+/// integer, matching the `u64` request ids on the wire and the order a SHA-1
+/// digest already arrives in. Reading it from the other end would not be the
+/// XOR metric at all, so the direction is load-bearing — don't "fix" it.
+///
+/// It also means the derived lexicographic `Ord` on `[u8; 20]` *is* numeric
+/// ordering, so the returned distance sorts correctly as a plain sort key.
+pub fn xor_distance(id: NodeId, target: NodeId) -> [u8; 20] {
+    std::array::from_fn(|i| id[i] ^ target[i])
+}
+
+/// Orders `a` and `b` by [`xor_distance`] to `target`; the closer id sorts
+/// first. `Iterator::cmp` is lexicographic and lazy, so this compares the
+/// first differing byte without materializing either distance.
+pub fn xor_distance_cmp(a: NodeId, b: NodeId, target: NodeId) -> std::cmp::Ordering {
+    a.iter()
+        .zip(&target)
+        .map(|(x, t)| x ^ t)
+        .cmp(b.iter().zip(&target).map(|(y, t)| y ^ t))
 }
