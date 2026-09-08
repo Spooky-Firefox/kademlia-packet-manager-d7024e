@@ -10,7 +10,7 @@
 //! [`NetworkedDebugTransport`] is then the same transport as
 //! [`UdpTransport`](crate::udp_transport::UdpTransport), with an [`Endpoint`]
 //! in place of the socket: identical 8-byte id framing, identical
-//! [`Pending`] bookkeeping, and `RpcTransport<SocketAddr>` either way, so code
+//! [`Pending`] bookkeeping, and `RpcTransport` either way, so code
 //! written against one runs unchanged against the other.
 //!
 //! # Two devices on one network
@@ -265,7 +265,7 @@ impl NetworkedDebugTransport {
     }
 }
 
-impl RpcTransport<SocketAddr> for NetworkedDebugTransport {
+impl RpcTransport for NetworkedDebugTransport {
     async fn send_receive(&self, payload: Vec<u8>, address: SocketAddr) -> Vec<u8> {
         let id = rand::random::<u64>();
         let msg = self.pending.register(id);

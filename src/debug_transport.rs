@@ -1,5 +1,6 @@
 use dashmap::DashMap;
-use tokio::{net::unix::SocketAddr, sync::oneshot};
+use std::net::SocketAddr;
+use tokio::sync::oneshot;
 
 use crate::rpc_transport_trait::{self, RpcTransport};
 struct DebugTransport {
@@ -17,7 +18,7 @@ impl DebugTransport {
 }
 
 /// The socket address is not used
-impl RpcTransport<SocketAddr> for DebugTransport {
+impl RpcTransport for DebugTransport {
     async fn send_receive(&self, payload: Vec<u8>, address: SocketAddr) -> Vec<u8> {
         let (tx, rx) = oneshot::channel();
         let id = rand::random::<u64>();

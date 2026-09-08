@@ -39,7 +39,7 @@ impl UdpTransport {
     }
 }
 
-impl RpcTransport<SocketAddr> for UdpTransport {
+impl RpcTransport for UdpTransport {
     // TODO deal with unwrap properly ie change the transport to return Result instead of unwrapping
     async fn send_receive(&self, payload: Vec<u8>, address: SocketAddr) -> Vec<u8> {
         let id = rand::random::<u64>();
