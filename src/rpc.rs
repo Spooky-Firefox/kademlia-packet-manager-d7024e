@@ -51,12 +51,13 @@ impl<T: RpcTransport, A: CloseNodes> Rpc<T, A> {
         // resolves this future with the reply that carried it back.
         let res = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            self.transport.send_receive(b"PING".to_vec(), peer),
+            self.transport
+                .send_receive(crate::handle_rpc::Method::Ping.tag().to_vec(), peer),
         )
         .await;
 
         match res {
-            Ok(receive_payload) => receive_payload == b"PONG",
+            Ok(receive_payload) => receive_payload == crate::handle_rpc::ping::PONG,
             Err(_) => false,
         }
     }
