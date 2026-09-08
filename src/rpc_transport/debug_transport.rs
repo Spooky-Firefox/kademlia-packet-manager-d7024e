@@ -2,7 +2,7 @@ use dashmap::DashMap;
 use std::net::SocketAddr;
 use tokio::sync::oneshot;
 
-use crate::rpc_transport_trait::{self, RpcTransport};
+use crate::rpc_transport::RpcTransport;
 struct DebugTransport {
     map: std::sync::Arc<dashmap::DashMap<u64, (SocketAddr, Vec<u8>, oneshot::Sender<Vec<u8>>)>>,
 }

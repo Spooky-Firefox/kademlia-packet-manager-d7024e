@@ -1,5 +1,9 @@
 use std::net::SocketAddr;
 
+pub mod debug_transport;
+pub mod networked_debug_transport;
+pub mod udp_transport;
+
 pub trait RpcTransport {
     // warning, the responsibility to hande a non response is on the user
     //

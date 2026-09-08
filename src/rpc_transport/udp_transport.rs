@@ -1,4 +1,4 @@
-use crate::{pending::Pending, rpc_transport_trait::RpcTransport};
+use crate::{pending::Pending, rpc_transport::RpcTransport};
 use log::trace;
 use std::net::SocketAddr;
 use tokio::net::UdpSocket;

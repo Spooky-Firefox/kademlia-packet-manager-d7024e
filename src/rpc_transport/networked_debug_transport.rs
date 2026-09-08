@@ -8,7 +8,7 @@
 //! nobody is home — without touching a port or waiting on a real timeout.
 //!
 //! [`NetworkedDebugTransport`] is then the same transport as
-//! [`UdpTransport`](crate::udp_transport::UdpTransport), with an [`Endpoint`]
+//! [`UdpTransport`](crate::rpc_transport::udp_transport::UdpTransport), with an [`Endpoint`]
 //! in place of the socket: identical 8-byte id framing, identical
 //! [`Pending`] bookkeeping, and `RpcTransport` either way, so code
 //! written against one runs unchanged against the other.
@@ -25,8 +25,8 @@
 //! the bottom of this file exercise the same path.
 //!
 //! ```ignore
-//! use crate::networked_debug_transport::{Endpoint, Network, NetworkedDebugTransport};
-//! use crate::rpc_transport_trait::RpcTransport;
+//! use crate::rpc_transport::networked_debug_transport::{Endpoint, Network, NetworkedDebugTransport};
+//! use crate::rpc_transport::RpcTransport;
 //! use std::net::SocketAddr;
 //! use std::time::Duration;
 //!
@@ -66,7 +66,7 @@
 //! To watch a request fail instead, either aim it at an address nobody bound —
 //! the network swallows it, exactly like a datagram to a dead port — or build
 //! the network with [`Network::with_config`] and give it latency or loss.
-use crate::{pending::Pending, rpc_transport_trait::RpcTransport};
+use crate::{pending::Pending, rpc_transport::RpcTransport};
 use dashmap::DashMap;
 use log::trace;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -229,7 +229,7 @@ impl Drop for Endpoint {
     }
 }
 
-/// [`UdpTransport`](crate::udp_transport::UdpTransport) over a [`Network`].
+/// [`UdpTransport`](crate::rpc_transport::udp_transport::UdpTransport) over a [`Network`].
 #[non_exhaustive]
 pub struct NetworkedDebugTransport {
     endpoint: Arc<Endpoint>,

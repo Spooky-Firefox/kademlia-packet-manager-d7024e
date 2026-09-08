@@ -3,16 +3,13 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 
-mod close_nodes_trait;
-mod debug_transport;
-mod networked_debug_transport;
+mod close_nodes;
 mod pending;
 mod rpc;
-mod rpc_transport_trait;
-mod udp_transport;
+mod rpc_transport;
 
-use rpc_transport_trait::RpcTransport;
-use udp_transport::UdpTransport;
+use rpc_transport::RpcTransport;
+use rpc_transport::udp_transport::UdpTransport;
 
 /// Stand-in for a remote node: echoes every datagram back verbatim. The 8-byte
 /// request id prefix survives the round trip, so `UdpTransport` can match the

@@ -1,5 +1,5 @@
-use crate::close_nodes_trait::{Contact, Key, NodeId};
-use crate::rpc_transport_trait::RpcTransport;
+use crate::close_nodes::{Contact, Key, NodeId};
+use crate::rpc_transport::RpcTransport;
 use std::net::SocketAddr;
 
 /// Result of a FIND_VALUE: either the value itself, or the closest contacts
