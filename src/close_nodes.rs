@@ -1,4 +1,5 @@
 pub mod dumb_bucket;
+pub mod static_bucket;
 
 use std::net::SocketAddr;
 
@@ -45,4 +46,21 @@ pub fn xor_distance_cmp(a: NodeId, b: NodeId, target: NodeId) -> std::cmp::Order
         .zip(&target)
         .map(|(x, t)| x ^ t)
         .cmp(b.iter().zip(&target).map(|(y, t)| y ^ t))
+}
+
+/// Number of leading zero bits in `id`, counting down from the most
+/// significant bit of byte 0 — the same big-endian direction
+/// [`xor_distance`] documents. The all-zero id has all 160 bits zero.
+///
+/// `leading_zeros(xor_distance(a, b))` is the length of the common prefix a
+/// and b share, which is what picks a routing bucket.
+pub fn leading_zeros(id: NodeId) -> u32 {
+    let mut zeros = 0;
+    for byte in id {
+        if byte != 0 {
+            return zeros + byte.leading_zeros();
+        }
+        zeros += 8;
+    }
+    zeros
 }
