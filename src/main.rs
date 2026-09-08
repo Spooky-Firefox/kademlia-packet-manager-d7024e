@@ -4,6 +4,7 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 
 mod debug_transport;
+mod networked_debug_transport;
 mod pending;
 mod rpc;
 mod rpc_transport_trait;
