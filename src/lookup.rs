@@ -3,7 +3,7 @@ use crate::rpc::Rpc;
 use crate::rpc_transport::RpcTransport;
 use std::collections::HashSet;
 
-// alpha = 1 to start
+// alpha = 1 just nu
 pub async fn lookup_node<T, A>(
     rpc: &Rpc<T, A>,
     target: NodeId,
@@ -12,10 +12,13 @@ where
     T: RpcTransport,
     A: CloseNodes,
 {
+    // contacts we know closest to target
     let mut candidates = rpc.close_nodes().close_nodes(target);
+    // hashset of contact ids for later
     let mut queried: HashSet<NodeId> = HashSet::new();
 
     loop {
+        // find next node that hasn't been queried yet
         let Some(next) = candidates
             .iter()
             .find(|contact| !queried.contains(&contact.id))
@@ -26,12 +29,16 @@ where
 
         queried.insert(next.id);
 
+        // ask next nodes for contacts (only one at a time right nyaow)
         let new_contacts = rpc.find_node(next.address, target).await;
 
         candidates.extend(new_contacts);
 
+        // sort by distance using Olles XOR thingamajig with a closure (rust voodoo)
         candidates.sort_by(|a, b| xor_distance_cmp(a.id, b.id, target));
+        //flatline duplicate chooms
         candidates.dedup_by_key(|contact| contact.id);
+        // yoink K closest contacts
         candidates.truncate(K);
     }
 
@@ -106,5 +113,30 @@ mod tests {
         let result = lookup_node(&rpc, target).await;
 
         assert_eq!(result, vec![c, b, a]);
+    }
+    #[tokio::test]
+    async fn lookup_returns_empty_when_no_contacts_are_known() {
+        let target = [0u8; 20];
+
+        let dummy = Contact {
+            id: [1u8; 20],
+            address: "127.0.0.1:8001".parse().unwrap(),
+        };
+
+        let transport = FakeTransport {
+            a: dummy,
+            b: dummy,
+            c: dummy,
+        };
+
+        let close_nodes = FakeCloseNodes {
+            initial: vec![],
+        };
+
+        let rpc = Rpc::new(transport, close_nodes);
+
+        let result = lookup_node(&rpc, target).await;
+
+        assert!(result.is_empty());
     }
 }
