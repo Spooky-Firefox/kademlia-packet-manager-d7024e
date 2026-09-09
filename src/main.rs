@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 
+mod lookup;
 mod close_nodes;
 mod handle_rpc;
 mod pending;
