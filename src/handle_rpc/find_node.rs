@@ -22,8 +22,9 @@ pub async fn handle<A: CloseNodes>(
     let target: NodeId = bincode::deserialize(body).ok()?;
 
     let contacts = context.close_nodes.close_nodes(target);
-
-    bincode::serialize(&contacts).ok()
+    let mut res = id.to_be_bytes().to_vec();
+    res.extend(bincode::serialize(&contacts).ok()?);
+    Some(res)
 }
 
 #[cfg(test)]
@@ -66,12 +67,15 @@ mod tests {
 
         let body = bincode::serialize(&target).unwrap();
 
-        let response = handle(&context, "127.0.0.1:9000".parse().unwrap(), &body)
+        let response = handle(&context, 42, "127.0.0.1:9000".parse().unwrap(), &body)
             .await
             .unwrap();
 
-        let contacts: Vec<Contact> = bincode::deserialize(&response).unwrap();
+        let (resp_id_bytes, contacts_bytes) = response.split_at(8);
+        let resp_id = u64::from_be_bytes(resp_id_bytes.try_into().unwrap());
+        let contacts: Vec<Contact> = bincode::deserialize(contacts_bytes).unwrap();
 
+        assert_eq!(resp_id, 42);
         assert_eq!(contacts, expected_contacts);
     }
 
@@ -86,7 +90,7 @@ mod tests {
 
         let bad_body = b"too short";
 
-        let response = handle(&context, "127.0.0.1:9000".parse().unwrap(), bad_body).await;
+        let response = handle(&context, 42, "127.0.0.1:9000".parse().unwrap(), bad_body).await;
 
         assert!(response.is_none());
     }
