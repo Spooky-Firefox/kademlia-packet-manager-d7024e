@@ -15,6 +15,7 @@ use std::net::SocketAddr;
 /// Answer a FIND_NODE for the target id in `body`.
 pub async fn handle<A: CloseNodes>(
     context: &Context<A>,
+    id: u64,
     from: SocketAddr,
     body: &[u8],
 ) -> Option<Vec<u8>> {

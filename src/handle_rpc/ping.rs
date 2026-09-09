@@ -21,12 +21,16 @@ pub const PONG: &[u8] = b"PONG";
 /// make us look dead to a node that is talking to us in good faith.
 pub async fn handle<A: CloseNodes>(
     context: &Context<A>,
+    id: u64,
     from: SocketAddr,
     body: &[u8],
 ) -> Option<Vec<u8>> {
     let _ = context;
     if !body.is_empty() {
-        trace!("PING from {from} carried {} unexpected bytes", body.len());
+        trace!(
+            "PING {id} from {from} carried {} unexpected bytes",
+            body.len()
+        );
     }
     // TODO: learn the sender as a contact, once a request body carries the
     // NodeId to learn it as. Every arriving RPC is evidence of liveness, and

@@ -18,6 +18,7 @@ use std::net::SocketAddr;
 /// "unreachable" anyway, and both mean the value did not land here.
 pub async fn handle<A: CloseNodes>(
     context: &Context<A>,
+    id: u64,
     from: SocketAddr,
     body: &[u8],
 ) -> Option<Vec<u8>> {
