@@ -70,7 +70,29 @@ impl<T: RpcTransport, A: CloseNodes> Rpc<T, A> {
 
     /// Ask `peer` for the contacts it knows closest to `target`.
     pub async fn find_node(&self, peer: SocketAddr, target: NodeId) -> Vec<Contact> {
-        todo!("encode FIND_NODE, send_receive, decode the reply")
+        let encoded_target = match bincode::serialize(&target) {
+            Ok(bytes) => bytes,
+            Err(_) => return Vec::new(),
+        };
+
+        let mut request = crate::handle_rpc::Method::FindNode.tag().to_vec();
+        request.extend(encoded_target);
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.transport.send_receive(request, peer),
+        )
+        .await;
+
+        let response = match response {
+            Ok(bytes) => bytes,
+            Err(_) => return Vec::new(),
+        };
+
+        match bincode::deserialize::<Vec<Contact>>(&response) {
+            Ok(contacts) => contacts,
+            Err(_) => Vec::new(),
+        }
     }
 
     /// Ask `peer` for `key`, falling back to its closest known contacts.
@@ -78,5 +100,70 @@ impl<T: RpcTransport, A: CloseNodes> Rpc<T, A> {
         // NOTE lab spec allows for tcp transport of values, not forcing udp only
 
         todo!("encode FIND_VALUE, send_receive, decode the reply")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct FakeTransport {
+        expected_payload: Vec<u8>,
+        expected_address: SocketAddr,
+        response: Vec<u8>,
+    }
+
+    impl RpcTransport for FakeTransport {
+        async fn send_receive(&self, payload: Vec<u8>, address: SocketAddr) -> Vec<u8> {
+            assert_eq!(payload, self.expected_payload);
+            assert_eq!(address, self.expected_address);
+
+            self.response.clone()
+        }
+    }
+    struct FakeCloseNodes;
+
+    impl CloseNodes for FakeCloseNodes {
+        fn close_nodes(&self, _id: NodeId) -> Vec<Contact> {
+            Vec::new()
+        }
+
+        fn maybe_add_contact(&self, _contact: Contact) {}
+    }
+
+    #[tokio::test]
+    async fn find_node_sends_request_and_decodes_contacts() {
+        let target = [1u8; 20];
+
+        let peer: SocketAddr = "127.0.0.1:8000".parse().unwrap();
+
+        let expected_contacts = vec![
+            Contact {
+                id: [2u8; 20],
+                address: "127.0.0.1:8001".parse().unwrap(),
+            },
+            Contact {
+                id: [3u8; 20],
+                address: "127.0.0.1:8002".parse().unwrap(),
+            },
+        ];
+
+        let mut expected_payload = crate::handle_rpc::Method::FindNode.tag().to_vec();
+
+        expected_payload.extend(bincode::serialize(&target).unwrap());
+
+        let response = bincode::serialize(&expected_contacts).unwrap();
+
+        let transport = FakeTransport {
+            expected_payload,
+            expected_address: peer,
+            response,
+        };
+
+        let rpc = Rpc::new(transport, FakeCloseNodes);
+
+        let contacts = rpc.find_node(peer, target).await;
+
+        assert_eq!(contacts, expected_contacts);
     }
 }

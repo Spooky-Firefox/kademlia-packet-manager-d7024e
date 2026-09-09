@@ -4,6 +4,7 @@ pub mod sibling_list;
 pub mod static_bucket;
 
 use cache::CachedCloseNodes;
+use serde::{Deserialize, Serialize};
 use sibling_list::SiblingList;
 use static_bucket::StaticBucket;
 use std::net::SocketAddr;
@@ -16,7 +17,7 @@ pub type Key = [u8; 20];
 
 /// A routing-table entry: who a node is, and where to reach it.
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Contact {
     pub id: NodeId,
     pub address: SocketAddr,
