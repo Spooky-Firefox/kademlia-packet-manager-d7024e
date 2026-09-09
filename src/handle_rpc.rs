@@ -12,9 +12,14 @@
 //! [`Pending`](crate::pending::Pending) and drop it when nobody is waiting —
 //! which is exactly what an unsolicited request looks like from there. Handing
 //! those datagrams to a [`Request`] channel instead of dropping them is the
-//! seam this module is written against, and it keeps the id framing where it
-//! already lives: [`Request::respond`] carries only the reply body, and the
-//! transport re-attaches the id it stripped on the way in.
+//! seam this module is written against, and [`Request::from_datagram`] is the
+//! split they need: the id off the front, the request behind it.
+//!
+//! The id goes back out on the reply. It is the only thing in the returning
+//! datagram that says which of the requester's awaiting tasks this answers, so
+//! [`frame_reply`] puts it back on the front before the answer leaves and
+//! [`Request::respond`] carries the finished datagram — a transport sends
+//! those bytes as they are rather than reconstructing the framing itself.
 //!
 //! # Why a task per request
 //!
@@ -34,6 +39,29 @@ use log::trace;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
+
+/// Wire framing: an 8-byte big-endian request id, then the payload. The same
+/// framing every transport writes — see
+/// [`UdpTransport`](crate::rpc_transport::udp_transport::UdpTransport), which
+/// strips exactly this much before a request ever reaches us.
+pub const ID_LEN: usize = size_of::<u64>();
+
+/// Frame a reply to request `id`: the id back on the front, then `body`.
+///
+/// The echo is load-bearing. The requester registered a
+/// [`Pending`](crate::pending::Pending) slot under this id and
+/// [`Pending::deliver`](crate::pending::Pending::deliver) is what wakes the
+/// task waiting in it — matching on the id alone, since a datagram carries
+/// nothing else tying it to a request. Answer without the id, or with the
+/// wrong one, and the reply arrives as an id nobody registered: dropped by the
+/// recv loop, while the caller sits out its full timeout as though we had
+/// never replied at all.
+pub fn frame_reply(id: u64, body: &[u8]) -> Vec<u8> {
+    let mut datagram = Vec::with_capacity(ID_LEN + body.len());
+    datagram.extend_from_slice(&id.to_be_bytes());
+    datagram.extend_from_slice(body);
+    datagram
+}
 
 /// Which RPC a request is, identified by the tag its payload starts with.
 ///
@@ -89,7 +117,10 @@ impl Method {
 /// Handlers take the whole context rather than the parts they happen to need
 /// today: STORE and FIND_VALUE want a value store that does not exist yet, and
 /// growing one struct is cheaper than re-threading four signatures.
-pub struct Context<A> {
+pub struct Context<A>
+where
+    A: CloseNodes,
+{
     pub close_nodes: A,
     // TODO: the value store that STORE writes and FIND_VALUE reads.
 }
@@ -104,6 +135,15 @@ impl<A: CloseNodes> Context<A> {
 /// One inbound RPC, waiting to be answered.
 #[non_exhaustive]
 pub struct Request {
+    /// The sender's request id, off the front of the datagram.
+    ///
+    /// It is the sender's name for this request, not ours, and it is only
+    /// unique among *their* in-flight requests — two peers will hand us the
+    /// same id routinely, so it identifies a request only together with
+    /// [`from`](Self::from). A handler wants it to name the request in a log
+    /// line that the other node's log can be read against, and to reference it
+    /// in a reply it frames itself, as a STORE answering over TCP would.
+    pub id: u64,
     /// Who sent it, and where the reply goes.
     ///
     /// A handler also wants this to learn the sender as a contact, which it
@@ -113,24 +153,44 @@ pub struct Request {
     /// The request as it arrived — method tag and all, minus the transport's
     /// id prefix.
     pub payload: Vec<u8>,
-    /// Where the reply body goes; the transport re-attaches the id framing.
-    /// Dropping this answers nothing, which over UDP is a legitimate answer.
+    /// Where the finished reply goes: the complete datagram, id and all, ready
+    /// to hand straight to `send_to`. Dropping this answers nothing, which
+    /// over UDP is a legitimate answer.
     pub respond: oneshot::Sender<Vec<u8>>,
 }
 
 impl Request {
     /// A request and the half that resolves once it has been answered. `None`
     /// out of the receiver means the node chose not to reply.
-    pub fn new(from: SocketAddr, payload: Vec<u8>) -> (Self, oneshot::Receiver<Vec<u8>>) {
+    pub fn new(id: u64, from: SocketAddr, payload: Vec<u8>) -> (Self, oneshot::Receiver<Vec<u8>>) {
         let (respond, rx) = oneshot::channel();
         (
             Self {
+                id,
                 from,
                 payload,
                 respond,
             },
             rx,
         )
+    }
+
+    /// Split a datagram as it came off the wire: [`ID_LEN`] bytes of id, then
+    /// the request itself.
+    ///
+    /// `None` if it is too short to carry an id — the same length check the
+    /// transports' receive loops already make before matching one against
+    /// [`Pending`](crate::pending::Pending). Reading the id here rather than
+    /// taking the transport's word for it keeps the framing in one place; a
+    /// transport that has already parsed it can call [`new`](Self::new).
+    pub fn from_datagram(
+        from: SocketAddr,
+        datagram: &[u8],
+    ) -> Option<(Self, oneshot::Receiver<Vec<u8>>)> {
+        let (id, payload) = datagram.split_at_checked(ID_LEN)?;
+        // split_at_checked handed back exactly ID_LEN bytes.
+        let id = u64::from_be_bytes(id.try_into().unwrap());
+        Some(Self::new(id, from, payload.to_vec()))
     }
 }
 
@@ -159,6 +219,7 @@ where
 /// queued behind.
 async fn dispatch<A: CloseNodes>(context: Arc<Context<A>>, request: Request) {
     let Request {
+        id,
         from,
         payload,
         respond,
@@ -168,27 +229,27 @@ async fn dispatch<A: CloseNodes>(context: Arc<Context<A>>, request: Request) {
         // Not ours: a stray datagram, a peer speaking a later version of the
         // protocol, or a reply that arrived after its request was cancelled.
         trace!(
-            "Unrecognised request from {from}, dropping {} bytes",
+            "Unrecognised request {id} from {from}, dropping {} bytes",
             payload.len()
         );
         return;
     };
-    trace!("{method:?} from {from}, {} byte body", body.len());
+    trace!("{method:?} {id} from {from}, {} byte body", body.len());
 
     let reply = match method {
-        Method::Ping => ping::handle(&context, from, body).await,
-        Method::Store => store::handle(&context, from, body).await,
-        Method::FindNode => find_node::handle(&context, from, body).await,
-        Method::FindValue => find_value::handle(&context, from, body).await,
+        Method::Ping => ping::handle(&context, id, from, body).await,
+        Method::Store => store::handle(&context, id, from, body).await,
+        Method::FindNode => find_node::handle(&context, id, from, body).await,
+        Method::FindValue => find_value::handle(&context, id, from, body).await,
     };
 
     let Some(reply) = reply else {
-        trace!("No reply to the {method:?} from {from}");
+        trace!("No reply to {method:?} {id} from {from}");
         return;
     };
     // Err means the requester gave up and dropped the responder.
-    if respond.send(reply).is_err() {
-        trace!("Nobody left to take the {method:?} reply for {from}");
+    if respond.send(frame_reply(id, &reply)).is_err() {
+        trace!("Nobody left to take the {method:?} {id} reply for {from}");
     }
 }
 
@@ -225,10 +286,36 @@ mod tests {
         assert_eq!(Method::split_tag(b""), None);
     }
 
+    /// The framing `UdpTransport::send_receive` writes, read back: an 8-byte
+    /// big-endian id, then the payload. Built here the way the transport
+    /// builds it, so the two cannot drift apart unnoticed.
+    #[test]
+    fn a_datagram_splits_into_its_id_and_the_request() {
+        let id = 0x0102_0304_0506_0708u64;
+        let mut datagram = id.to_be_bytes().to_vec();
+        datagram.extend_from_slice(Method::Ping.tag());
+
+        let (request, _reply) = Request::from_datagram(addr(), &datagram).expect("carries an id");
+        assert_eq!(request.id, id);
+        assert_eq!(request.payload, Method::Ping.tag());
+        assert_eq!(request.from, addr());
+    }
+
+    /// Too short to carry an id: dropped rather than parsed out of whatever
+    /// bytes are there, which is the check both transports already make.
+    #[test]
+    fn a_datagram_too_short_for_an_id_is_rejected() {
+        assert!(Request::from_datagram(addr(), b"").is_none());
+        assert!(Request::from_datagram(addr(), &[0u8; ID_LEN - 1]).is_none());
+        // Exactly an id and nothing else still parses; an empty payload is a
+        // request with no method tag, which dispatch drops on its own.
+        assert!(Request::from_datagram(addr(), &[0u8; ID_LEN]).is_some());
+    }
+
     #[tokio::test]
     async fn ping_is_answered_with_a_pong() {
         let requests = spawn_serve();
-        let (request, reply) = Request::new(addr(), Method::Ping.tag().to_vec());
+        let (request, reply) = Request::new(7, addr(), Method::Ping.tag().to_vec());
         requests.send(request).await.unwrap();
 
         assert_eq!(
@@ -236,7 +323,7 @@ mod tests {
                 .await
                 .expect("answered within 1s")
                 .expect("the handler replied"),
-            ping::PONG
+            frame_reply(7, ping::PONG)
         );
     }
 
@@ -246,7 +333,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_methods_go_unanswered() {
         let requests = spawn_serve();
-        let (request, reply) = Request::new(addr(), b"NOT_A_METHOD".to_vec());
+        let (request, reply) = Request::new(7, addr(), b"NOT_A_METHOD".to_vec());
         requests.send(request).await.unwrap();
 
         assert!(
@@ -262,13 +349,45 @@ mod tests {
     #[tokio::test]
     async fn requests_are_served_concurrently() {
         let requests = spawn_serve();
-        let (first, first_reply) = Request::new(addr(), Method::Ping.tag().to_vec());
-        let (second, second_reply) = Request::new(addr(), Method::Ping.tag().to_vec());
+        let (first, first_reply) = Request::new(1, addr(), Method::Ping.tag().to_vec());
+        let (second, second_reply) = Request::new(2, addr(), Method::Ping.tag().to_vec());
         requests.send(first).await.unwrap();
         requests.send(second).await.unwrap();
 
         let (a, b) = tokio::join!(first_reply, second_reply);
-        assert_eq!(a.unwrap(), ping::PONG);
-        assert_eq!(b.unwrap(), ping::PONG);
+        assert_eq!(a.unwrap(), frame_reply(1, ping::PONG));
+        assert_eq!(b.unwrap(), frame_reply(2, ping::PONG));
+    }
+
+    /// The echo the requester's `Pending` matches on: a reply goes back under
+    /// the id it came in with, so `deliver` finds the slot the caller is
+    /// parked in. An id that did not survive the round trip wakes nobody.
+    #[tokio::test]
+    async fn the_reply_carries_the_request_id_back() {
+        let requests = spawn_serve();
+        let id = 0x0102_0304_0506_0708u64;
+        let (request, reply) = Request::new(id, addr(), Method::Ping.tag().to_vec());
+        requests.send(request).await.unwrap();
+
+        let datagram = tokio::time::timeout(Duration::from_secs(1), reply)
+            .await
+            .expect("answered within 1s")
+            .expect("the handler replied");
+
+        // Read back the way a recv loop reads it: id off the front, then body.
+        let (echoed, body) = datagram.split_at(ID_LEN);
+        assert_eq!(u64::from_be_bytes(echoed.try_into().unwrap()), id);
+        assert_eq!(body, ping::PONG);
+    }
+
+    /// A reply reframed by `frame_reply` is a datagram `from_datagram` reads,
+    /// so the two halves of the framing cannot drift apart.
+    #[test]
+    fn framing_round_trips() {
+        let id = u64::MAX;
+        let datagram = frame_reply(id, b"PONG");
+        let (parsed, _reply) = Request::from_datagram(addr(), &datagram).expect("carries an id");
+        assert_eq!(parsed.id, id);
+        assert_eq!(parsed.payload, b"PONG");
     }
 }
