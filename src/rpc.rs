@@ -63,9 +63,21 @@ impl<T: RpcTransport, A: CloseNodes> Rpc<T, A> {
     }
 
     /// Ask `peer` to store `value` under `key`.
-    pub async fn store(&self, peer: SocketAddr, key: Key, value: Vec<u8>) {
+    pub async fn store(&self, peer: SocketAddr, key: Key, value: Vec<u8>) -> bool {
         // NOTE lab spec allows for tcp transport of values, not forcing udp only
-        todo!("encode STORE, send_receive, decode the reply")
+        let Ok(encoded) = bincode::serialize(&(key, value)) else {
+            return false;
+        };
+        let mut request = crate::handle_rpc::Method::Store.tag().to_vec();
+        request.extend(encoded);
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.transport.send_receive(request, peer),
+        )
+        .await;
+
+        matches!(response, Ok(bytes) if bytes == crate::handle_rpc::store::STORED)
     }
 
     /// Ask `peer` for the contacts it knows closest to `target`.

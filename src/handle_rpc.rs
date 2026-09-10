@@ -39,6 +39,8 @@ use log::trace;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
+use crate::close_nodes::Key;
+use dashmap::DashMap;
 
 /// Wire framing: an 8-byte big-endian request id, then the payload. The same
 /// framing every transport writes — see
@@ -122,13 +124,13 @@ where
     A: CloseNodes,
 {
     pub close_nodes: A,
-    // TODO: the value store that STORE writes and FIND_VALUE reads.
+    pub values: DashMap<Key, Vec<u8>>,    
 }
 
 impl<A: CloseNodes> Context<A> {
     /// Shared by every spawned handler, so it is handed out behind an `Arc`.
     pub fn new(close_nodes: A) -> Arc<Self> {
-        Arc::new(Self { close_nodes })
+        Arc::new(Self { close_nodes, values: DashMap::new() })
     }
 }
 
