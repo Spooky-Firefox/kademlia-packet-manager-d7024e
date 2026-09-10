@@ -78,7 +78,7 @@ impl<T: RpcTransport, A: CloseNodes> Rpc<T, A> {
         )
         .await;
 
-        matches!(response, Ok(bytes) if bytes == crate::handle_rpc::store::STORED)
+        matches!(response, Ok(Ok(bytes)) if bytes == crate::handle_rpc::store::STORED)
     }
 
     /// Ask `peer` for the contacts it knows closest to `target`.
