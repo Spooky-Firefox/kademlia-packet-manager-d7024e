@@ -49,15 +49,13 @@ impl<T: RpcTransport, A: CloseNodes> Rpc<T, A> {
     pub async fn ping(&self, peer: SocketAddr) -> bool {
         // No request id in the body: the transport frames one and only ever
         // resolves this future with the reply that carried it back.
-        let res = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            self.transport
-                .send_receive(crate::handle_rpc::Method::Ping.tag().to_vec(), peer),
-        )
-        .await;
+        let res = self
+            .transport
+            .send_receive(crate::handle_rpc::Method::Ping.tag().to_vec(), peer)
+            .await;
 
         match res {
-            Ok(Ok(receive_payload)) => receive_payload == crate::handle_rpc::ping::PONG,
+            Ok(receive_payload) => receive_payload == crate::handle_rpc::ping::PONG,
             // transport error or timeout
             _ => false,
         }
@@ -72,13 +70,9 @@ impl<T: RpcTransport, A: CloseNodes> Rpc<T, A> {
         let mut request = crate::handle_rpc::Method::Store.tag().to_vec();
         request.extend(encoded);
 
-        let response = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            self.transport.send_receive(request, peer),
-        )
-        .await;
+        let response = self.transport.send_receive(request, peer).await;
 
-        matches!(response, Ok(Ok(bytes)) if bytes == crate::handle_rpc::store::STORED)
+        matches!(response, Ok(bytes) if bytes == crate::handle_rpc::store::STORED)
     }
 
     /// Ask `peer` for the contacts it knows closest to `target`.
@@ -91,14 +85,10 @@ impl<T: RpcTransport, A: CloseNodes> Rpc<T, A> {
         let mut request = crate::handle_rpc::Method::FindNode.tag().to_vec();
         request.extend(encoded_target);
 
-        let response = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            self.transport.send_receive(request, peer),
-        )
-        .await;
+        let response = self.transport.send_receive(request, peer).await;
 
         let response = match response {
-            Ok(Ok(bytes)) => bytes,
+            Ok(bytes) => bytes,
             // transport error or timeout
             _ => return Vec::new(),
         };
