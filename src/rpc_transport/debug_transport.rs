@@ -26,12 +26,16 @@ impl DebugTransport {
 
 /// The socket address is not used
 impl RpcTransport for DebugTransport {
-    async fn send_receive(&self, payload: Vec<u8>, address: SocketAddr) -> Vec<u8> {
+    async fn send_receive(
+        &self,
+        payload: Vec<u8>,
+        address: SocketAddr,
+    ) -> std::io::Result<Vec<u8>> {
         let id = self
             .counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.map.insert(id, (address, payload, tx));
-        rx.await.unwrap()
+        Ok(rx.await.unwrap())
     }
 }
