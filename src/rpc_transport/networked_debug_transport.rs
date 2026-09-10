@@ -7,11 +7,12 @@
 //! so tests get UDP semantics — unreliable, unordered, silently dropped when
 //! nobody is home — without touching a port or waiting on a real timeout.
 //!
-//! [`NetworkedDebugTransport`] is then the same transport as
-//! [`UdpTransport`](crate::rpc_transport::udp_transport::UdpTransport), with an [`Endpoint`]
-//! in place of the socket: identical 8-byte id framing, identical
-//! [`Pending`] bookkeeping, and `RpcTransport` either way, so code
-//! written against one runs unchanged against the other.
+//! [`NetworkedDebugTransport`] is then just
+//! [`RetryTransport`](crate::rpc_transport::retry_transport::RetryTransport)
+//! with an [`Endpoint`] in place of the `UdpSocket`: the id framing, the
+//! pending-request bookkeeping, and the resend loop are all shared code, so a
+//! test against the fake wire exercises the same transport `main` runs over
+//! real UDP.
 //!
 //! # Two devices on one network
 //!
@@ -52,21 +53,25 @@
 //! // Device A: a node that issues RPCs.
 //! let node: NetworkedDebugTransport = NetworkedDebugTransport::new(network.bind_any());
 //!
-//! // As with UDP, send_receive never times out on its own — that is the
-//! // caller's job, and dropping the future releases the pending slot.
+//! // send_receive resends on silence and, after a few attempts with no reply,
+//! // gives up with an `io::Error` of kind `TimedOut`. Wrapping it in an outer
+//! // `timeout` still works and simply bounds that from the outside.
 //! let reply: Vec<u8> = tokio::time::timeout(
 //!     Duration::from_secs(1),
 //!     node.send_receive(b"ping".to_vec(), peer_addr),
 //! )
 //! .await
-//! .expect("peer answered within 1s");
+//! .expect("outer timeout not reached")
+//! .expect("peer answered before the attempt budget ran out");
 //! assert_eq!(reply, b"pong: ping");
 //! ```
 //!
-//! To watch a request fail instead, either aim it at an address nobody bound —
-//! the network swallows it, exactly like a datagram to a dead port — or build
-//! the network with [`Network::with_config`] and give it latency or loss.
-use crate::{pending::Pending, rpc_transport::RpcTransport};
+//! To watch a request fail instead, aim it at an address nobody bound — the
+//! network swallows every resend, exactly like datagrams to a dead port, and
+//! `send_receive` returns `TimedOut` once the attempts are spent — or build the
+//! network with [`Network::with_config`] and give it latency or loss.
+use crate::rpc_transport::data_rx_tx::DataRxTx;
+use crate::rpc_transport::retry_transport::RetryTransport;
 use dashmap::DashMap;
 use log::trace;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -229,58 +234,39 @@ impl Drop for Endpoint {
     }
 }
 
-/// [`UdpTransport`](crate::rpc_transport::udp_transport::UdpTransport) over a [`Network`].
-#[non_exhaustive]
-pub struct NetworkedDebugTransport {
-    endpoint: Arc<Endpoint>,
-    pending: Arc<Pending>,
-}
+/// A [`RetryTransport`] over a [`Network`]: the same transport that
+/// [`udp_transport`](crate::rpc_transport::udp_transport) runs over a real
+/// socket, with an [`Endpoint`] in place of the `UdpSocket`.
+pub type NetworkedDebugTransport = RetryTransport<Endpoint>;
 
-impl NetworkedDebugTransport {
-    pub fn new(endpoint: Endpoint) -> Self {
-        // spawn receiving loop
-        let endpoint = Arc::new(endpoint);
-        let endpoint_clone = endpoint.clone();
-        let pending = Pending::new();
-        let pending_clone = pending.clone();
-        // TODO deal with spawn handle
-        tokio::spawn(async move {
-            while let Some((addr, datagram)) = endpoint_clone.recv_from().await {
-                trace!("Received {} bytes from {}", datagram.len(), addr);
-                if datagram.len() < ID_LEN {
-                    trace!("Datagram from {} too short to carry an id, dropping", addr);
-                    continue;
-                }
-                let id = u64::from_be_bytes(datagram[0..ID_LEN].try_into().unwrap());
-                if !pending_clone.deliver(id, datagram[ID_LEN..].into()) {
-                    trace!("No one waiting on id {} from {}, dropping", id, addr);
-                }
+impl DataRxTx for Endpoint {
+    async fn send_packet(&self, payload: &[u8], address: SocketAddr) -> std::io::Result<()> {
+        // Like UDP, the fake wire cannot report a delivery failure from here.
+        self.send_to(payload, address);
+        Ok(())
+    }
+
+    async fn receive_packet(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        match self.recv_from().await {
+            Some((from, datagram)) => {
+                // Truncate to the buffer, as `UdpSocket::recv_from` does.
+                let len = datagram.len().min(buf.len());
+                buf[..len].copy_from_slice(&datagram[..len]);
+                Ok((len, from))
             }
-        });
-        Self { endpoint, pending }
-    }
-
-    pub fn local_addr(&self) -> SocketAddr {
-        self.endpoint.local_addr()
-    }
-}
-
-impl RpcTransport for NetworkedDebugTransport {
-    async fn send_receive(&self, payload: Vec<u8>, address: SocketAddr) -> Vec<u8> {
-        let id = self.pending.next_id();
-        let msg = self.pending.register(id);
-        let mut datagram = Vec::with_capacity(ID_LEN + payload.len());
-        datagram.extend_from_slice(&id.to_be_bytes());
-        datagram.extend_from_slice(&payload);
-        self.endpoint.send_to(&datagram, address);
-        // None is unreachable: the slot outlives this await.
-        msg.await.unwrap()
+            // The endpoint has been unbound; nothing more will arrive.
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "endpoint unbound",
+            )),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rpc_transport::RpcTransport;
 
     /// Stand-in for a remote node, as in `main`: echoes every datagram back
     /// verbatim, so the id prefix survives the round trip.
@@ -301,7 +287,10 @@ mod tests {
         let peer = spawn_echo_peer(&network);
         let transport = NetworkedDebugTransport::new(network.bind_any());
 
-        let reply = transport.send_receive(b"ping".to_vec(), peer).await;
+        let reply = transport
+            .send_receive(b"ping".to_vec(), peer)
+            .await
+            .unwrap();
         assert_eq!(reply, b"ping");
     }
 
@@ -329,7 +318,8 @@ mod tests {
             node.send_receive(b"ping".to_vec(), peer_addr),
         )
         .await
-        .expect("peer answered within 1s");
+        .expect("peer answered within 1s")
+        .unwrap();
         assert_eq!(reply, b"pong: ping");
     }
 
@@ -343,8 +333,8 @@ mod tests {
             transport.send_receive(b"first".to_vec(), peer),
             transport.send_receive(b"second".to_vec(), peer),
         );
-        assert_eq!(a, b"first");
-        assert_eq!(b, b"second");
+        assert_eq!(a.unwrap(), b"first");
+        assert_eq!(b.unwrap(), b"second");
     }
 
     #[tokio::test]
@@ -386,6 +376,7 @@ mod tests {
                 transport.send_receive(b"ping".to_vec(), peer)
             )
             .await
+            .unwrap()
             .unwrap(),
             b"ping"
         );
