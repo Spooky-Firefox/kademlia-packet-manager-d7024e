@@ -57,8 +57,9 @@ impl<T: RpcTransport, A: CloseNodes> Rpc<T, A> {
         .await;
 
         match res {
-            Ok(receive_payload) => receive_payload == crate::handle_rpc::ping::PONG,
-            Err(_) => false,
+            Ok(Ok(receive_payload)) => receive_payload == crate::handle_rpc::ping::PONG,
+            // transport error or timeout
+            _ => false,
         }
     }
 
@@ -85,8 +86,9 @@ impl<T: RpcTransport, A: CloseNodes> Rpc<T, A> {
         .await;
 
         let response = match response {
-            Ok(bytes) => bytes,
-            Err(_) => return Vec::new(),
+            Ok(Ok(bytes)) => bytes,
+            // transport error or timeout
+            _ => return Vec::new(),
         };
 
         match bincode::deserialize::<Vec<Contact>>(&response) {
@@ -114,11 +116,15 @@ mod tests {
     }
 
     impl RpcTransport for FakeTransport {
-        async fn send_receive(&self, payload: Vec<u8>, address: SocketAddr) -> Vec<u8> {
+        async fn send_receive(
+            &self,
+            payload: Vec<u8>,
+            address: SocketAddr,
+        ) -> std::io::Result<Vec<u8>> {
             assert_eq!(payload, self.expected_payload);
             assert_eq!(address, self.expected_address);
 
-            self.response.clone()
+            Ok(self.response.clone())
         }
     }
     struct FakeCloseNodes;

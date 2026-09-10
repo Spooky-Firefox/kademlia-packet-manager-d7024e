@@ -24,10 +24,12 @@ async fn spawn_echo_peer() -> io::Result<SocketAddr> {
         loop {
             let (len, from) = socket.recv_from(&mut buf).await.unwrap();
             println!(
-                "received {} bytes from {}, waiting 2s then echoing back",
+                "received {} bytes from {}, waiting 500ms then echoing back",
                 len, from
             );
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            // Long enough that the caller resends once or twice first, short
+            // enough to answer before its attempt budget runs out.
+            tokio::time::sleep(Duration::from_millis(500)).await;
             socket.send_to(&buf[..len], from).await.unwrap();
         }
     });
@@ -42,24 +44,20 @@ async fn main() -> io::Result<()> {
     let transport = UdpTransport::new(UdpSocket::bind("127.0.0.1:0").await?);
     println!("Echo peer listening on {peer}");
 
-    // RpcTransport::send_receive never times out on its own: a lost datagram
-    // would park this task forever, so the timeout is the caller's job.
+    // send_receive resends on silence and gives up with a TimedOut error once
+    // its attempt budget is spent, so no outer timeout is needed here.
     println!("Sending \"ping\" to {peer}");
-    match tokio::time::timeout(
-        Duration::from_secs(5),
-        transport.send_receive(b"ping".to_vec(), peer),
-    )
-    .await
-    {
+    match transport.send_receive(b"ping".to_vec(), peer).await {
         Ok(payload) => println!(
             "Got {:?} back from {peer}",
             String::from_utf8_lossy(&payload)
         ),
-        Err(_) => println!("No response from {peer} within 5s"),
+        Err(e) => println!("No response from {peer}: {e}"),
     }
 
-    // Nothing is listening here, so the timeout fires and dropping the
-    // send_receive future deregisters the slot via PendingResponse::drop.
+    // Nothing is listening here: every resend is swallowed. The 200ms outer
+    // timeout fires well before send_receive's own budget, and dropping the
+    // future deregisters the slot via PendingResponse::drop.
     let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
     println!("Sending \"ping\" to dead socket:{dead}");
     match tokio::time::timeout(
@@ -70,7 +68,7 @@ async fn main() -> io::Result<()> {
     {
         Ok(payload) => println!(
             "Got {:?} back from {dead}",
-            String::from_utf8_lossy(&payload)
+            String::from_utf8_lossy(&payload?)
         ),
         Err(_) => println!("No response from {dead} within 200ms, slot cleaned up"),
     }
