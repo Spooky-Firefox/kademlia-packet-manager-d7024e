@@ -63,6 +63,7 @@ impl Future for PendingResponse {
     /// `None` if the slot was dropped without a response ever arriving.
     type Output = Option<Vec<u8>>;
 
+    // TODO change to err instead of Option
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         Pin::new(&mut self.rx).poll(cx).map(|res| res.ok())
     }
