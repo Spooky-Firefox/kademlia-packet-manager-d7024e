@@ -78,13 +78,17 @@ mod tests {
     }
 
     impl RpcTransport for FakeTransport {
-        async fn send_receive(&self, _payload: Vec<u8>, address: std::net::SocketAddr) -> Vec<u8> {
+        async fn send_receive(
+            &self,
+            _payload: Vec<u8>,
+            address: std::net::SocketAddr,
+        ) -> std::io::Result<Vec<u8>> {
             if address == self.a.address {
-                bincode::serialize(&vec![self.b]).unwrap()
+                Ok(bincode::serialize(&vec![self.b]).unwrap())
             } else if address == self.b.address {
-                bincode::serialize(&vec![self.c]).unwrap()
+                Ok(bincode::serialize(&vec![self.c]).unwrap())
             } else {
-                bincode::serialize(&Vec::<Contact>::new()).unwrap()
+                Ok(bincode::serialize(&Vec::<Contact>::new()).unwrap())
             }
         }
     }
