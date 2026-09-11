@@ -11,7 +11,6 @@ use std::net::SocketAddr;
 
 pub const STORED: &[u8] = b"STORED";
 
-
 /// Store the key and value in `body`, and acknowledge it.
 ///
 /// Returning `None` leaves the sender to time out, which is the right answer
