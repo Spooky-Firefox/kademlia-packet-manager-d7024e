@@ -34,8 +34,7 @@ pub mod find_value;
 pub mod ping;
 pub mod store;
 
-use crate::close_nodes::CloseNodes;
-use crate::close_nodes::Key;
+use crate::close_nodes::{CloseNodes, Contact, Key, NodeId};
 use dashmap::DashMap;
 use log::trace;
 use std::net::SocketAddr;
@@ -49,6 +48,13 @@ use tokio::sync::{mpsc, oneshot};
 /// [`UdpTransport`](crate::rpc_transport::udp_transport::UdpTransport), which
 /// strips exactly this much before a request ever reaches us.
 pub const ID_LEN: usize = size_of::<u64>();
+
+/// Wire framing: right after the request id comes the sender's [`NodeId`],
+/// ahead of the method tag and body. Every RPC [`Rpc`](crate::rpc::Rpc)
+/// issues is framed with this prefix, and [`dispatch`] strips exactly this
+/// much off `Request::payload` before looking at the method tag, learning
+/// the sender as a [`Contact`] from it.
+pub const NODE_ID_LEN: usize = size_of::<NodeId>();
 
 /// Frame a reply to request `id`: the id back on the front, then `body`.
 ///
@@ -154,12 +160,15 @@ pub struct Request {
     pub id: u64,
     /// Who sent it, and where the reply goes.
     ///
-    /// A handler also wants this to learn the sender as a contact, which it
-    /// cannot do yet: [`Contact`](crate::close_nodes::Contact) needs a
-    /// [`NodeId`](crate::close_nodes::NodeId) and no request body carries one.
+    /// Paired with the [`NodeId`] [`dispatch`] strips off the front of
+    /// `payload`, this is how the sender gets learned as a
+    /// [`Contact`](crate::close_nodes::Contact) — before any handler sees the
+    /// request.
     pub from: SocketAddr,
-    /// The request as it arrived — method tag and all, minus the transport's
-    /// id prefix.
+    /// The request as it arrived, minus the transport's id prefix: the
+    /// sender's [`NodeId`], then the method tag and body. [`dispatch`] strips
+    /// the node id before splitting off the tag, so a handler only ever sees
+    /// what follows it.
     pub payload: Vec<u8>,
     /// Where the finished reply goes: the complete datagram, id and all, ready
     /// to hand straight to `send_to`. Dropping this answers nothing, which
@@ -306,7 +315,21 @@ async fn dispatch<A: CloseNodes>(context: Arc<Context<A>>, request: Request) {
         respond,
     } = request;
 
-    let Some((method, body)) = Method::split_tag(&payload) else {
+    let Some((sender_id, payload)) = payload.split_at_checked(NODE_ID_LEN) else {
+        trace!(
+            "Request {id} from {from} too short to carry a node id, dropping {} bytes",
+            payload.len()
+        );
+        return;
+    };
+    // Every arriving RPC is evidence the sender is alive and reachable here,
+    // so it is learned as a contact before its method is even looked at.
+    context.close_nodes.maybe_add_contact(Contact {
+        id: sender_id.try_into().unwrap(),
+        address: from,
+    });
+
+    let Some((method, body)) = Method::split_tag(payload) else {
         // Not ours: a stray datagram, a peer speaking a later version of the
         // protocol, or a reply that arrived after its request was cancelled.
         trace!(
@@ -342,6 +365,18 @@ mod tests {
 
     fn addr() -> SocketAddr {
         "127.0.0.1:4242".parse().unwrap()
+    }
+
+    fn sender_id() -> NodeId {
+        [1u8; 20]
+    }
+
+    /// Frame a request payload the way a live `Rpc` does: [`sender_id`],
+    /// then whatever follows (a method tag and body).
+    fn framed(rest: &[u8]) -> Vec<u8> {
+        let mut payload = sender_id().to_vec();
+        payload.extend_from_slice(rest);
+        payload
     }
 
     /// A served node with a channel to feed requests into, the address its
@@ -416,7 +451,7 @@ mod tests {
     #[tokio::test]
     async fn ping_is_answered_with_a_pong() {
         let requests = spawn_serve();
-        let (request, reply) = Request::new(7, addr(), Method::Ping.tag().to_vec());
+        let (request, reply) = Request::new(7, addr(), framed(Method::Ping.tag()));
         requests.send(request).await.unwrap();
 
         assert_eq!(
@@ -428,13 +463,51 @@ mod tests {
         );
     }
 
+    /// A payload too short to carry a node id is dropped the same way an
+    /// unrecognised method is: no reply, sender times out.
+    #[tokio::test]
+    async fn requests_too_short_for_a_node_id_are_dropped() {
+        let requests = spawn_serve();
+        let (request, reply) = Request::new(7, addr(), vec![0u8; NODE_ID_LEN - 1]);
+        requests.send(request).await.unwrap();
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), reply)
+                .await
+                .expect("resolved within 1s")
+                .is_err()
+        );
+    }
+
+    /// Every dispatched request learns its sender as a contact, whether or
+    /// not the method itself is recognised — this is what lets a routing
+    /// table build up from ordinary traffic instead of only from FIND_NODE
+    /// replies.
+    #[tokio::test]
+    async fn dispatch_learns_the_sender_as_a_contact() {
+        let (requests, _tcp_addr, context) = spawn_serve_with_tcp_addr();
+        let (request, reply) = Request::new(7, addr(), framed(Method::Ping.tag()));
+        requests.send(request).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), reply)
+            .await
+            .expect("resolved within 1s")
+            .expect("the handler replied");
+
+        let learned = context.close_nodes.close_nodes(sender_id());
+        assert!(
+            learned
+                .iter()
+                .any(|c| c.id == sender_id() && c.address == addr())
+        );
+    }
+
     /// An unrecognised request is dropped, not answered: the responder is
     /// closed without a value, and the sender sees a timeout as it would for
     /// any lost datagram.
     #[tokio::test]
     async fn unknown_methods_go_unanswered() {
         let requests = spawn_serve();
-        let (request, reply) = Request::new(7, addr(), b"NOT_A_METHOD".to_vec());
+        let (request, reply) = Request::new(7, addr(), framed(b"NOT_A_METHOD"));
         requests.send(request).await.unwrap();
 
         assert!(
@@ -450,8 +523,8 @@ mod tests {
     #[tokio::test]
     async fn requests_are_served_concurrently() {
         let requests = spawn_serve();
-        let (first, first_reply) = Request::new(1, addr(), Method::Ping.tag().to_vec());
-        let (second, second_reply) = Request::new(2, addr(), Method::Ping.tag().to_vec());
+        let (first, first_reply) = Request::new(1, addr(), framed(Method::Ping.tag()));
+        let (second, second_reply) = Request::new(2, addr(), framed(Method::Ping.tag()));
         requests.send(first).await.unwrap();
         requests.send(second).await.unwrap();
 
@@ -467,7 +540,7 @@ mod tests {
     async fn the_reply_carries_the_request_id_back() {
         let requests = spawn_serve();
         let id = 0x0102_0304_0506_0708u64;
-        let (request, reply) = Request::new(id, addr(), Method::Ping.tag().to_vec());
+        let (request, reply) = Request::new(id, addr(), framed(Method::Ping.tag()));
         requests.send(request).await.unwrap();
 
         let datagram = tokio::time::timeout(Duration::from_secs(1), reply)
@@ -506,7 +579,7 @@ mod tests {
         let id = 0x1122_3344_5566_7788u64;
 
         let mut datagram = id.to_be_bytes().to_vec();
-        datagram.extend_from_slice(Method::Store.tag());
+        datagram.extend(framed(Method::Store.tag()));
         datagram.extend(bincode::serialize(&(key, value.clone())).unwrap());
 
         let reply = tokio::time::timeout(Duration::from_secs(1), async {
