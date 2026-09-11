@@ -56,9 +56,10 @@ where
     candidates
 }
 
-pub async fn lookup_value<T, A>(rpc: &Rpc<T, A>, key: Key) -> Option<Vec<u8>>
+pub async fn lookup_value<T, U, A>(rpc: &Rpc<T, U, A>, key: Key) -> Option<Vec<u8>>
 where
     T: RpcTransport,
+    U: RpcTransport,
     A: CloseNodes,
 {
     let mut candidates = rpc.close_nodes().close_nodes(key);
@@ -202,9 +203,16 @@ mod tests {
             value: value.clone(),
         };
 
+        let robust_transport = FakeValueTransport {
+            a,
+            b,
+            c,
+            value: value.clone(),
+        };
+
         let close_nodes = FakeCloseNodes { initial: vec![a] };
 
-        let rpc = Rpc::new(transport, close_nodes);
+        let rpc = Rpc::new(transport, robust_transport, close_nodes);
 
         let result = lookup_value(&rpc, key).await;
 
@@ -246,10 +254,11 @@ mod tests {
         };
 
         let transport = FakeMissingValueTransport { a, b };
+        let robust_transport = FakeMissingValueTransport { a, b };
 
         let close_nodes = FakeCloseNodes { initial: vec![a] };
 
-        let rpc = Rpc::new(transport, close_nodes);
+        let rpc = Rpc::new(transport, robust_transport, close_nodes);
 
         let result = lookup_value(&rpc, key).await;
 

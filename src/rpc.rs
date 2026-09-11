@@ -237,7 +237,13 @@ mod tests {
             response,
         };
 
-        let rpc = Rpc::new(transport, FakeCloseNodes);
+        let robust_transport = FakeTransport {
+            expected_payload: Vec::new(),
+            expected_address: peer,
+            response: Vec::new(),
+        };
+
+        let rpc = Rpc::new(transport, robust_transport, FakeCloseNodes);
 
         let result = rpc.find_value(peer, key).await;
 
@@ -267,7 +273,13 @@ mod tests {
             response,
         };
 
-        let rpc = Rpc::new(transport, FakeCloseNodes);
+        let robust_transport = FakeTransport {
+            expected_payload: Vec::new(),
+            expected_address: peer,
+            response: Vec::new(),
+        };
+
+        let rpc = Rpc::new(transport, robust_transport, FakeCloseNodes);
 
         let result = rpc.find_value(peer, key).await;
 
