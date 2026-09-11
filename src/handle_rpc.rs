@@ -40,6 +40,8 @@ use dashmap::DashMap;
 use log::trace;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 
 /// Wire framing: an 8-byte big-endian request id, then the payload. The same
@@ -119,6 +121,7 @@ impl Method {
 /// Handlers take the whole context rather than the parts they happen to need
 /// today: STORE and FIND_VALUE want a value store that does not exist yet, and
 /// growing one struct is cheaper than re-threading four signatures.
+#[non_exhaustive]
 pub struct Context<A>
 where
     A: CloseNodes,
@@ -205,16 +208,89 @@ impl Request {
 /// and drop what does not fit, rather than park its receive loop behind a
 /// backlog. Shedding load looks like a lost datagram to the sender, which is
 /// the failure every caller already handles; blocking the socket does not.
-pub async fn serve<A>(context: Arc<Context<A>>, mut requests: mpsc::Receiver<Request>)
-where
+///
+/// `tcp_listener` is accepted already bound, the same way
+/// [`UdpTransport`](crate::rpc_transport::udp_transport::UdpTransport) takes
+/// an already-bound socket: binding is the caller's address decision, not
+/// this function's.
+pub async fn serve<A>(
+    context: Arc<Context<A>>,
+    mut requests: mpsc::Receiver<Request>,
+    tcp_listener: TcpListener,
+) where
     A: CloseNodes + Send + Sync + 'static,
 {
+    let tcp_context = Arc::clone(&context);
+    // TODO deal with spawn handle
+    tokio::spawn(serve_tcp(tcp_context, tcp_listener));
     while let Some(request) = requests.recv().await {
         let context = Arc::clone(&context);
         // TODO deal with spawn handle
         tokio::spawn(dispatch(context, request));
     }
     trace!("Request channel closed, stopping the serve loop");
+}
+
+/// Accept STORE requests arriving over TCP, one connection per request.
+///
+/// [`TcpTransport::send_receive`](crate::rpc_transport::tcp_transport::TcpTransport::send_receive)
+/// writes the whole request, half-closes, then reads until we close our own
+/// write side — so a connection here is read to EOF for the request, and
+/// closed once the reply has been written, mirroring that framing from the
+/// other end.
+async fn serve_tcp<A>(context: Arc<Context<A>>, listener: TcpListener)
+where
+    A: CloseNodes + Send + Sync + 'static,
+{
+    loop {
+        let (stream, from) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                trace!("tcp accept failed: {e}");
+                continue;
+            }
+        };
+        let context = Arc::clone(&context);
+        // TODO deal with spawn handle
+        tokio::spawn(async move {
+            if let Err(e) = handle_tcp_connection(context, stream, from).await {
+                trace!("tcp connection from {from} failed: {e}");
+            }
+        });
+    }
+}
+
+/// Read one framed request off `stream`, dispatch it, and write the reply
+/// back before closing.
+async fn handle_tcp_connection<A>(
+    context: Arc<Context<A>>,
+    mut stream: TcpStream,
+    from: SocketAddr,
+) -> std::io::Result<()>
+where
+    A: CloseNodes + Send + Sync + 'static,
+{
+    let mut datagram = Vec::new();
+    stream.read_to_end(&mut datagram).await?;
+
+    let Some((request, reply)) = Request::from_datagram(from, &datagram) else {
+        trace!(
+            "tcp request from {from} too short for an id, dropping {} bytes",
+            datagram.len()
+        );
+        return Ok(());
+    };
+
+    // Awaited inline rather than spawned: this connection already has its
+    // own task, so there is no fan-out left to gain by handing dispatch a
+    // second one, and awaiting keeps the reply's oneshot alive without an
+    // extra clone of `from`.
+    dispatch(context, request).await;
+
+    if let Ok(datagram) = reply.await {
+        stream.write_all(&datagram).await?;
+    }
+    stream.shutdown().await
 }
 
 /// Parse one request and hand it to its handler.
@@ -268,11 +344,31 @@ mod tests {
         "127.0.0.1:4242".parse().unwrap()
     }
 
+    /// A served node with a channel to feed requests into, the address its
+    /// TCP loop is listening on, and the context it is served with (so a
+    /// test can check what actually landed in `values`).
+    ///
+    /// Bound via `std::net::TcpListener` and handed to Tokio through
+    /// `from_std` so this helper can stay a plain (non-async) fn, matching
+    /// its existing callers.
+    fn spawn_serve_with_tcp_addr() -> (
+        mpsc::Sender<Request>,
+        SocketAddr,
+        Arc<Context<crate::close_nodes::RecommendedCloseNodes>>,
+    ) {
+        let (tx, rx) = mpsc::channel(8);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let tcp_addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let listener = TcpListener::from_std(listener).unwrap();
+        let context = Context::new(recommended([0u8; 20]));
+        tokio::spawn(serve(Arc::clone(&context), rx, listener));
+        (tx, tcp_addr, context)
+    }
+
     /// A served node with a channel to feed requests into.
     fn spawn_serve() -> mpsc::Sender<Request> {
-        let (tx, rx) = mpsc::channel(8);
-        tokio::spawn(serve(Context::new(recommended([0u8; 20])), rx));
-        tx
+        spawn_serve_with_tcp_addr().0
     }
 
     #[test]
@@ -394,5 +490,37 @@ mod tests {
         let (parsed, _reply) = Request::from_datagram(addr(), &datagram).expect("carries an id");
         assert_eq!(parsed.id, id);
         assert_eq!(parsed.payload, b"PONG");
+    }
+
+    /// A STORE arriving over the TCP loop, framed exactly the way
+    /// [`TcpTransport`](crate::rpc_transport::tcp_transport::TcpTransport)
+    /// sends it (write the request, half-close, read to EOF), is dispatched,
+    /// lands in `values`, and the ack comes back over the same connection.
+    #[tokio::test]
+    async fn tcp_store_is_written_and_acked() {
+        use tokio::net::TcpStream;
+
+        let (_requests, tcp_addr, context) = spawn_serve_with_tcp_addr();
+        let key: Key = [9u8; 20];
+        let value = b"stored over tcp".to_vec();
+        let id = 0x1122_3344_5566_7788u64;
+
+        let mut datagram = id.to_be_bytes().to_vec();
+        datagram.extend_from_slice(Method::Store.tag());
+        datagram.extend(bincode::serialize(&(key, value.clone())).unwrap());
+
+        let reply = tokio::time::timeout(Duration::from_secs(1), async {
+            let mut stream = TcpStream::connect(tcp_addr).await.unwrap();
+            stream.write_all(&datagram).await.unwrap();
+            stream.shutdown().await.unwrap();
+            let mut reply = Vec::new();
+            stream.read_to_end(&mut reply).await.unwrap();
+            reply
+        })
+        .await
+        .expect("answered within 1s");
+
+        assert_eq!(reply, frame_reply(id, store::STORED));
+        assert_eq!(context.values.get(&key).as_deref(), Some(&value));
     }
 }

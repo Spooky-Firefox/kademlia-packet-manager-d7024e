@@ -4,6 +4,7 @@ pub mod data_rx_tx;
 pub mod debug_transport;
 pub mod networked_debug_transport;
 pub mod retry_transport;
+pub mod tcp_transport;
 pub mod udp_transport;
 
 pub trait RpcTransport {
