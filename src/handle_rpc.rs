@@ -35,12 +35,12 @@ pub mod ping;
 pub mod store;
 
 use crate::close_nodes::CloseNodes;
+use crate::close_nodes::Key;
+use dashmap::DashMap;
 use log::trace;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
-use crate::close_nodes::Key;
-use dashmap::DashMap;
 
 /// Wire framing: an 8-byte big-endian request id, then the payload. The same
 /// framing every transport writes — see
@@ -119,18 +119,22 @@ impl Method {
 /// Handlers take the whole context rather than the parts they happen to need
 /// today: STORE and FIND_VALUE want a value store that does not exist yet, and
 /// growing one struct is cheaper than re-threading four signatures.
+#[non_exhaustive]
 pub struct Context<A>
 where
     A: CloseNodes,
 {
     pub close_nodes: A,
-    pub values: DashMap<Key, Vec<u8>>,    
+    pub values: DashMap<Key, Vec<u8>>,
 }
 
 impl<A: CloseNodes> Context<A> {
     /// Shared by every spawned handler, so it is handed out behind an `Arc`.
     pub fn new(close_nodes: A) -> Arc<Self> {
-        Arc::new(Self { close_nodes, values: DashMap::new() })
+        Arc::new(Self {
+            close_nodes,
+            values: DashMap::new(),
+        })
     }
 }
 
@@ -206,6 +210,10 @@ pub async fn serve<A>(context: Arc<Context<A>>, mut requests: mpsc::Receiver<Req
 where
     A: CloseNodes + Send + Sync + 'static,
 {
+    tokio::spawn(async move {
+        tokio::task::yield_now().await;
+        todo!("create a tcp loop to handle relibale transport of store data");
+    });
     while let Some(request) = requests.recv().await {
         let context = Arc::clone(&context);
         // TODO deal with spawn handle

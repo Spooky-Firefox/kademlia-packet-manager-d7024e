@@ -8,9 +8,10 @@ use std::collections::HashSet;
 /// in flight at once.
 const ALPHA: usize = 3;
 
-pub async fn lookup_node<T, A>(rpc: &Rpc<T, A>, target: NodeId) -> Vec<Contact>
+pub async fn lookup_node<T, U, A>(rpc: &Rpc<T, U, A>, target: NodeId) -> Vec<Contact>
 where
     T: RpcTransport,
+    U: RpcTransport,
     A: CloseNodes,
 {
     // contacts we know closest to target
@@ -113,10 +114,13 @@ mod tests {
         };
 
         let transport = FakeTransport { a, b, c };
+        // lookup_node only calls find_node, which uses the plain transport,
+        // so the robust transport is never invoked here.
+        let robust_transport = FakeTransport { a, b, c };
 
         let close_nodes = FakeCloseNodes { initial: vec![a] };
 
-        let rpc = Rpc::new(transport, close_nodes);
+        let rpc = Rpc::new(transport, robust_transport, close_nodes);
 
         let result = lookup_node(&rpc, target).await;
 
@@ -136,10 +140,15 @@ mod tests {
             b: dummy,
             c: dummy,
         };
+        let robust_transport = FakeTransport {
+            a: dummy,
+            b: dummy,
+            c: dummy,
+        };
 
         let close_nodes = FakeCloseNodes { initial: vec![] };
 
-        let rpc = Rpc::new(transport, close_nodes);
+        let rpc = Rpc::new(transport, robust_transport, close_nodes);
 
         let result = lookup_node(&rpc, target).await;
 

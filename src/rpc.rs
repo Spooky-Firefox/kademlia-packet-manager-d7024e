@@ -12,23 +12,27 @@ pub enum FindValue {
 
 /// The four Kademlia RPCs, issued over some [`RpcTransport`].
 #[non_exhaustive]
-pub struct Rpc<T, A>
+pub struct Rpc<T, U, A>
 where
     T: RpcTransport,
+    U: RpcTransport,
     A: CloseNodes,
 {
     transport: T,
+    robust_transport: U,
     close_nodes: A,
 }
 
-impl<T, A> Rpc<T, A>
+impl<T, U, A> Rpc<T, U, A>
 where
     T: RpcTransport,
+    U: RpcTransport,
     A: CloseNodes,
 {
-    pub fn new(transport: T, close_nodes: A) -> Self {
+    pub fn new(transport: T, robust_transport: U, close_nodes: A) -> Self {
         Self {
             transport,
+            robust_transport,
             close_nodes,
         }
     }
@@ -44,7 +48,7 @@ where
 
 // TODO: drop this once the stubs below have real bodies.
 #[allow(unused_variables)]
-impl<T: RpcTransport, A: CloseNodes> Rpc<T, A> {
+impl<T: RpcTransport, U: RpcTransport, A: CloseNodes> Rpc<T, U, A> {
     /// Probe `peer` for liveness.
     pub async fn ping(&self, peer: SocketAddr) -> bool {
         // No request id in the body: the transport frames one and only ever
@@ -74,7 +78,7 @@ impl<T: RpcTransport, A: CloseNodes> Rpc<T, A> {
 
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            self.transport.send_receive(request, peer),
+            self.robust_transport.send_receive(request, peer),
         )
         .await;
 
@@ -178,7 +182,15 @@ mod tests {
             response,
         };
 
-        let rpc = Rpc::new(transport, FakeCloseNodes);
+        // find_node never touches the robust transport, so a transport that
+        // asserts nothing and is never called stands in for it here.
+        let robust_transport = FakeTransport {
+            expected_payload: Vec::new(),
+            expected_address: peer,
+            response: Vec::new(),
+        };
+
+        let rpc = Rpc::new(transport, robust_transport, FakeCloseNodes);
 
         let contacts = rpc.find_node(peer, target).await;
 
