@@ -18,6 +18,7 @@ where
     U: RpcTransport,
     A: CloseNodes,
 {
+    my_id: NodeId,
     transport: T,
     robust_transport: U,
     close_nodes: A,
@@ -29,8 +30,9 @@ where
     U: RpcTransport,
     A: CloseNodes,
 {
-    pub fn new(transport: T, robust_transport: U, close_nodes: A) -> Self {
+    pub fn new(my_id: NodeId, transport: T, robust_transport: U, close_nodes: A) -> Self {
         Self {
+            my_id,
             transport,
             robust_transport,
             close_nodes,
@@ -49,6 +51,14 @@ where
 // TODO: drop this once the stubs below have real bodies.
 #[allow(unused_variables)]
 impl<T: RpcTransport, U: RpcTransport, A: CloseNodes> Rpc<T, U, A> {
+    /// A request's mandatory prefix: this node's id, so the responder can
+    /// learn us as a contact, then `method`'s tag.
+    fn framed_request(&self, method: crate::handle_rpc::Method) -> Vec<u8> {
+        let mut request = self.my_id.to_vec();
+        request.extend_from_slice(method.tag());
+        request
+    }
+
     /// Probe `peer` for liveness.
     pub async fn ping(&self, peer: SocketAddr) -> bool {
         // No request id in the body: the transport frames one and only ever
@@ -56,7 +66,7 @@ impl<T: RpcTransport, U: RpcTransport, A: CloseNodes> Rpc<T, U, A> {
         let res = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             self.transport
-                .send_receive(crate::handle_rpc::Method::Ping.tag().to_vec(), peer),
+                .send_receive(self.framed_request(crate::handle_rpc::Method::Ping), peer),
         )
         .await;
 
@@ -73,7 +83,7 @@ impl<T: RpcTransport, U: RpcTransport, A: CloseNodes> Rpc<T, U, A> {
         let Ok(encoded) = bincode::serialize(&(key, value)) else {
             return false;
         };
-        let mut request = crate::handle_rpc::Method::Store.tag().to_vec();
+        let mut request = self.framed_request(crate::handle_rpc::Method::Store);
         request.extend(encoded);
 
         let response = tokio::time::timeout(
@@ -92,7 +102,7 @@ impl<T: RpcTransport, U: RpcTransport, A: CloseNodes> Rpc<T, U, A> {
             Err(_) => return Vec::new(),
         };
 
-        let mut request = crate::handle_rpc::Method::FindNode.tag().to_vec();
+        let mut request = self.framed_request(crate::handle_rpc::Method::FindNode);
         request.extend(encoded_target);
 
         let response = tokio::time::timeout(
@@ -155,6 +165,7 @@ mod tests {
 
     #[tokio::test]
     async fn find_node_sends_request_and_decodes_contacts() {
+        let my_id = [9u8; 20];
         let target = [1u8; 20];
 
         let peer: SocketAddr = "127.0.0.1:8000".parse().unwrap();
@@ -170,7 +181,11 @@ mod tests {
             },
         ];
 
-        let mut expected_payload = crate::handle_rpc::Method::FindNode.tag().to_vec();
+        // The requester's own id comes right after the transport's request
+        // id, ahead of the method tag, so the responder can learn us as a
+        // contact.
+        let mut expected_payload = my_id.to_vec();
+        expected_payload.extend_from_slice(crate::handle_rpc::Method::FindNode.tag());
 
         expected_payload.extend(bincode::serialize(&target).unwrap());
 
@@ -190,7 +205,7 @@ mod tests {
             response: Vec::new(),
         };
 
-        let rpc = Rpc::new(transport, robust_transport, FakeCloseNodes);
+        let rpc = Rpc::new(my_id, transport, robust_transport, FakeCloseNodes);
 
         let contacts = rpc.find_node(peer, target).await;
 

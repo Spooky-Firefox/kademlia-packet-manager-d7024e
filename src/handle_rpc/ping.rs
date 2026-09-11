@@ -32,8 +32,7 @@ pub async fn handle<A: CloseNodes>(
             body.len()
         );
     }
-    // TODO: learn the sender as a contact, once a request body carries the
-    // NodeId to learn it as. Every arriving RPC is evidence of liveness, and
-    // dropping it is how a routing table goes stale.
+    // The sender is already learned as a contact by `dispatch`, ahead of
+    // every handler — every arriving RPC carries a NodeId now, not just this one.
     Some(PONG.to_vec())
 }
