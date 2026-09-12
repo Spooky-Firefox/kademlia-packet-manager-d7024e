@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 
 /// Result of a FIND_VALUE: either the value itself, or the closest contacts
 /// the peer knows about if it does not hold the key.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FindValue {
     Value(Vec<u8>),
     Closest(Vec<Contact>),
@@ -117,7 +117,29 @@ impl<T: RpcTransport, U: RpcTransport, A: CloseNodes> Rpc<T, U, A> {
     pub async fn find_value(&self, peer: SocketAddr, key: Key) -> FindValue {
         // NOTE lab spec allows for tcp transport of values, not forcing udp only
 
-        todo!("encode FIND_VALUE, send_receive, decode the reply")
+        let encoded_key = match bincode::serialize(&key) {
+            Ok(bytes) => bytes,
+            Err(_) => return FindValue::Closest(Vec::new()),
+        };
+
+        let mut request = crate::handle_rpc::Method::FindValue.tag().to_vec();
+        request.extend(encoded_key);
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.robust_transport.send_receive(request, peer),
+        )
+        .await;
+
+        let response = match response {
+            Ok(Ok(bytes)) => bytes,
+            _ => return FindValue::Closest(Vec::new()),
+        };
+
+        match bincode::deserialize::<FindValue>(&response) {
+            Ok(reply) => reply,
+            Err(_) => FindValue::Closest(Vec::new()),
+        }
     }
 }
 
@@ -195,5 +217,72 @@ mod tests {
         let contacts = rpc.find_node(peer, target).await;
 
         assert_eq!(contacts, expected_contacts);
+    }
+
+    #[tokio::test]
+    async fn find_value_sends_request_and_decodes_value() {
+        let key = [1u8; 20];
+        let peer: SocketAddr = "127.0.0.1:8000".parse().unwrap();
+
+        let expected_reply = FindValue::Value(b"hello".to_vec());
+
+        let mut expected_payload = crate::handle_rpc::Method::FindValue.tag().to_vec();
+        expected_payload.extend(bincode::serialize(&key).unwrap());
+
+        let response = bincode::serialize(&expected_reply).unwrap();
+
+        let transport = FakeTransport {
+            expected_payload: Vec::new(),
+            expected_address: peer,
+            response: Vec::new(),
+        };
+
+        let robust_transport = FakeTransport {
+            expected_payload,
+            expected_address: peer,
+            response,
+        };
+
+        let rpc = Rpc::new(transport, robust_transport, FakeCloseNodes);
+
+        let result = rpc.find_value(peer, key).await;
+
+        assert_eq!(result, expected_reply);
+    }
+
+    #[tokio::test]
+    async fn find_value_decodes_closest_contacts() {
+        let key = [1u8; 20];
+        let peer: SocketAddr = "127.0.0.1:8000".parse().unwrap();
+
+        let contacts = vec![Contact {
+            id: [2u8; 20],
+            address: "127.0.0.1:8001".parse().unwrap(),
+        }];
+
+        let expected_reply = FindValue::Closest(contacts);
+
+        let mut expected_payload = crate::handle_rpc::Method::FindValue.tag().to_vec();
+        expected_payload.extend(bincode::serialize(&key).unwrap());
+
+        let response = bincode::serialize(&expected_reply).unwrap();
+
+        let transport = FakeTransport {
+            expected_payload: Vec::new(),
+            expected_address: peer,
+            response: Vec::new(),
+        };
+
+        let robust_transport = FakeTransport {
+            expected_payload,
+            expected_address: peer,
+            response,
+        };
+
+        let rpc = Rpc::new(transport, robust_transport, FakeCloseNodes);
+
+        let result = rpc.find_value(peer, key).await;
+
+        assert_eq!(result, expected_reply);
     }
 }
