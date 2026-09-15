@@ -1,33 +1,34 @@
 //! The server side of the four Kademlia RPCs.
 //!
 //! [`Rpc`](crate::rpc::Rpc) is the client half: it encodes a request, hands it
-//! to a transport and waits for the reply. This module is the other half.
-//! [`serve`] takes inbound requests off a channel, reads the method tag off
-//! the front of each payload and spawns the matching handler.
+//! to a transport and waits for the reply. This module is the other half:
+//! [`UdpDispatcher`] and [`TcpDispatcher`] each read framed requests off their
+//! own transport, route the method tag to a handler, and write the reply
+//! back over the same transport it arrived on.
 //!
-//! # Where the requests come from
+//! # Why two dispatchers, not one
 //!
-//! Neither transport routes inbound *requests* anywhere yet. Their receive
-//! loops match each datagram's 8-byte id against
-//! [`Pending`](crate::pending::Pending) and drop it when nobody is waiting —
-//! which is exactly what an unsolicited request looks like from there. Handing
-//! those datagrams to a [`Request`] channel instead of dropping them is the
-//! seam this module is written against, and [`Request::from_datagram`] is the
-//! split they need: the id off the front, the request behind it.
-//!
-//! The id goes back out on the reply. It is the only thing in the returning
-//! datagram that says which of the requester's awaiting tasks this answers, so
-//! [`frame_reply`] puts it back on the front before the answer leaves and
-//! [`Request::respond`] carries the finished datagram — a transport sends
-//! those bytes as they are rather than reconstructing the framing itself.
+//! Parsing and routing are identical for both transports — that part is
+//! [`parse_framed`] and [`handle_body`], shared by both. They differ on
+//! exactly one thing: whether `from` is safe to learn as a
+//! [`Contact`]. A UDP request's `from` is the address its sender is actually
+//! listening on, because send and receive share one bound socket
+//! ([`UdpTransport`](crate::rpc_transport::udp_transport::UdpTransport)) — so
+//! [`UdpDispatcher`] hands it straight to
+//! [`CloseNodes::maybe_add_contact`]. A TCP request's `from` is the ephemeral
+//! local port the OS picked for the sender's one-shot
+//! [`TcpTransport::send_receive`](crate::rpc_transport::tcp_transport::TcpTransport::send_receive)
+//! call, not the port it listens on for the next connection — so
+//! [`TcpDispatcher`] has no `CloseNodes` handle at all, and cannot learn a
+//! bad contact from it by accident.
 //!
 //! # Why a task per request
 //!
 //! A handler can block on work of its own — a STORE that hits disk, a
 //! FIND_VALUE that has to ask someone else first. Awaiting it inline would
-//! stall every other request behind it, on a wire where the sender has already
-//! started its own timeout. So the loop does nothing but parse and dispatch,
-//! and the work happens in a task.
+//! stall every other request behind it, on a wire where the sender has
+//! already started its own timeout. So each dispatcher's receive loop does
+//! nothing but parse and spawn, and the work happens in a task.
 
 pub mod find_node;
 pub mod find_value;
@@ -40,8 +41,7 @@ use log::trace;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 /// Wire framing: an 8-byte big-endian request id, then the payload. The same
 /// framing every transport writes — see
@@ -51,9 +51,8 @@ pub const ID_LEN: usize = size_of::<u64>();
 
 /// Wire framing: right after the request id comes the sender's [`NodeId`],
 /// ahead of the method tag and body. Every RPC [`Rpc`](crate::rpc::Rpc)
-/// issues is framed with this prefix, and [`dispatch`] strips exactly this
-/// much off `Request::payload` before looking at the method tag, learning
-/// the sender as a [`Contact`] from it.
+/// issues is framed with this prefix, and [`parse_framed`] strips exactly
+/// this much off a request's payload before looking at the method tag.
 pub const NODE_ID_LEN: usize = size_of::<NodeId>();
 
 /// Frame a reply to request `id`: the id back on the front, then `body`.
@@ -154,42 +153,25 @@ pub struct Request {
     /// It is the sender's name for this request, not ours, and it is only
     /// unique among *their* in-flight requests — two peers will hand us the
     /// same id routinely, so it identifies a request only together with
-    /// [`from`](Self::from). A handler wants it to name the request in a log
-    /// line that the other node's log can be read against, and to reference it
-    /// in a reply it frames itself, as a STORE answering over TCP would.
+    /// [`from`](Self::from).
     pub id: u64,
     /// Who sent it, and where the reply goes.
     ///
-    /// Paired with the [`NodeId`] [`dispatch`] strips off the front of
-    /// `payload`, this is how the sender gets learned as a
-    /// [`Contact`](crate::close_nodes::Contact) — before any handler sees the
-    /// request.
+    /// Paired with the [`NodeId`] [`parse_framed`] strips off the front of
+    /// `payload`, this is how [`UdpDispatcher`] learns the sender as a
+    /// [`Contact`] — [`TcpDispatcher`] never does, since a TCP request's
+    /// `from` is not a dialable address (see the module doc).
     pub from: SocketAddr,
     /// The request as it arrived, minus the transport's id prefix: the
-    /// sender's [`NodeId`], then the method tag and body. [`dispatch`] strips
-    /// the node id before splitting off the tag, so a handler only ever sees
-    /// what follows it.
+    /// sender's [`NodeId`], then the method tag and body. [`parse_framed`]
+    /// strips the node id before splitting off the tag, so a handler only
+    /// ever sees what follows it.
     pub payload: Vec<u8>,
-    /// Where the finished reply goes: the complete datagram, id and all, ready
-    /// to hand straight to `send_to`. Dropping this answers nothing, which
-    /// over UDP is a legitimate answer.
-    pub respond: oneshot::Sender<Vec<u8>>,
 }
 
 impl Request {
-    /// A request and the half that resolves once it has been answered. `None`
-    /// out of the receiver means the node chose not to reply.
-    pub fn new(id: u64, from: SocketAddr, payload: Vec<u8>) -> (Self, oneshot::Receiver<Vec<u8>>) {
-        let (respond, rx) = oneshot::channel();
-        (
-            Self {
-                id,
-                from,
-                payload,
-                respond,
-            },
-            rx,
-        )
+    pub fn new(id: u64, from: SocketAddr, payload: Vec<u8>) -> Self {
+        Self { id, from, payload }
     }
 
     /// Split a datagram as it came off the wire: [`ID_LEN`] bytes of id, then
@@ -200,10 +182,7 @@ impl Request {
     /// [`Pending`](crate::pending::Pending). Reading the id here rather than
     /// taking the transport's word for it keeps the framing in one place; a
     /// transport that has already parsed it can call [`new`](Self::new).
-    pub fn from_datagram(
-        from: SocketAddr,
-        datagram: &[u8],
-    ) -> Option<(Self, oneshot::Receiver<Vec<u8>>)> {
+    pub fn from_datagram(from: SocketAddr, datagram: &[u8]) -> Option<Self> {
         let (id, payload) = datagram.split_at_checked(ID_LEN)?;
         // split_at_checked handed back exactly ID_LEN bytes.
         let id = u64::from_be_bytes(id.try_into().unwrap());
@@ -211,43 +190,172 @@ impl Request {
     }
 }
 
-/// Answer inbound requests until `requests` closes.
-///
-/// The channel is bounded on purpose: the side feeding it should `try_send`
-/// and drop what does not fit, rather than park its receive loop behind a
-/// backlog. Shedding load looks like a lost datagram to the sender, which is
-/// the failure every caller already handles; blocking the socket does not.
-///
-/// `tcp_listener` is accepted already bound, the same way
-/// [`UdpTransport`](crate::rpc_transport::udp_transport::UdpTransport) takes
-/// an already-bound socket: binding is the caller's address decision, not
-/// this function's.
-pub async fn serve<A>(
-    context: Arc<Context<A>>,
-    mut requests: mpsc::Receiver<Request>,
-    tcp_listener: TcpListener,
-) where
-    A: CloseNodes + Send + Sync + 'static,
-{
-    let tcp_context = Arc::clone(&context);
-    // TODO deal with spawn handle
-    tokio::spawn(serve_tcp(tcp_context, tcp_listener));
-    while let Some(request) = requests.recv().await {
-        let context = Arc::clone(&context);
-        // TODO deal with spawn handle
-        tokio::spawn(dispatch(context, request));
-    }
-    trace!("Request channel closed, stopping the serve loop");
+/// Strip the framing every [`Rpc`](crate::rpc::Rpc) writes: the sender's
+/// [`NodeId`], then the method tag. `None` for a payload too short to carry
+/// a node id, or one whose tag nothing here recognises.
+fn parse_framed(payload: &[u8]) -> Option<(NodeId, Method, &[u8])> {
+    let (sender_id, rest) = payload.split_at_checked(NODE_ID_LEN)?;
+    let (method, body) = Method::split_tag(rest)?;
+    // split_at_checked handed back exactly NODE_ID_LEN bytes.
+    Some((sender_id.try_into().unwrap(), method, body))
 }
 
-/// Accept STORE requests arriving over TCP, one connection per request.
+/// Route to the matching handler. The one piece both dispatchers share, so
+/// teaching the server a new method only means changing it here once.
+async fn handle_body<A: CloseNodes>(
+    context: &Context<A>,
+    id: u64,
+    from: SocketAddr,
+    method: Method,
+    body: &[u8],
+) -> Option<Vec<u8>> {
+    trace!("{method:?} {id} from {from}, {} byte body", body.len());
+    let reply = match method {
+        Method::Ping => ping::handle(context, id, from, body).await,
+        Method::Store => store::handle(context, id, from, body).await,
+        Method::FindNode => find_node::handle(context, id, from, body).await,
+        Method::FindValue => find_value::handle(context, id, from, body).await,
+    };
+    if reply.is_none() {
+        trace!("No reply to {method:?} {id} from {from}");
+    }
+    reply
+}
+
+/// Answers requests arriving over UDP — the one dispatcher that learns
+/// contacts. See the module doc for why that is safe here and is not for
+/// [`TcpDispatcher`].
+pub struct UdpDispatcher<A: CloseNodes> {
+    context: Arc<Context<A>>,
+}
+
+impl<A: CloseNodes> UdpDispatcher<A> {
+    pub fn new(context: Arc<Context<A>>) -> Self {
+        Self { context }
+    }
+}
+
+impl<A: CloseNodes + Send + Sync + 'static> UdpDispatcher<A> {
+    /// Parse `request`, learn its sender, and hand off to the shared
+    /// handler. `None` for a malformed or unrecognised request, or one the
+    /// handler chose not to answer.
+    async fn dispatch(&self, request: &Request) -> Option<Vec<u8>> {
+        let Some((sender_id, method, body)) = parse_framed(&request.payload) else {
+            trace!(
+                "Unrecognised or malformed UDP request {} from {}, dropping {} bytes",
+                request.id,
+                request.from,
+                request.payload.len()
+            );
+            return None;
+        };
+        // Every arriving UDP request is evidence the sender is alive and
+        // reachable at this address, so it is learned before the method is
+        // even looked at.
+        self.context.close_nodes.maybe_add_contact(Contact {
+            id: sender_id,
+            address: request.from,
+        });
+
+        let reply = handle_body(&self.context, request.id, request.from, method, body).await?;
+        Some(frame_reply(request.id, &reply))
+    }
+
+    /// Read datagrams off `socket` until it errors, dispatching each on its
+    /// own task so one slow handler cannot delay the next datagram's turn at
+    /// `recv_from`.
+    ///
+    /// `socket` is accepted already bound: binding is the caller's address
+    /// decision, not this method's.
+    pub async fn run(self: Arc<Self>, socket: UdpSocket) {
+        let socket = Arc::new(socket);
+        let mut buf = vec![0u8; 1024];
+        loop {
+            let (len, from) = match socket.recv_from(&mut buf).await {
+                Ok(received) => received,
+                Err(e) => {
+                    trace!("udp recv failed: {e}");
+                    continue;
+                }
+            };
+
+            let Some(request) = Request::from_datagram(from, &buf[..len]) else {
+                trace!("udp datagram from {from} too short for an id, dropping {len} bytes");
+                continue;
+            };
+
+            let this = Arc::clone(&self);
+            let socket = Arc::clone(&socket);
+            tokio::spawn(async move {
+                let Some(datagram) = this.dispatch(&request).await else {
+                    return;
+                };
+                if let Err(e) = socket.send_to(&datagram, request.from).await {
+                    trace!("udp reply to {} failed: {e}", request.from);
+                }
+            });
+        }
+    }
+}
+
+/// Answers requests arriving over TCP.
+///
+/// Deliberately has no [`CloseNodes`] handle: a TCP request's `from` is the
+/// ephemeral local port the OS picked for the sender's one-shot
+/// `TcpStream::connect`, not the port it listens on for the next connection —
+/// nothing here is safe to hand to `maybe_add_contact`. See [`UdpDispatcher`]
+/// for the transport that can.
+pub struct TcpDispatcher<A: CloseNodes> {
+    context: Arc<Context<A>>,
+}
+
+impl<A: CloseNodes> TcpDispatcher<A> {
+    pub fn new(context: Arc<Context<A>>) -> Self {
+        Self { context }
+    }
+}
+
+impl<A: CloseNodes + Send + Sync + 'static> TcpDispatcher<A> {
+    async fn dispatch(&self, request: &Request) -> Option<Vec<u8>> {
+        let Some((_sender_id, method, body)) = parse_framed(&request.payload) else {
+            trace!(
+                "Unrecognised or malformed TCP request {} from {}, dropping {} bytes",
+                request.id,
+                request.from,
+                request.payload.len()
+            );
+            return None;
+        };
+
+        let reply = handle_body(&self.context, request.id, request.from, method, body).await?;
+        Some(frame_reply(request.id, &reply))
+    }
+}
+
+/// Answer inbound requests on both transports until either socket is closed.
+///
+/// Both sockets are accepted already bound: binding is the caller's address
+/// decision, not this function's.
+pub async fn serve<A>(context: Arc<Context<A>>, udp_socket: UdpSocket, tcp_listener: TcpListener)
+where
+    A: CloseNodes + Send + Sync + 'static,
+{
+    let udp_dispatcher = Arc::new(UdpDispatcher::new(Arc::clone(&context)));
+    let tcp_dispatcher = Arc::new(TcpDispatcher::new(context));
+
+    // TODO deal with spawn handle
+    tokio::spawn(udp_dispatcher.run(udp_socket));
+    serve_tcp(tcp_dispatcher, tcp_listener).await;
+}
+
+/// Accept requests arriving over TCP, one connection per request.
 ///
 /// [`TcpTransport::send_receive`](crate::rpc_transport::tcp_transport::TcpTransport::send_receive)
 /// writes the whole request, half-closes, then reads until we close our own
 /// write side — so a connection here is read to EOF for the request, and
 /// closed once the reply has been written, mirroring that framing from the
 /// other end.
-async fn serve_tcp<A>(context: Arc<Context<A>>, listener: TcpListener)
+async fn serve_tcp<A>(dispatcher: Arc<TcpDispatcher<A>>, listener: TcpListener)
 where
     A: CloseNodes + Send + Sync + 'static,
 {
@@ -259,10 +367,10 @@ where
                 continue;
             }
         };
-        let context = Arc::clone(&context);
+        let dispatcher = Arc::clone(&dispatcher);
         // TODO deal with spawn handle
         tokio::spawn(async move {
-            if let Err(e) = handle_tcp_connection(context, stream, from).await {
+            if let Err(e) = handle_tcp_connection(dispatcher, stream, from).await {
                 trace!("tcp connection from {from} failed: {e}");
             }
         });
@@ -272,7 +380,7 @@ where
 /// Read one framed request off `stream`, dispatch it, and write the reply
 /// back before closing.
 async fn handle_tcp_connection<A>(
-    context: Arc<Context<A>>,
+    dispatcher: Arc<TcpDispatcher<A>>,
     mut stream: TcpStream,
     from: SocketAddr,
 ) -> std::io::Result<()>
@@ -282,7 +390,7 @@ where
     let mut datagram = Vec::new();
     stream.read_to_end(&mut datagram).await?;
 
-    let Some((request, reply)) = Request::from_datagram(from, &datagram) else {
+    let Some(request) = Request::from_datagram(from, &datagram) else {
         trace!(
             "tcp request from {from} too short for an id, dropping {} bytes",
             datagram.len()
@@ -290,71 +398,10 @@ where
         return Ok(());
     };
 
-    // Awaited inline rather than spawned: this connection already has its
-    // own task, so there is no fan-out left to gain by handing dispatch a
-    // second one, and awaiting keeps the reply's oneshot alive without an
-    // extra clone of `from`.
-    dispatch(context, request).await;
-
-    if let Ok(datagram) = reply.await {
-        stream.write_all(&datagram).await?;
+    if let Some(reply) = dispatcher.dispatch(&request).await {
+        stream.write_all(&reply).await?;
     }
     stream.shutdown().await
-}
-
-/// Parse one request and hand it to its handler.
-///
-/// Split out of [`serve`] so the spawned task owns the parse too: a malformed
-/// payload then costs a task instead of a turn of the loop everyone else is
-/// queued behind.
-async fn dispatch<A: CloseNodes>(context: Arc<Context<A>>, request: Request) {
-    let Request {
-        id,
-        from,
-        payload,
-        respond,
-    } = request;
-
-    let Some((sender_id, payload)) = payload.split_at_checked(NODE_ID_LEN) else {
-        trace!(
-            "Request {id} from {from} too short to carry a node id, dropping {} bytes",
-            payload.len()
-        );
-        return;
-    };
-    // Every arriving RPC is evidence the sender is alive and reachable here,
-    // so it is learned as a contact before its method is even looked at.
-    context.close_nodes.maybe_add_contact(Contact {
-        id: sender_id.try_into().unwrap(),
-        address: from,
-    });
-
-    let Some((method, body)) = Method::split_tag(payload) else {
-        // Not ours: a stray datagram, a peer speaking a later version of the
-        // protocol, or a reply that arrived after its request was cancelled.
-        trace!(
-            "Unrecognised request {id} from {from}, dropping {} bytes",
-            payload.len()
-        );
-        return;
-    };
-    trace!("{method:?} {id} from {from}, {} byte body", body.len());
-
-    let reply = match method {
-        Method::Ping => ping::handle(&context, id, from, body).await,
-        Method::Store => store::handle(&context, id, from, body).await,
-        Method::FindNode => find_node::handle(&context, id, from, body).await,
-        Method::FindValue => find_value::handle(&context, id, from, body).await,
-    };
-
-    let Some(reply) = reply else {
-        trace!("No reply to {method:?} {id} from {from}");
-        return;
-    };
-    // Err means the requester gave up and dropped the responder.
-    if respond.send(frame_reply(id, &reply)).is_err() {
-        trace!("Nobody left to take the {method:?} {id} reply for {from}");
-    }
 }
 
 #[cfg(test)]
@@ -379,31 +426,16 @@ mod tests {
         payload
     }
 
-    /// A served node with a channel to feed requests into, the address its
-    /// TCP loop is listening on, and the context it is served with (so a
-    /// test can check what actually landed in `values`).
-    ///
-    /// Bound via `std::net::TcpListener` and handed to Tokio through
-    /// `from_std` so this helper can stay a plain (non-async) fn, matching
-    /// its existing callers.
-    fn spawn_serve_with_tcp_addr() -> (
-        mpsc::Sender<Request>,
-        SocketAddr,
-        Arc<Context<crate::close_nodes::RecommendedCloseNodes>>,
-    ) {
-        let (tx, rx) = mpsc::channel(8);
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let tcp_addr = listener.local_addr().unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let listener = TcpListener::from_std(listener).unwrap();
-        let context = Context::new(recommended([0u8; 20]));
-        tokio::spawn(serve(Arc::clone(&context), rx, listener));
-        (tx, tcp_addr, context)
+    /// Frame a whole datagram the way a transport writes it: an 8-byte id,
+    /// then [`framed`]'s payload.
+    fn framed_datagram(id: u64, rest: &[u8]) -> Vec<u8> {
+        let mut datagram = id.to_be_bytes().to_vec();
+        datagram.extend(framed(rest));
+        datagram
     }
 
-    /// A served node with a channel to feed requests into.
-    fn spawn_serve() -> mpsc::Sender<Request> {
-        spawn_serve_with_tcp_addr().0
+    fn test_context() -> Arc<Context<crate::close_nodes::RecommendedCloseNodes>> {
+        Context::new(recommended([0u8; 20]))
     }
 
     #[test]
@@ -422,16 +454,16 @@ mod tests {
         assert_eq!(Method::split_tag(b""), None);
     }
 
-    /// The framing `UdpTransport::send_receive` writes, read back: an 8-byte
-    /// big-endian id, then the payload. Built here the way the transport
-    /// builds it, so the two cannot drift apart unnoticed.
+    /// The framing every transport writes, read back: an 8-byte big-endian
+    /// id, then the payload. Built here the way a transport builds it, so
+    /// the two cannot drift apart unnoticed.
     #[test]
     fn a_datagram_splits_into_its_id_and_the_request() {
         let id = 0x0102_0304_0506_0708u64;
         let mut datagram = id.to_be_bytes().to_vec();
         datagram.extend_from_slice(Method::Ping.tag());
 
-        let (request, _reply) = Request::from_datagram(addr(), &datagram).expect("carries an id");
+        let request = Request::from_datagram(addr(), &datagram).expect("carries an id");
         assert_eq!(request.id, id);
         assert_eq!(request.payload, Method::Ping.tag());
         assert_eq!(request.from, addr());
@@ -444,53 +476,56 @@ mod tests {
         assert!(Request::from_datagram(addr(), b"").is_none());
         assert!(Request::from_datagram(addr(), &[0u8; ID_LEN - 1]).is_none());
         // Exactly an id and nothing else still parses; an empty payload is a
-        // request with no method tag, which dispatch drops on its own.
+        // request with no node id or method tag, which dispatch drops on its
+        // own.
         assert!(Request::from_datagram(addr(), &[0u8; ID_LEN]).is_some());
+    }
+
+    /// A reply reframed by `frame_reply` is a datagram `from_datagram` reads,
+    /// so the two halves of the framing cannot drift apart.
+    #[test]
+    fn framing_round_trips() {
+        let id = u64::MAX;
+        let datagram = frame_reply(id, b"PONG");
+        let parsed = Request::from_datagram(addr(), &datagram).expect("carries an id");
+        assert_eq!(parsed.id, id);
+        assert_eq!(parsed.payload, b"PONG");
     }
 
     #[tokio::test]
     async fn ping_is_answered_with_a_pong() {
-        let requests = spawn_serve();
-        let (request, reply) = Request::new(7, addr(), framed(Method::Ping.tag()));
-        requests.send(request).await.unwrap();
+        let dispatcher = UdpDispatcher::new(test_context());
+        let request = Request::new(7, addr(), framed(Method::Ping.tag()));
 
         assert_eq!(
-            tokio::time::timeout(Duration::from_secs(1), reply)
-                .await
-                .expect("answered within 1s")
-                .expect("the handler replied"),
-            frame_reply(7, ping::PONG)
+            dispatcher.dispatch(&request).await,
+            Some(frame_reply(7, ping::PONG))
         );
     }
 
     /// A payload too short to carry a node id is dropped the same way an
-    /// unrecognised method is: no reply, sender times out.
+    /// unrecognised method is: no reply.
     #[tokio::test]
     async fn requests_too_short_for_a_node_id_are_dropped() {
-        let requests = spawn_serve();
-        let (request, reply) = Request::new(7, addr(), vec![0u8; NODE_ID_LEN - 1]);
-        requests.send(request).await.unwrap();
+        let dispatcher = UdpDispatcher::new(test_context());
+        let request = Request::new(7, addr(), vec![0u8; NODE_ID_LEN - 1]);
 
-        assert!(
-            tokio::time::timeout(Duration::from_secs(1), reply)
-                .await
-                .expect("resolved within 1s")
-                .is_err()
-        );
+        assert_eq!(dispatcher.dispatch(&request).await, None);
     }
 
-    /// Every dispatched request learns its sender as a contact, whether or
-    /// not the method itself is recognised — this is what lets a routing
-    /// table build up from ordinary traffic instead of only from FIND_NODE
-    /// replies.
+    /// Every request `UdpDispatcher` handles learns its sender as a contact,
+    /// whether or not the method itself is recognised — this is what lets a
+    /// routing table build up from ordinary traffic instead of only from
+    /// FIND_NODE replies.
     #[tokio::test]
-    async fn dispatch_learns_the_sender_as_a_contact() {
-        let (requests, _tcp_addr, context) = spawn_serve_with_tcp_addr();
-        let (request, reply) = Request::new(7, addr(), framed(Method::Ping.tag()));
-        requests.send(request).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(1), reply)
+    async fn udp_dispatch_learns_the_sender_as_a_contact() {
+        let context = test_context();
+        let dispatcher = UdpDispatcher::new(Arc::clone(&context));
+        let request = Request::new(7, addr(), framed(Method::Ping.tag()));
+
+        dispatcher
+            .dispatch(&request)
             .await
-            .expect("resolved within 1s")
             .expect("the handler replied");
 
         let learned = context.close_nodes.close_nodes(sender_id());
@@ -501,36 +536,31 @@ mod tests {
         );
     }
 
-    /// An unrecognised request is dropped, not answered: the responder is
-    /// closed without a value, and the sender sees a timeout as it would for
-    /// any lost datagram.
+    /// The whole point of splitting the dispatchers: a TCP request's `from`
+    /// is not a dialable address (see the module doc), so `TcpDispatcher`
+    /// must never learn it as a contact — unlike `UdpDispatcher` above.
     #[tokio::test]
-    async fn unknown_methods_go_unanswered() {
-        let requests = spawn_serve();
-        let (request, reply) = Request::new(7, addr(), framed(b"NOT_A_METHOD"));
-        requests.send(request).await.unwrap();
+    async fn tcp_dispatch_does_not_learn_the_sender_as_a_contact() {
+        let context = test_context();
+        let dispatcher = TcpDispatcher::new(Arc::clone(&context));
+        let request = Request::new(7, addr(), framed(Method::Ping.tag()));
 
-        assert!(
-            tokio::time::timeout(Duration::from_secs(1), reply)
-                .await
-                .expect("resolved within 1s")
-                .is_err()
-        );
+        dispatcher
+            .dispatch(&request)
+            .await
+            .expect("the handler replied");
+
+        let learned = context.close_nodes.close_nodes(sender_id());
+        assert!(!learned.iter().any(|c| c.id == sender_id()));
     }
 
-    /// One handler must not hold up the next request, which is the whole
-    /// reason the loop spawns.
+    /// An unrecognised request is dropped, not answered.
     #[tokio::test]
-    async fn requests_are_served_concurrently() {
-        let requests = spawn_serve();
-        let (first, first_reply) = Request::new(1, addr(), framed(Method::Ping.tag()));
-        let (second, second_reply) = Request::new(2, addr(), framed(Method::Ping.tag()));
-        requests.send(first).await.unwrap();
-        requests.send(second).await.unwrap();
+    async fn unknown_methods_go_unanswered() {
+        let dispatcher = UdpDispatcher::new(test_context());
+        let request = Request::new(7, addr(), framed(b"NOT_A_METHOD"));
 
-        let (a, b) = tokio::join!(first_reply, second_reply);
-        assert_eq!(a.unwrap(), frame_reply(1, ping::PONG));
-        assert_eq!(b.unwrap(), frame_reply(2, ping::PONG));
+        assert_eq!(dispatcher.dispatch(&request).await, None);
     }
 
     /// The echo the requester's `Pending` matches on: a reply goes back under
@@ -538,14 +568,13 @@ mod tests {
     /// parked in. An id that did not survive the round trip wakes nobody.
     #[tokio::test]
     async fn the_reply_carries_the_request_id_back() {
-        let requests = spawn_serve();
+        let dispatcher = UdpDispatcher::new(test_context());
         let id = 0x0102_0304_0506_0708u64;
-        let (request, reply) = Request::new(id, addr(), framed(Method::Ping.tag()));
-        requests.send(request).await.unwrap();
+        let request = Request::new(id, addr(), framed(Method::Ping.tag()));
 
-        let datagram = tokio::time::timeout(Duration::from_secs(1), reply)
+        let datagram = dispatcher
+            .dispatch(&request)
             .await
-            .expect("answered within 1s")
             .expect("the handler replied");
 
         // Read back the way a recv loop reads it: id off the front, then body.
@@ -554,15 +583,62 @@ mod tests {
         assert_eq!(body, ping::PONG);
     }
 
-    /// A reply reframed by `frame_reply` is a datagram `from_datagram` reads,
-    /// so the two halves of the framing cannot drift apart.
-    #[test]
-    fn framing_round_trips() {
-        let id = u64::MAX;
-        let datagram = frame_reply(id, b"PONG");
-        let (parsed, _reply) = Request::from_datagram(addr(), &datagram).expect("carries an id");
-        assert_eq!(parsed.id, id);
-        assert_eq!(parsed.payload, b"PONG");
+    /// A served node with the address each of its two transports is
+    /// listening on, and the context it is served with (so a test can check
+    /// what actually landed in `values` or the routing table).
+    ///
+    /// Both are bound via `std::net::{TcpListener, UdpSocket}` and handed to
+    /// Tokio through `from_std` so this helper can stay a plain (non-async)
+    /// fn, matching its existing callers.
+    fn spawn_serve() -> (
+        SocketAddr,
+        SocketAddr,
+        Arc<Context<crate::close_nodes::RecommendedCloseNodes>>,
+    ) {
+        let tcp_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let tcp_addr = tcp_listener.local_addr().unwrap();
+        tcp_listener.set_nonblocking(true).unwrap();
+        let tcp_listener = TcpListener::from_std(tcp_listener).unwrap();
+
+        let udp_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let udp_addr = udp_socket.local_addr().unwrap();
+        udp_socket.set_nonblocking(true).unwrap();
+        let udp_socket = UdpSocket::from_std(udp_socket).unwrap();
+
+        let context = Context::new(recommended([0u8; 20]));
+        tokio::spawn(serve(Arc::clone(&context), udp_socket, tcp_listener));
+        (tcp_addr, udp_addr, context)
+    }
+
+    /// Two pings sent back-to-back over the real UDP loop come back
+    /// correctly matched by id — proof `UdpDispatcher::run` spawns a task per
+    /// datagram instead of answering them one at a time.
+    #[tokio::test]
+    async fn udp_requests_are_served_concurrently() {
+        let (_tcp_addr, udp_addr, _context) = spawn_serve();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        client
+            .send_to(&framed_datagram(1, Method::Ping.tag()), udp_addr)
+            .await
+            .unwrap();
+        client
+            .send_to(&framed_datagram(2, Method::Ping.tag()), udp_addr)
+            .await
+            .unwrap();
+
+        let mut buf = [0u8; 64];
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..2 {
+            let (len, _) = tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut buf))
+                .await
+                .expect("answered within 1s")
+                .unwrap();
+            seen.insert(buf[..len].to_vec());
+        }
+
+        assert!(seen.contains(&frame_reply(1, ping::PONG)));
+        assert!(seen.contains(&frame_reply(2, ping::PONG)));
     }
 
     /// A STORE arriving over the TCP loop, framed exactly the way
@@ -571,9 +647,7 @@ mod tests {
     /// lands in `values`, and the ack comes back over the same connection.
     #[tokio::test]
     async fn tcp_store_is_written_and_acked() {
-        use tokio::net::TcpStream;
-
-        let (_requests, tcp_addr, context) = spawn_serve_with_tcp_addr();
+        let (tcp_addr, _udp_addr, context) = spawn_serve();
         let key: Key = [9u8; 20];
         let value = b"stored over tcp".to_vec();
         let id = 0x1122_3344_5566_7788u64;

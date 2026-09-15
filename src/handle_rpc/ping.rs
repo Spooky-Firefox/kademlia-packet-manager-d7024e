@@ -32,7 +32,8 @@ pub async fn handle<A: CloseNodes>(
             body.len()
         );
     }
-    // The sender is already learned as a contact by `dispatch`, ahead of
-    // every handler — every arriving RPC carries a NodeId now, not just this one.
+    // A UDP sender is already learned as a contact by `UdpDispatcher`, ahead
+    // of every handler; a TCP one deliberately is not (see handle_rpc's
+    // module doc).
     Some(PONG.to_vec())
 }
