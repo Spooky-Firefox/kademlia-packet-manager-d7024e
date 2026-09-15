@@ -8,6 +8,14 @@ use std::collections::HashSet;
 /// in flight at once.
 const ALPHA: usize = 3;
 
+/// The [`K`] contacts closest to `target` that the network can show us.
+///
+/// Every contact an answer brings back is offered to the routing table on the
+/// way past. A lookup is the only thing that meets nodes outside our own
+/// neighbourhood, so if it did not record them the table would never learn
+/// anything a peer did not first ask us about — which is the whole of joining
+/// a network. See [`bootstrap`](crate::bootstrap), which is a lookup for our
+/// own id and nothing else.
 pub async fn lookup_node<T, U, A>(rpc: &Rpc<T, U, A>, target: NodeId) -> Vec<Contact>
 where
     T: RpcTransport,
@@ -43,6 +51,12 @@ where
         let Some(new_contacts) = in_flight.next().await else {
             break;
         };
+
+        // Learned here rather than by the caller: these are the only nodes we
+        // will ever see that neither contacted us nor were known already.
+        for contact in &new_contacts {
+            rpc.close_nodes().maybe_add_contact(*contact);
+        }
 
         candidates.extend(new_contacts);
         // sort by distance using Olles XOR thingamajig with a closure (rust voodoo)
@@ -120,7 +134,12 @@ mod tests {
 
         let close_nodes = FakeCloseNodes { initial: vec![a] };
 
-        let rpc = Rpc::new(transport, robust_transport, close_nodes);
+        let me = Contact {
+            id: [1u8; 20],
+            address: "127.0.0.1:8000".parse().unwrap(),
+        };
+
+        let rpc = Rpc::new(me, transport, robust_transport, close_nodes);
 
         let result = lookup_node(&rpc, target).await;
 
@@ -148,7 +167,12 @@ mod tests {
 
         let close_nodes = FakeCloseNodes { initial: vec![] };
 
-        let rpc = Rpc::new(transport, robust_transport, close_nodes);
+        let me = Contact {
+            id: [1u8; 20],
+            address: "127.0.0.1:8000".parse().unwrap()
+        };
+
+        let rpc = Rpc::new(me, transport, robust_transport, close_nodes);
 
         let result = lookup_node(&rpc, target).await;
 

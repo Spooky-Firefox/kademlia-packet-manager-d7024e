@@ -35,7 +35,7 @@ pub mod ping;
 pub mod store;
 
 use crate::close_nodes::CloseNodes;
-use crate::close_nodes::Key;
+use crate::close_nodes::{Key, NodeId};
 use dashmap::DashMap;
 use log::trace;
 use std::net::SocketAddr;
@@ -126,14 +126,22 @@ pub struct Context<A>
 where
     A: CloseNodes,
 {
+    /// Who we are. A [`CloseNodes`] knows this already, but does not expose
+    /// it, and [`ping`] has to put it on the wire: an address alone does not
+    /// tell a joining node whose address it is.
+    pub my_id: NodeId,
     pub close_nodes: A,
     pub values: DashMap<Key, Vec<u8>>,
 }
 
 impl<A: CloseNodes> Context<A> {
     /// Shared by every spawned handler, so it is handed out behind an `Arc`.
-    pub fn new(close_nodes: A) -> Arc<Self> {
+    ///
+    /// `my_id` must be the same id the routing table was built around, or we
+    /// answer PINGs with a name our own siblings do not know us by.
+    pub fn new(my_id: NodeId, close_nodes: A) -> Arc<Self> {
         Arc::new(Self {
+            my_id,
             close_nodes,
             values: DashMap::new(),
         })
@@ -336,13 +344,15 @@ async fn dispatch<A: CloseNodes>(context: Arc<Context<A>>, request: Request) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::close_nodes::recommended;
+use super::*;
+    use crate::close_nodes::{Contact, recommended};
     use std::time::Duration;
 
     fn addr() -> SocketAddr {
         "127.0.0.1:4242".parse().unwrap()
     }
+
+    const TEST_ID: NodeId = [0u8; 20];
 
     /// A served node with a channel to feed requests into, the address its
     /// TCP loop is listening on, and the context it is served with (so a
@@ -361,7 +371,8 @@ mod tests {
         let tcp_addr = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
         let listener = TcpListener::from_std(listener).unwrap();
-        let context = Context::new(recommended([0u8; 20]));
+        let my_id = [0u8; 20];
+        let context = Context::new(my_id, recommended(my_id));
         tokio::spawn(serve(Arc::clone(&context), rx, listener));
         (tx, tcp_addr, context)
     }
@@ -424,7 +435,7 @@ mod tests {
                 .await
                 .expect("answered within 1s")
                 .expect("the handler replied"),
-            frame_reply(7, ping::PONG)
+            frame_reply(7, &bincode::serialize(&TEST_ID).unwrap())
         );
     }
 
@@ -456,8 +467,8 @@ mod tests {
         requests.send(second).await.unwrap();
 
         let (a, b) = tokio::join!(first_reply, second_reply);
-        assert_eq!(a.unwrap(), frame_reply(1, ping::PONG));
-        assert_eq!(b.unwrap(), frame_reply(2, ping::PONG));
+        assert_eq!(a.unwrap(), frame_reply(1, &bincode::serialize(&TEST_ID).unwrap()));
+        assert_eq!(b.unwrap(), frame_reply(2, &bincode::serialize(&TEST_ID).unwrap()));
     }
 
     /// The echo the requester's `Pending` matches on: a reply goes back under
@@ -478,7 +489,7 @@ mod tests {
         // Read back the way a recv loop reads it: id off the front, then body.
         let (echoed, body) = datagram.split_at(ID_LEN);
         assert_eq!(u64::from_be_bytes(echoed.try_into().unwrap()), id);
-        assert_eq!(body, ping::PONG);
+        assert_eq!(ping::decode_reply(body), Some(TEST_ID));
     }
 
     /// A reply reframed by `frame_reply` is a datagram `from_datagram` reads,
@@ -504,10 +515,14 @@ mod tests {
         let key: Key = [9u8; 20];
         let value = b"stored over tcp".to_vec();
         let id = 0x1122_3344_5566_7788u64;
+        let sender = Contact {
+            id: [3u8; 20],
+            address: "127.0.0.1:8003".parse().unwrap()
+        };
 
         let mut datagram = id.to_be_bytes().to_vec();
         datagram.extend_from_slice(Method::Store.tag());
-        datagram.extend(bincode::serialize(&(key, value.clone())).unwrap());
+        datagram.extend(store::encode_request(sender, key, value.clone()).unwrap());
 
         let reply = tokio::time::timeout(Duration::from_secs(1), async {
             let mut stream = TcpStream::connect(tcp_addr).await.unwrap();

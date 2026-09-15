@@ -1,6 +1,16 @@
 use crate::close_nodes::{CloseNodes, Contact, Key, NodeId};
+use crate::handle_rpc::Method;
 use crate::rpc_transport::RpcTransport;
+use log::trace;
 use std::net::SocketAddr;
+use std::time::Duration;
+
+/// How long to wait on a reply before giving up on a peer.
+///
+/// The datagram transports resend on silence and give up on their own, so this
+/// is a backstop for the ones that do not — and a bound on how long a single
+/// unreachable peer can hold up a lookup.
+const RPC_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Result of a FIND_VALUE: either the value itself, or the closest contacts
 /// the peer knows about if it does not hold the key.
@@ -18,6 +28,12 @@ where
     U: RpcTransport,
     A: CloseNodes,
 {
+    /// Us, as the peer we are calling should record us.
+    ///
+    /// Every request carries it. A peer that answers a question has met a
+    /// live node and should remember it, and the address a datagram arrives
+    /// from is not enough on its own: routing needs the [`NodeId`] too.
+    my_contact: Contact,
     transport: T,
     robust_transport: U,
     close_nodes: A,
@@ -29,8 +45,9 @@ where
     U: RpcTransport,
     A: CloseNodes,
 {
-    pub fn new(transport: T, robust_transport: U, close_nodes: A) -> Self {
+    pub fn new(my_contact: Contact, transport: T, robust_transport: U, close_nodes: A) -> Self {
         Self {
+            my_contact,
             transport,
             robust_transport,
             close_nodes,
@@ -44,73 +61,92 @@ where
     pub fn close_nodes(&self) -> &A {
         &self.close_nodes
     }
+
+    pub fn my_contact(&self) -> Contact {
+        self.my_contact
+    }
+
+    pub fn my_id(&self) -> NodeId {
+        self.my_contact.id
+    }
 }
 
 // TODO: drop this once the stubs below have real bodies.
 #[allow(unused_variables)]
 impl<T: RpcTransport, U: RpcTransport, A: CloseNodes> Rpc<T, U, A> {
-    /// Probe `peer` for liveness.
-    pub async fn ping(&self, peer: SocketAddr) -> bool {
+    /// Tag `body` as `method`, send it, and hand back the reply body.
+    ///
+    /// `None` for a timeout or a transport error. The four RPCs differ only in
+    /// what they put in the body and what they make of the answer, so the
+    /// framing and the failure handling live here once.
+    async fn call<X: RpcTransport>(
+        &self,
+        transport: &X,
+        method: Method,
+        body: Vec<u8>,
+        peer: SocketAddr,
+    ) -> Option<Vec<u8>> {
+        let mut request = method.tag().to_vec();
+        request.extend(body);
+
+        match tokio::time::timeout(RPC_TIMEOUT, transport.send_receive(request, peer)).await {
+            Ok(Ok(reply)) => Some(reply),
+            Ok(Err(e)) => {
+                trace!("{method:?} to {peer} failed: {e}");
+                None
+            }
+            Err(_) => {
+                trace!("{method:?} to {peer} timed out");
+                None
+            }
+        }
+    }
+
+    /// Probe `peer` for liveness, and learn whose address it is.
+    ///
+    /// `Some(id)` is the liveness answer as well as the identity one: a node
+    /// that replied is alive. `None` covers every way the probe can fail, none
+    /// of which the caller can tell apart on a lossy wire anyway.
+    ///
+    /// Returning the id is what lets a joining node turn a bare bootstrap
+    /// address into a [`Contact`] it can route with.
+    pub async fn ping(&self, peer: SocketAddr) -> Option<NodeId> {
         // No request id in the body: the transport frames one and only ever
         // resolves this future with the reply that carried it back.
-        let res = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            self.transport
-                .send_receive(crate::handle_rpc::Method::Ping.tag().to_vec(), peer),
-        )
-        .await;
-
-        match res {
-            Ok(Ok(receive_payload)) => receive_payload == crate::handle_rpc::ping::PONG,
-            // transport error or timeout
-            _ => false,
-        }
+        let body = crate::handle_rpc::ping::encode_request(self.my_contact)?;
+        let reply = self.call(&self.transport, Method::Ping, body, peer).await?;
+        crate::handle_rpc::ping::decode_reply(&reply)
     }
 
     /// Ask `peer` to store `value` under `key`.
     pub async fn store(&self, peer: SocketAddr, key: Key, value: Vec<u8>) -> bool {
         // NOTE lab spec allows for tcp transport of values, not forcing udp only
-        let Ok(encoded) = bincode::serialize(&(key, value)) else {
+        let Some(body) = crate::handle_rpc::store::encode_request(self.my_contact, key, value)
+        else {
             return false;
         };
-        let mut request = crate::handle_rpc::Method::Store.tag().to_vec();
-        request.extend(encoded);
+        let reply = self
+            .call(&self.robust_transport, Method::Store, body, peer)
+            .await;
 
-        let response = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            self.robust_transport.send_receive(request, peer),
-        )
-        .await;
-
-        matches!(response, Ok(Ok(bytes)) if bytes == crate::handle_rpc::store::STORED)
+        matches!(reply, Some(bytes) if bytes == crate::handle_rpc::store::STORED)
     }
 
     /// Ask `peer` for the contacts it knows closest to `target`.
+    ///
+    /// An empty vector is every kind of "nothing useful came back": an
+    /// unreachable peer, a garbled reply, or a peer that genuinely knows
+    /// nobody. A lookup treats all three the same — it moves on to the next
+    /// candidate — so they do not need telling apart here.
     pub async fn find_node(&self, peer: SocketAddr, target: NodeId) -> Vec<Contact> {
-        let encoded_target = match bincode::serialize(&target) {
-            Ok(bytes) => bytes,
-            Err(_) => return Vec::new(),
+        let Some(body) = crate::handle_rpc::find_node::encode_request(self.my_contact, target)
+        else {
+            return Vec::new();
         };
-
-        let mut request = crate::handle_rpc::Method::FindNode.tag().to_vec();
-        request.extend(encoded_target);
-
-        let response = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            self.transport.send_receive(request, peer),
-        )
-        .await;
-
-        let response = match response {
-            Ok(Ok(bytes)) => bytes,
-            // transport error or timeout
-            _ => return Vec::new(),
+        let Some(reply) = self.call(&self.transport, Method::FindNode, body, peer).await else {
+            return Vec::new();
         };
-
-        match bincode::deserialize::<Vec<Contact>>(&response) {
-            Ok(contacts) => contacts,
-            Err(_) => Vec::new(),
-        }
+        crate::handle_rpc::find_node::decode_reply(&reply).unwrap_or_default()
     }
 
     /// Ask `peer` for `key`, falling back to its closest known contacts.
@@ -170,9 +206,13 @@ mod tests {
             },
         ];
 
-        let mut expected_payload = crate::handle_rpc::Method::FindNode.tag().to_vec();
+        let me = Contact {
+            id: [1u8; 20],
+            address: "127.0.0.1:8010".parse().unwrap(),
+        };
 
-        expected_payload.extend(bincode::serialize(&target).unwrap());
+        let mut expected_payload = crate::handle_rpc::Method::FindNode.tag().to_vec();
+        expected_payload.extend(crate::handle_rpc::find_node::encode_request(me, target).unwrap());
 
         let response = bincode::serialize(&expected_contacts).unwrap();
 
@@ -190,7 +230,9 @@ mod tests {
             response: Vec::new(),
         };
 
-        let rpc = Rpc::new(transport, robust_transport, FakeCloseNodes);
+        
+
+        let rpc = Rpc::new(me, transport, robust_transport, FakeCloseNodes);
 
         let contacts = rpc.find_node(peer, target).await;
 
