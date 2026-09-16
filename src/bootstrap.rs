@@ -43,11 +43,13 @@ pub enum BootstrapError {
 /// will hold values whose keys land near us, and the nodes we answer for.
 ///
 /// The walk also runs in the other direction, which is easy to miss and is
-/// half the point. Every FIND_NODE carries our contact in its body, so each
-/// node we touch records us while answering. Without that the join would be
-/// read-only — a thousand nodes could each bootstrap off the same seed and
-/// that seed would still know none of them, answering every query with an
-/// empty list while the network failed to form.
+/// half the point. Every request carries our [`NodeId`](crate::close_nodes::NodeId)
+/// ahead of its method tag, and the receiving node pairs it with the address
+/// the request arrived from — so each node we touch records us while
+/// answering. Without that the join would be read-only: a thousand nodes could
+/// each bootstrap off the same seed and that seed would still know none of
+/// them, answering every query with an empty list while the network failed to
+/// form.
 ///
 /// # Errors
 ///
@@ -126,7 +128,7 @@ mod tests {
     }
 
     impl CloseNodes for RecordingCloseNodes {
-        fn close_nodes(&self, id: NodeId) -> Vec<Contact> {
+        fn close_nodes(&self, _id: NodeId) -> Vec<Contact> {
             self.contacts.lock().unwrap().clone()
         }
 

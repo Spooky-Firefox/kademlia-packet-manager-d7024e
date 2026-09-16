@@ -112,17 +112,18 @@ impl<T: RpcTransport, U: RpcTransport, A: CloseNodes> Rpc<T, U, A> {
     /// address into a [`Contact`] it can route with.
     pub async fn ping(&self, peer: SocketAddr) -> Option<NodeId> {
         // No request id in the body: the transport frames one and only ever
-        // resolves this future with the reply that carried it back.
-        let body = crate::handle_rpc::ping::encode_request(self.my_contact)?;
-        let reply = self.call(&self.transport, Method::Ping, body, peer).await?;
+        // resolves this future with the reply that carried it back. No sender
+        // either — that rides ahead of the method tag.
+        let reply = self
+            .call(&self.transport, Method::Ping, Vec::new(), peer)
+            .await?;
         crate::handle_rpc::ping::decode_reply(&reply)
     }
 
     /// Ask `peer` to store `value` under `key`.
     pub async fn store(&self, peer: SocketAddr, key: Key, value: Vec<u8>) -> bool {
         // NOTE lab spec allows for tcp transport of values, not forcing udp only
-        let Some(body) = crate::handle_rpc::store::encode_request(self.my_contact, key, value)
-        else {
+        let Some(body) = crate::handle_rpc::store::encode_request(key, value) else {
             return false;
         };
         let reply = self
@@ -139,8 +140,7 @@ impl<T: RpcTransport, U: RpcTransport, A: CloseNodes> Rpc<T, U, A> {
     /// nobody. A lookup treats all three the same — it moves on to the next
     /// candidate — so they do not need telling apart here.
     pub async fn find_node(&self, peer: SocketAddr, target: NodeId) -> Vec<Contact> {
-        let Some(body) = crate::handle_rpc::find_node::encode_request(self.my_contact, target)
-        else {
+        let Some(body) = crate::handle_rpc::find_node::encode_request(target) else {
             return Vec::new();
         };
         let Some(reply) = self
@@ -215,7 +215,7 @@ mod tests {
         };
 
         let mut expected_payload = crate::handle_rpc::Method::FindNode.tag().to_vec();
-        expected_payload.extend(crate::handle_rpc::find_node::encode_request(me, target).unwrap());
+        expected_payload.extend(crate::handle_rpc::find_node::encode_request(target).unwrap());
 
         let response = bincode::serialize(&expected_contacts).unwrap();
 

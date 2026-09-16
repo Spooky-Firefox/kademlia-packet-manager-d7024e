@@ -345,7 +345,7 @@ async fn dispatch<A: CloseNodes>(context: Arc<Context<A>>, request: Request) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::close_nodes::{Contact, recommended};
+    use crate::close_nodes::recommended;
     use std::time::Duration;
 
     fn addr() -> SocketAddr {
@@ -521,14 +521,10 @@ mod tests {
         let key: Key = [9u8; 20];
         let value = b"stored over tcp".to_vec();
         let id = 0x1122_3344_5566_7788u64;
-        let sender = Contact {
-            id: [3u8; 20],
-            address: "127.0.0.1:8003".parse().unwrap(),
-        };
 
         let mut datagram = id.to_be_bytes().to_vec();
         datagram.extend_from_slice(Method::Store.tag());
-        datagram.extend(store::encode_request(sender, key, value.clone()).unwrap());
+        datagram.extend(store::encode_request(key, value.clone()).unwrap());
 
         let reply = tokio::time::timeout(Duration::from_secs(1), async {
             let mut stream = TcpStream::connect(tcp_addr).await.unwrap();
