@@ -44,6 +44,12 @@ where
             break;
         };
 
+        // every contact a response teaches us about is worth offering to the
+        // routing table, whether or not it ends up among the K closest here
+        for contact in &new_contacts {
+            rpc.close_nodes().maybe_add_contact(*contact);
+        }
+
         candidates.extend(new_contacts);
         // sort by distance using Olles XOR thingamajig with a closure (rust voodoo)
         candidates.sort_by(|a, b| xor_distance_cmp(a.id, b.id, target));
@@ -84,8 +90,15 @@ where
             break;
         };
 
-        if let FindValue::Value(value) = reply {
-            return Some(value);
+        match reply {
+            FindValue::Value(value) => return Some(value),
+            FindValue::Closest(contacts) => {
+                // every contact a response teaches us about is worth offering
+                // to the routing table, whether or not the value turns up
+                for contact in &contacts {
+                    rpc.close_nodes().maybe_add_contact(*contact);
+                }
+            }
         }
     }
 
@@ -94,6 +107,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::close_nodes::dumb_bucket::DumbBucket;
+    use std::sync::{Arc, RwLock};
 
     struct FakeCloseNodes {
         initial: Vec<Contact>,
@@ -187,7 +202,7 @@ mod tests {
 
         let close_nodes = FakeCloseNodes { initial: vec![a] };
 
-        let rpc = Rpc::new(transport, robust_transport, close_nodes);
+        let rpc = Rpc::new([0xffu8; 20], transport, robust_transport, close_nodes);
 
         let result = lookup_value(&rpc, key).await;
 
@@ -238,11 +253,86 @@ mod tests {
 
         let close_nodes = FakeCloseNodes { initial: vec![a] };
 
-        let rpc = Rpc::new(transport, robust_transport, close_nodes);
+        let rpc = Rpc::new([0xffu8; 20], transport, robust_transport, close_nodes);
 
         let result = lookup_value(&rpc, key).await;
 
         assert_eq!(result, None);
+    }
+
+    struct FakeEmptyTransport;
+
+    impl RpcTransport for FakeEmptyTransport {
+        async fn send_receive(
+            &self,
+            _payload: Vec<u8>,
+            _address: std::net::SocketAddr,
+        ) -> std::io::Result<Vec<u8>> {
+            Ok(bincode::serialize(&Vec::<Contact>::new()).unwrap())
+        }
+    }
+
+    struct FakeClosestOnlyTransport {
+        a: Contact,
+        newly_discovered: Contact,
+    }
+
+    impl RpcTransport for FakeClosestOnlyTransport {
+        async fn send_receive(
+            &self,
+            _payload: Vec<u8>,
+            address: std::net::SocketAddr,
+        ) -> std::io::Result<Vec<u8>> {
+            let reply = if address == self.a.address {
+                FindValue::Closest(vec![self.newly_discovered])
+            } else {
+                FindValue::Closest(Vec::new())
+            };
+
+            Ok(bincode::serialize(&reply).unwrap())
+        }
+    }
+
+    /// `find_value` can answer with closest-known contacts just like
+    /// `find_node` does, and any of those are worth offering to the routing
+    /// table even when the lookup never turns up the value itself.
+    #[tokio::test]
+    async fn value_lookup_offers_closest_reply_contacts_to_the_routing_table() {
+        let key = [0u8; 20];
+
+        let a = Contact {
+            id: [8u8; 20],
+            address: "127.0.0.1:9101".parse().unwrap(),
+        };
+        // only ever surfaces through find_value's Closest reply, never
+        // through find_node, so its presence proves this call path.
+        let newly_discovered = Contact {
+            id: [4u8; 20],
+            address: "127.0.0.1:9102".parse().unwrap(),
+        };
+
+        // find_node (plain transport) discovers nothing new, so lookup_node
+        // hands lookup_value only the single already-known contact `a`.
+        let transport = FakeEmptyTransport;
+        let robust_transport = FakeClosestOnlyTransport {
+            a,
+            newly_discovered,
+        };
+
+        // DumbBucket has no insertion path besides `maybe_add_contact`, so
+        // whatever ends up in it must have gone through that call.
+        let close_nodes = DumbBucket {
+            contacts: Arc::new(RwLock::new(vec![a])),
+        };
+
+        let rpc = Rpc::new([0xffu8; 20], transport, robust_transport, close_nodes);
+
+        let result = lookup_value(&rpc, key).await;
+
+        assert_eq!(result, None);
+
+        let learned = rpc.close_nodes().contacts.read().unwrap().clone();
+        assert!(learned.contains(&newly_discovered));
     }
 
     #[tokio::test]
@@ -271,12 +361,46 @@ mod tests {
 
         let close_nodes = FakeCloseNodes { initial: vec![a] };
 
-        let rpc = Rpc::new(transport, robust_transport, close_nodes);
+        let rpc = Rpc::new([0xffu8; 20], transport, robust_transport, close_nodes);
 
         let result = lookup_node(&rpc, target).await;
 
         assert_eq!(result, vec![c, b, a]);
     }
+    #[tokio::test]
+    async fn lookup_offers_newly_discovered_contacts_to_the_routing_table() {
+        let target = [0u8; 20];
+
+        let a = Contact {
+            id: [8u8; 20],
+            address: "127.0.0.1:9001".parse().unwrap(),
+        };
+        let b = Contact {
+            id: [4u8; 20],
+            address: "127.0.0.1:9002".parse().unwrap(),
+        };
+        let c = Contact {
+            id: [2u8; 20],
+            address: "127.0.0.1:9003".parse().unwrap(),
+        };
+
+        let transport = FakeTransport { a, b, c };
+        let robust_transport = FakeTransport { a, b, c };
+
+        // DumbBucket has no insertion path besides `maybe_add_contact`, so
+        // whatever ends up in it must have gone through that call.
+        let close_nodes = DumbBucket {
+            contacts: Arc::new(RwLock::new(vec![a])),
+        };
+
+        let rpc = Rpc::new([0xffu8; 20], transport, robust_transport, close_nodes);
+
+        lookup_node(&rpc, target).await;
+
+        let learned = rpc.close_nodes().contacts.read().unwrap().clone();
+        assert_eq!(learned, vec![a, b, c]);
+    }
+
     #[tokio::test]
     async fn lookup_returns_empty_when_no_contacts_are_known() {
         let target = [0u8; 20];
@@ -299,7 +423,7 @@ mod tests {
 
         let close_nodes = FakeCloseNodes { initial: vec![] };
 
-        let rpc = Rpc::new(transport, robust_transport, close_nodes);
+        let rpc = Rpc::new([0xffu8; 20], transport, robust_transport, close_nodes);
 
         let result = lookup_node(&rpc, target).await;
 

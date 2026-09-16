@@ -10,12 +10,15 @@ mod pending;
 mod rpc;
 mod rpc_transport;
 
+use handle_rpc::ID_LEN;
 use rpc_transport::RpcTransport;
+use rpc_transport::reply_id;
 use rpc_transport::udp_transport::UdpTransport;
 
-/// Stand-in for a remote node: echoes every datagram back verbatim. The 8-byte
-/// request id prefix survives the round trip, so `UdpTransport` can match the
-/// reply to the request that is awaiting it.
+/// Stand-in for a remote node: echoes every datagram's body back under the id
+/// it arrived with, `REPLY_TAG` set. The id is what lets `UdpTransport` match
+/// the reply to the request awaiting it, and the tag is what tells its receive
+/// loop this is that reply rather than a fresh request being asked of it.
 async fn spawn_echo_peer() -> io::Result<SocketAddr> {
     let socket = UdpSocket::bind("127.0.0.1:0").await?;
     let addr = socket.local_addr()?;
@@ -30,7 +33,10 @@ async fn spawn_echo_peer() -> io::Result<SocketAddr> {
             // Long enough that the caller resends once or twice first, short
             // enough to answer before its attempt budget runs out.
             tokio::time::sleep(Duration::from_millis(500)).await;
-            socket.send_to(&buf[..len], from).await.unwrap();
+            let id = u64::from_be_bytes(buf[..ID_LEN].try_into().unwrap());
+            let mut reply = reply_id(id).to_be_bytes().to_vec();
+            reply.extend_from_slice(&buf[ID_LEN..len]);
+            socket.send_to(&reply, from).await.unwrap();
         }
     });
     Ok(addr)

@@ -1,4 +1,5 @@
 use crate::rpc_transport::RpcTransport;
+use crate::rpc_transport::request_id;
 use std::net::SocketAddr;
 use std::vec::Vec;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -11,7 +12,10 @@ impl RpcTransport for TcpTransport {
         payload: Vec<u8>,
         address: SocketAddr,
     ) -> std::io::Result<Vec<u8>> {
-        let id = rand::random::<u64>();
+        // Tag bit cleared: this is a request, and a random u64 would set it
+        // half the time. `frame_reply` sets it on the way back, so the echo is
+        // compared with it masked off.
+        let id = request_id(rand::random::<u64>());
         let mut stream = tokio::net::TcpStream::connect(address).await?;
         stream.write_all(&id.to_be_bytes()).await?;
         stream.write_all(&payload).await?;
@@ -24,7 +28,7 @@ impl RpcTransport for TcpTransport {
         let mut id_bytes = [0u8; 8];
         stream.read_exact(&mut id_bytes).await?;
         let echoed_id = u64::from_be_bytes(id_bytes);
-        assert_eq!(echoed_id, id);
+        assert_eq!(request_id(echoed_id), id);
         stream.read_to_end(&mut outbuff).await?;
         Ok(outbuff)
     }

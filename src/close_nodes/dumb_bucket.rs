@@ -2,7 +2,7 @@ use crate::close_nodes::{CloseNodes, Contact, K, NodeId, xor_distance_cmp};
 use std::sync::Arc;
 use std::sync::RwLock;
 pub struct DumbBucket {
-    contacts: Arc<RwLock<Vec<Contact>>>,
+    pub contacts: Arc<RwLock<Vec<Contact>>>,
 }
 
 impl CloseNodes for DumbBucket {

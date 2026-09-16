@@ -34,8 +34,10 @@
 //! let network: Network = Network::new();
 //!
 //! // Device B: a peer that answers requests. Note the framing contract — the
-//! // 8-byte id prefix must come back untouched, or the caller cannot tell
-//! // which of its in-flight requests this reply belongs to.
+//! // 8-byte id prefix must come back carrying the same number, with
+//! // `REPLY_TAG` set to mark it an answer, or the caller's receive loop
+//! // cannot tell which in-flight request this belongs to (or that it is a
+//! // reply at all, rather than a question being asked of it).
 //! let peer: Endpoint = network.bind_any();
 //! let peer_addr: SocketAddr = peer.local_addr();
 //! tokio::spawn(async move {
@@ -43,7 +45,8 @@
 //!     // datagram, and None once the endpoint is unbound.
 //!     while let Some((from, datagram)) = peer.recv_from().await {
 //!         let (id, body): (&[u8], &[u8]) = datagram.split_at(size_of::<u64>());
-//!         let mut reply: Vec<u8> = id.to_vec();
+//!         let id: u64 = u64::from_be_bytes(id.try_into().unwrap());
+//!         let mut reply: Vec<u8> = reply_id(id).to_be_bytes().to_vec();
 //!         reply.extend_from_slice(b"pong: ");
 //!         reply.extend_from_slice(body);
 //!         peer.send_to(&reply, from);
@@ -266,19 +269,30 @@ impl DataRxTx for Endpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rpc_transport::RpcTransport;
+    use crate::rpc_transport::{RpcTransport, reply_id};
 
-    /// Stand-in for a remote node, as in `main`: echoes every datagram back
-    /// verbatim, so the id prefix survives the round trip.
+    /// Stand-in for a remote node, as in `main`: echoes every datagram's body
+    /// back under the id it came in with, tagged as the reply it is so the
+    /// requester's receive loop matches it rather than reading it as a fresh
+    /// question. See [`REPLY_TAG`].
     fn spawn_echo_peer(network: &Network) -> SocketAddr {
         let endpoint = network.bind_any();
         let addr = endpoint.local_addr();
         tokio::spawn(async move {
             while let Some((from, datagram)) = endpoint.recv_from().await {
-                endpoint.send_to(&datagram, from);
+                endpoint.send_to(&reply_to(&datagram, &datagram[ID_LEN..]), from);
             }
         });
         addr
+    }
+
+    /// Frame `body` as the answer to `request`: its id back on the front with
+    /// [`REPLY_TAG`] set, the way `handle_rpc::frame_reply` does.
+    fn reply_to(request: &[u8], body: &[u8]) -> Vec<u8> {
+        let id = u64::from_be_bytes(request[..ID_LEN].try_into().unwrap());
+        let mut reply = reply_id(id).to_be_bytes().to_vec();
+        reply.extend_from_slice(body);
+        reply
     }
 
     #[tokio::test]
@@ -304,11 +318,9 @@ mod tests {
         let peer_addr = peer.local_addr();
         tokio::spawn(async move {
             while let Some((from, datagram)) = peer.recv_from().await {
-                let (id, body) = datagram.split_at(ID_LEN);
-                let mut reply = id.to_vec();
-                reply.extend_from_slice(b"pong: ");
-                reply.extend_from_slice(body);
-                peer.send_to(&reply, from);
+                let mut body = b"pong: ".to_vec();
+                body.extend_from_slice(&datagram[ID_LEN..]);
+                peer.send_to(&reply_to(&datagram, &body), from);
             }
         });
 
