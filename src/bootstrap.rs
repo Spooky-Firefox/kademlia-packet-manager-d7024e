@@ -104,7 +104,7 @@ where
 mod tests {
     use super::*;
     use crate::close_nodes::NodeId;
-    use crate::handle_rpc::Method;
+    use crate::handle_rpc::{Method, NODE_ID_LEN};
     use std::sync::Mutex;
 
     const MY_ID: NodeId = [1u8; 20];
@@ -176,7 +176,16 @@ mod tests {
                     "no answer",
                 ));
             }
-            let (method, _body) = Method::split_tag(&payload)
+            // Every request is framed with the sender's NodeId ahead of the
+            // method tag, the way `Rpc::call` writes it. A real responder
+            // learns the sender from it; this one only needs to skip it.
+            let rest = payload
+                .split_at_checked(NODE_ID_LEN)
+                .map(|(_sender, rest)| rest)
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "no node id")
+                })?;
+            let (method, _body) = Method::split_tag(rest)
                 .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad tag"))?;
             match method {
                 Method::Ping => Ok(bincode::serialize(&self.seed_id).unwrap()),
