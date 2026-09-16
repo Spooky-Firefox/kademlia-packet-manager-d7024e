@@ -32,8 +32,8 @@ pub async fn handle<A: CloseNodes>(
             body.len()
         );
     }
-    // A UDP sender is already learned as a contact by `UdpDispatcher`, ahead
-    // of every handler; a TCP one deliberately is not (see handle_rpc's
-    // module doc).
+    // A datagram sender is already learned as a contact by
+    // `DatagramDispatcher`, ahead of every handler; one that arrived over a
+    // connection deliberately is not (see handle_rpc's module doc).
     Some(PONG.to_vec())
 }
