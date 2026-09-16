@@ -169,7 +169,7 @@ mod tests {
 
         let me = Contact {
             id: [1u8; 20],
-            address: "127.0.0.1:8000".parse().unwrap()
+            address: "127.0.0.1:8000".parse().unwrap(),
         };
 
         let rpc = Rpc::new(me, transport, robust_transport, close_nodes);

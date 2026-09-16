@@ -143,7 +143,10 @@ impl<T: RpcTransport, U: RpcTransport, A: CloseNodes> Rpc<T, U, A> {
         else {
             return Vec::new();
         };
-        let Some(reply) = self.call(&self.transport, Method::FindNode, body, peer).await else {
+        let Some(reply) = self
+            .call(&self.transport, Method::FindNode, body, peer)
+            .await
+        else {
             return Vec::new();
         };
         crate::handle_rpc::find_node::decode_reply(&reply).unwrap_or_default()
@@ -229,8 +232,6 @@ mod tests {
             expected_address: peer,
             response: Vec::new(),
         };
-
-        
 
         let rpc = Rpc::new(me, transport, robust_transport, FakeCloseNodes);
 

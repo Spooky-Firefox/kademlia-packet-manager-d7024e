@@ -344,7 +344,7 @@ async fn dispatch<A: CloseNodes>(context: Arc<Context<A>>, request: Request) {
 
 #[cfg(test)]
 mod tests {
-use super::*;
+    use super::*;
     use crate::close_nodes::{Contact, recommended};
     use std::time::Duration;
 
@@ -467,8 +467,14 @@ use super::*;
         requests.send(second).await.unwrap();
 
         let (a, b) = tokio::join!(first_reply, second_reply);
-        assert_eq!(a.unwrap(), frame_reply(1, &bincode::serialize(&TEST_ID).unwrap()));
-        assert_eq!(b.unwrap(), frame_reply(2, &bincode::serialize(&TEST_ID).unwrap()));
+        assert_eq!(
+            a.unwrap(),
+            frame_reply(1, &bincode::serialize(&TEST_ID).unwrap())
+        );
+        assert_eq!(
+            b.unwrap(),
+            frame_reply(2, &bincode::serialize(&TEST_ID).unwrap())
+        );
     }
 
     /// The echo the requester's `Pending` matches on: a reply goes back under
@@ -517,7 +523,7 @@ use super::*;
         let id = 0x1122_3344_5566_7788u64;
         let sender = Contact {
             id: [3u8; 20],
-            address: "127.0.0.1:8003".parse().unwrap()
+            address: "127.0.0.1:8003".parse().unwrap(),
         };
 
         let mut datagram = id.to_be_bytes().to_vec();

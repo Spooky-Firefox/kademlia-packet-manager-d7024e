@@ -20,7 +20,6 @@ pub enum BootstrapError {
     SelfSeed,
 }
 
-
 /// Join the network through `seed`, returning the neighbourhood we land in.
 ///
 /// # Why a PING first
@@ -67,10 +66,10 @@ pub enum BootstrapError {
 /// An empty-handed success is not an error. The second node on a network
 /// legitimately finds only the seed.
 pub async fn bootstrap<T, U, A>(
-    rpc: &Rpc<T, U, A>, 
+    rpc: &Rpc<T, U, A>,
     seed: SocketAddr,
 ) -> Result<Vec<Contact>, BootstrapError>
-where 
+where
     T: RpcTransport,
     U: RpcTransport,
     A: CloseNodes,
@@ -81,7 +80,10 @@ where
         return Err(BootstrapError::SelfSeed);
     }
 
-    rpc.close_nodes().maybe_add_contact(Contact { id: seed_id, address: seed });
+    rpc.close_nodes().maybe_add_contact(Contact {
+        id: seed_id,
+        address: seed,
+    });
 
     // TODO: refresh the buckets past our nearest neighbour. Kademlia's join
     // follows the self-lookup with a lookup for a random id in each bucket
@@ -98,12 +100,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use heapless::sorted_linked_list::Node;
-
-use super::*;
+    use super::*;
     use crate::close_nodes::NodeId;
     use crate::handle_rpc::Method;
-use crate::rpc;
     use std::sync::Mutex;
 
     const MY_ID: NodeId = [1u8; 20];
@@ -114,13 +113,16 @@ use crate::rpc;
     }
 
     fn me() -> Contact {
-        Contact { id: MY_ID, address: "127.0.0.1:9000".parse().unwrap() }
+        Contact {
+            id: MY_ID,
+            address: "127.0.0.1:9000".parse().unwrap(),
+        }
     }
 
     /// Routing table remembers what bootstrap taught it
     #[derive(Default)]
     struct RecordingCloseNodes {
-        contacts: Mutex<Vec<Contact>>
+        contacts: Mutex<Vec<Contact>>,
     }
 
     impl CloseNodes for RecordingCloseNodes {
@@ -144,28 +146,36 @@ use crate::rpc;
 
     impl FakeTransport {
         fn new(seed_id: NodeId, contacts: Vec<Contact>) -> Self {
-            Self { seed_id, contacts, reachable: true }
+            Self {
+                seed_id,
+                contacts,
+                reachable: true,
+            }
         }
 
         fn unreachable() -> Self {
-            Self {seed_id: SEED_ID, contacts: Vec::new(), reachable: false}
+            Self {
+                seed_id: SEED_ID,
+                contacts: Vec::new(),
+                reachable: false,
+            }
         }
     }
 
     impl RpcTransport for FakeTransport {
-        async fn send_receive(&self, 
-            payload: Vec<u8>, 
-            _address: SocketAddr
+        async fn send_receive(
+            &self,
+            payload: Vec<u8>,
+            _address: SocketAddr,
         ) -> std::io::Result<Vec<u8>> {
             if !self.reachable {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
-                     "no answer",
-                    ));
+                    "no answer",
+                ));
             }
-            let (method, _body) = Method::split_tag(&payload).ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "bad tag")
-            })?;
+            let (method, _body) = Method::split_tag(&payload)
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad tag"))?;
             match method {
                 Method::Ping => Ok(bincode::serialize(&self.seed_id).unwrap()),
                 Method::FindNode => Ok(bincode::serialize(&self.contacts).unwrap()),
@@ -177,7 +187,12 @@ use crate::rpc;
     fn rpc_with(
         transport: FakeTransport,
     ) -> Rpc<FakeTransport, FakeTransport, RecordingCloseNodes> {
-        Rpc::new(me(), transport, FakeTransport::unreachable(), RecordingCloseNodes::default(),)
+        Rpc::new(
+            me(),
+            transport,
+            FakeTransport::unreachable(),
+            RecordingCloseNodes::default(),
+        )
     }
 
     #[tokio::test]
@@ -188,7 +203,10 @@ use crate::rpc;
 
         assert_eq!(
             rpc.close_nodes().close_nodes(MY_ID),
-            vec![Contact {id: SEED_ID, address: seed_addr()}]
+            vec![Contact {
+                id: SEED_ID,
+                address: seed_addr()
+            }]
         );
     }
 
@@ -207,7 +225,13 @@ use crate::rpc;
         known.sort_by_key(|contact| contact.id);
         assert_eq!(
             known,
-            vec![Contact {id:SEED_ID, address: seed_addr()}, neighbour]
+            vec![
+                Contact {
+                    id: SEED_ID,
+                    address: seed_addr()
+                },
+                neighbour
+            ]
         )
     }
 
