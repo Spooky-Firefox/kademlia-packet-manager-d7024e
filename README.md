@@ -66,6 +66,15 @@ Request ids are the transport's own business: it frames one, matches the reply
 against it, and only ever hands back a response that carried it. Callers just
 send bytes and get bytes.
 
+A node sends and receives everything on one socket, so its receive loop has to
+tell an answer to something it asked from a question someone is asking it.
+That is not inferrable from the id — every node starts its counter in the same
+place, so a peer's request `7` and our own pending reply `7` are the same
+number. So it is written on the wire: the top bit of the id is `REPLY_TAG`, set
+by whoever frames a reply and clear on a request. Ids are 63-bit as a result,
+and `request_id` / `reply_id` / `is_reply` are the only things that touch the
+bit.
+
 ### `DataRxTx`
 
 A datagram channel, reduced to two methods: `send_packet(payload, address)` and
@@ -76,8 +85,14 @@ a stream's. Both return `impl Future + Send` rather than being written
 ### `RetryTransport<T: DataRxTx>`
 
 The real work. It prefixes an 8-byte big-endian request id to every payload and
-spawns a receive loop that reads the id off each arriving datagram and hands
-the rest to whoever is awaiting it through [`Pending`](#pending-requests).
+spawns the node's one receive loop, which splits each arriving datagram on
+`REPLY_TAG`: a tagged one is an answer and goes to whoever is awaiting it
+through [`Pending`](#pending-requests), an untagged one is a question and goes
+down the channel given to `with_requests` for
+[`handle_rpc`](#serving-rpcs) to answer. Built with plain `new` there is no
+channel and inbound requests are dropped, which is all a client-only node
+needs.
+
 A request that goes quiet is resent every 200 ms, up to 5 attempts, after which
 `send_receive` returns an `io::Error` of kind `TimedOut` — so callers only need
 an outer `timeout` for a deadline shorter than that.
@@ -114,6 +129,48 @@ half-closes the write side so the peer sees EOF, then reads the echoed id and
 the reply until the peer closes its own side. There is no length framing — EOF
 is the only end-of-message signal either side has — and no retry loop, because
 TCP already does that underneath.
+
+Its id is a random `u64` rather than a counter, run through `request_id` so the
+tag bit is clear: a random draw would set it half the time.
+
+## Serving RPCs
+
+`src/handle_rpc.rs` is the server half — `Rpc` encodes a request and waits for
+the answer, this answers other nodes' requests. A request's payload is the
+sender's `NodeId`, then a method tag (`PING`, `STORE`, `FIND_NODE`,
+`FIND_VALUE`), then the body; `parse_framed` strips the first two and routes
+the rest to `ping`, `store`, `find_node` or `find_value`. A handler that
+returns `None` — malformed body, unknown method, a request we decline — is
+simply not answered, and the sender times out. Handlers take the whole
+`Context` (the routing table and the value store) rather than the parts they
+use today.
+
+Neither dispatcher reads a socket itself; requests arrive from the transport
+that already owns the receive loop.
+
+### Two dispatchers
+
+`DatagramDispatcher` and `StreamDispatcher` parse and route identically. They
+differ on one thing: whether `from` is safe to learn as a `Contact`.
+
+- A datagram transport sends and receives on one bound socket, so a request's
+  `from` *is* the address its sender listens on. `DatagramDispatcher` hands it
+  to `maybe_add_contact` before it even looks at the method — which is how a
+  routing table fills up from ordinary traffic rather than from FIND_NODE
+  replies alone.
+- A connection's `from` is the ephemeral local port the OS picked for that one
+  `connect`, not the port its sender accepts on. So `StreamDispatcher` holds no
+  `CloseNodes` handle at all and cannot learn a bad contact by accident.
+
+They are named for the transport's *shape* rather than for UDP and TCP on
+purpose: the rule follows from the shape, not from the protocol.
+
+`serve` runs both — the datagram dispatcher over the transport's request
+channel and its socket, and `serve_tcp` accepting connections, each reply going
+back the way its request came. Every request is handled in its own spawned
+task, because a handler can block on work of its own (a STORE that hits disk, a
+FIND_VALUE that has to ask someone else) and the sender's timeout is already
+running.
 
 ## Pending requests
 
