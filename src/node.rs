@@ -1,17 +1,16 @@
-use crate::close_nodes::CloseNodes;
-use crate::close_nodes::{NodeId, RecommendedCloseNodes, recommended};
+use crate::close_nodes::{Contact, NodeId, RecommendedCloseNodes, recommended};
 use crate::handle_rpc::{self, Context};
 use crate::rpc::Rpc;
 use crate::rpc_transport::tcp_transport::TcpTransport;
 use crate::rpc_transport::udp_transport::UdpTransport;
 
+use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::task::JoinHandle;
 
-use std::io;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 pub type NodeRpc = Rpc<UdpTransport, TcpTransport, Arc<RecommendedCloseNodes>>;
 
@@ -25,28 +24,42 @@ pub struct Node {
 
 impl Node {
     pub async fn bind(id: NodeId, bind_address: SocketAddr) -> io::Result<Self> {
+        // Bind UDP first.
         let udp_socket = UdpSocket::bind(bind_address).await?;
         let address = udp_socket.local_addr()?;
 
+        // Use the same numbered port for TCP.
         let tcp_listener = TcpListener::bind(address).await?;
 
+        // One routing table shared by incoming and outgoing RPC logic.
         let routing = Arc::new(recommended(id));
 
-        // give incoming handlers access to routingtable
-        let context = Context::new(Arc::clone(&routing));
-        // create channel for incoming UDP requests to be sent to the RPC handler
+        // State used by incoming RPC handlers.
+        let context = Context::new(id, Arc::clone(&routing));
+
+        // Incoming UDP requests are forwarded from the transport's receive
+        // loop to the RPC dispatcher through this channel.
         let (request_tx, request_rx) = mpsc::channel(64);
 
         let udp_transport = UdpTransport::with_requests(udp_socket, request_tx);
-        // start the RPC server
+
+        // Start the incoming RPC server in the background.
         let server_task = tokio::spawn(handle_rpc::serve(
             Arc::clone(&context),
             request_rx,
             udp_transport.socket(),
             tcp_listener,
         ));
-        // outgoing RPC
-        let rpc = Rpc::new(id, udp_transport, TcpTransport, Arc::clone(&routing));
+
+        // Outgoing RPC side.
+        //
+        // Rpc now wants our full Contact rather than only our NodeId.
+        let rpc = Rpc::new(
+            Contact { id, address },
+            udp_transport,
+            TcpTransport,
+            Arc::clone(&routing),
+        );
 
         Ok(Self {
             id,
@@ -56,6 +69,7 @@ impl Node {
             _server_task: server_task,
         })
     }
+
     pub fn id(&self) -> NodeId {
         self.id
     }
@@ -68,9 +82,11 @@ impl Node {
         &self.rpc
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::close_nodes::CloseNodes;
 
     #[tokio::test]
     async fn two_nodes_can_ping_each_other() {
@@ -82,8 +98,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(a.rpc().ping(b.address()).await);
+        assert_eq!(a.rpc().ping(b.address()).await, Some(b.id()));
     }
+
     #[tokio::test]
     async fn two_nodes_can_ping_and_learn_each_other() {
         let a = Node::bind([1u8; 20], "127.0.0.1:0".parse().unwrap())
@@ -94,16 +111,17 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(a.rpc().ping(b.address()).await);
+        assert_eq!(a.rpc().ping(b.address()).await, Some(b.id()));
 
         let contacts = b.rpc().close_nodes().close_nodes(a.id());
 
         assert!(
             contacts
                 .iter()
-                .any(|contact| contact.id == a.id() && contact.address == a.address())
+                .any(|contact| { contact.id == a.id() && contact.address == a.address() })
         );
     }
+
     #[tokio::test]
     async fn node_can_discover_another_node_through_lookup() {
         let a = Node::bind([1u8; 20], "127.0.0.1:0".parse().unwrap())
@@ -118,20 +136,21 @@ mod tests {
             .await
             .unwrap();
 
-        // Make A learn B.
-        assert!(b.rpc().ping(a.address()).await);
+        // B sends PING to A, so A learns B.
+        assert_eq!(b.rpc().ping(a.address()).await, Some(a.id()));
 
-        // Make B learn C.
-        assert!(c.rpc().ping(b.address()).await);
+        // C sends PING to B, so B learns C.
+        assert_eq!(c.rpc().ping(b.address()).await, Some(b.id()));
 
         let found = crate::lookup::lookup_node(a.rpc(), c.id()).await;
 
         assert!(
             found
                 .iter()
-                .any(|contact| contact.id == c.id() && contact.address == c.address())
+                .any(|contact| { contact.id == c.id() && contact.address == c.address() })
         );
     }
+
     #[tokio::test]
     async fn real_nodes_can_store_and_find_value() {
         let a = Node::bind([1u8; 20], "127.0.0.1:0".parse().unwrap())
@@ -145,7 +164,7 @@ mod tests {
         let key = [9u8; 20];
         let value = vec![0xAB; 5000];
 
-        assert!(a.rpc().store(b.address(), key, value.clone()).await);
+        assert!(a.rpc().store(b.address(), key, value.clone(),).await);
 
         let result = a.rpc().find_value(b.address(), key).await;
 
@@ -170,13 +189,13 @@ mod tests {
         let value = vec![0xAB; 5000];
 
         // Make A learn B.
-        assert!(b.rpc().ping(a.address()).await);
+        assert_eq!(b.rpc().ping(a.address()).await, Some(a.id()));
 
         // Make B learn C.
-        assert!(c.rpc().ping(b.address()).await);
+        assert_eq!(c.rpc().ping(b.address()).await, Some(b.id()));
 
-        // Put the value on C.
-        assert!(a.rpc().store(c.address(), key, value.clone()).await);
+        // Preload C with the value.
+        assert!(a.rpc().store(c.address(), key, value.clone(),).await);
 
         let found = crate::lookup::lookup_value(a.rpc(), key).await;
 
