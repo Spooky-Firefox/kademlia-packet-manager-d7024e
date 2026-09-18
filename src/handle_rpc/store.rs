@@ -11,6 +11,14 @@ use std::net::SocketAddr;
 
 pub const STORED: &[u8] = b"STORED";
 
+/// Encode a STORE body: the pair to hold.
+///
+/// Who is asking is not in here — it travels ahead of the method tag, in the
+/// framing every request carries.
+pub fn encode_request(key: Key, value: Vec<u8>) -> Option<Vec<u8>> {
+    bincode::serialize(&(key, value)).ok()
+}
+
 /// Store the key and value in `body`, and acknowledge it.
 ///
 /// Returning `None` leaves the sender to time out, which is the right answer
@@ -18,8 +26,8 @@ pub const STORED: &[u8] = b"STORED";
 /// "unreachable" anyway, and both mean the value did not land here.
 pub async fn handle<A: CloseNodes>(
     context: &Context<A>,
-    id: u64,
-    from: SocketAddr,
+    _id: u64,
+    _from: SocketAddr,
     body: &[u8],
 ) -> Option<Vec<u8>> {
     let (key, value): (Key, Vec<u8>) = bincode::deserialize(body).ok()?;
@@ -30,17 +38,7 @@ pub async fn handle<A: CloseNodes>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::close_nodes::{Contact, NodeId};
-
-    // STORE does not use routing table
-    struct FakeCloseNodes;
-
-    impl CloseNodes for FakeCloseNodes {
-        fn close_nodes(&self, _id: NodeId) -> Vec<Contact> {
-            Vec::new()
-        }
-        fn maybe_add_contact(&self, _contact: Contact) {}
-    }
+    use crate::close_nodes::recommended;
 
     fn addr() -> SocketAddr {
         "127.0.0.1:9000".parse().unwrap()
@@ -50,10 +48,10 @@ mod tests {
     async fn store_writes_the_value_and_acks() {
         let key: Key = [1u8; 20];
         let value = b"hello".to_vec();
-        let context = Context::new(FakeCloseNodes);
+        let my_id = [0u8; 20];
+        let context = Context::new(my_id, recommended(my_id));
 
-        let body = bincode::serialize(&(key, value.clone())).unwrap();
-
+        let body = encode_request(key, value.clone()).unwrap();
         let reply = handle(&context, 42, addr(), &body).await;
 
         assert_eq!(reply.as_deref(), Some(STORED));
@@ -62,11 +60,12 @@ mod tests {
 
     #[tokio::test]
     async fn store_overwrites_an_existing_value() {
-        let key = [1u8; 20];
-        let context = Context::new(FakeCloseNodes);
+        let key: Key = [1u8; 20];
+        let my_id = [0u8; 20];
+        let context = Context::new(my_id, recommended(my_id));
 
-        let first = bincode::serialize(&(key, b"old".to_vec())).unwrap();
-        let second = bincode::serialize(&(key, b"new".to_vec())).unwrap();
+        let first = encode_request(key, b"old".to_vec()).unwrap();
+        let second = encode_request(key, b"new".to_vec()).unwrap();
         handle(&context, 1, addr(), &first).await;
         handle(&context, 2, addr(), &second).await;
 
@@ -75,7 +74,8 @@ mod tests {
 
     #[tokio::test]
     async fn store_rejects_invalid_body() {
-        let context = Context::new(FakeCloseNodes);
+        let my_id = [0u8; 20];
+        let context = Context::new(my_id, recommended(my_id));
 
         let reply = handle(&context, 42, addr(), b"too short").await;
 

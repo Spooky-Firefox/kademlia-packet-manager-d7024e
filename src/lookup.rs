@@ -110,6 +110,15 @@ mod tests {
     use crate::close_nodes::dumb_bucket::DumbBucket;
     use std::sync::{Arc, RwLock};
 
+    /// The node running the lookups under test. Far from every target here, so
+    /// it never competes with the contacts a lookup is meant to return.
+    fn me() -> Contact {
+        Contact {
+            id: [0xffu8; 20],
+            address: "127.0.0.1:9000".parse().unwrap(),
+        }
+    }
+
     struct FakeCloseNodes {
         initial: Vec<Contact>,
     }
@@ -202,7 +211,7 @@ mod tests {
 
         let close_nodes = FakeCloseNodes { initial: vec![a] };
 
-        let rpc = Rpc::new([0xffu8; 20], transport, robust_transport, close_nodes);
+        let rpc = Rpc::new(me(), transport, robust_transport, close_nodes);
 
         let result = lookup_value(&rpc, key).await;
 
@@ -253,7 +262,7 @@ mod tests {
 
         let close_nodes = FakeCloseNodes { initial: vec![a] };
 
-        let rpc = Rpc::new([0xffu8; 20], transport, robust_transport, close_nodes);
+        let rpc = Rpc::new(me(), transport, robust_transport, close_nodes);
 
         let result = lookup_value(&rpc, key).await;
 
@@ -325,7 +334,7 @@ mod tests {
             contacts: Arc::new(RwLock::new(vec![a])),
         };
 
-        let rpc = Rpc::new([0xffu8; 20], transport, robust_transport, close_nodes);
+        let rpc = Rpc::new(me(), transport, robust_transport, close_nodes);
 
         let result = lookup_value(&rpc, key).await;
 
@@ -361,7 +370,7 @@ mod tests {
 
         let close_nodes = FakeCloseNodes { initial: vec![a] };
 
-        let rpc = Rpc::new([0xffu8; 20], transport, robust_transport, close_nodes);
+        let rpc = Rpc::new(me(), transport, robust_transport, close_nodes);
 
         let result = lookup_node(&rpc, target).await;
 
@@ -393,7 +402,7 @@ mod tests {
             contacts: Arc::new(RwLock::new(vec![a])),
         };
 
-        let rpc = Rpc::new([0xffu8; 20], transport, robust_transport, close_nodes);
+        let rpc = Rpc::new(me(), transport, robust_transport, close_nodes);
 
         lookup_node(&rpc, target).await;
 
@@ -423,7 +432,7 @@ mod tests {
 
         let close_nodes = FakeCloseNodes { initial: vec![] };
 
-        let rpc = Rpc::new([0xffu8; 20], transport, robust_transport, close_nodes);
+        let rpc = Rpc::new(me(), transport, robust_transport, close_nodes);
 
         let result = lookup_node(&rpc, target).await;
 

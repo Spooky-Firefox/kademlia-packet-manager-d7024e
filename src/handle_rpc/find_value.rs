@@ -55,9 +55,12 @@ mod tests {
         let key = [1u8; 20];
         let value = b"hello".to_vec();
 
-        let context = Context::new(FakeCloseNodes {
-            contacts: Vec::new(),
-        });
+        let context = Context::new(
+            [0u8; 20],
+            FakeCloseNodes {
+                contacts: Vec::new(),
+            },
+        );
 
         context.values.insert(key, value.clone());
 
@@ -85,9 +88,12 @@ mod tests {
             },
         ];
 
-        let context = Context::new(FakeCloseNodes {
-            contacts: contacts.clone(),
-        });
+        let context = Context::new(
+            [0u8; 20],
+            FakeCloseNodes {
+                contacts: contacts.clone(),
+            },
+        );
 
         let body = bincode::serialize(&key).unwrap();
 

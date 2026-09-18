@@ -24,7 +24,7 @@ use crate::handle_rpc::Request;
 use crate::pending::Pending;
 use crate::rpc_transport::RpcTransport;
 use crate::rpc_transport::data_rx_tx::DataRxTx;
-use crate::rpc_transport::{is_reply, reply_id, request_id};
+use crate::rpc_transport::{is_reply, request_id};
 use log::trace;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -162,6 +162,7 @@ impl<T: DataRxTx + Send + Sync + 'static> RpcTransport for RetryTransport<T> {
 mod tests {
     use super::*;
     use crate::rpc_transport::networked_debug_transport::Network;
+    use crate::rpc_transport::reply_id;
 
     /// The reason requests and replies are told apart by a tag rather than by
     /// "did an id match something pending".

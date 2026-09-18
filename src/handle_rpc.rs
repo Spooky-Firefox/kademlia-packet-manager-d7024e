@@ -159,14 +159,22 @@ pub struct Context<A>
 where
     A: CloseNodes,
 {
+    /// Who we are. A [`CloseNodes`] knows this already, but does not expose
+    /// it, and [`ping`] has to put it on the wire: an address alone does not
+    /// tell a joining node whose address it is.
+    pub my_id: NodeId,
     pub close_nodes: A,
     pub values: DashMap<Key, Vec<u8>>,
 }
 
 impl<A: CloseNodes> Context<A> {
     /// Shared by every spawned handler, so it is handed out behind an `Arc`.
-    pub fn new(close_nodes: A) -> Arc<Self> {
+    ///
+    /// `my_id` must be the same id the routing table was built around, or we
+    /// answer PINGs with a name our own siblings do not know us by.
+    pub fn new(my_id: NodeId, close_nodes: A) -> Arc<Self> {
         Arc::new(Self {
+            my_id,
             close_nodes,
             values: DashMap::new(),
         })
@@ -469,8 +477,17 @@ mod tests {
         datagram
     }
 
+    /// The id every context in these tests answers under.
+    const TEST_ID: NodeId = [0u8; 20];
+
     fn test_context() -> Arc<Context<crate::close_nodes::RecommendedCloseNodes>> {
-        Context::new(recommended([0u8; 20]))
+        Context::new(TEST_ID, recommended(TEST_ID))
+    }
+
+    /// What a PING is answered with: the responder's own id, which is how a
+    /// joining node turns a bootstrap address into a [`Contact`].
+    fn pong() -> Vec<u8> {
+        bincode::serialize(&TEST_ID).unwrap()
     }
 
     #[test]
@@ -530,13 +547,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ping_is_answered_with_a_pong() {
+    async fn ping_is_answered_with_our_own_id() {
         let dispatcher = DatagramDispatcher::new(test_context());
         let request = Request::new(7, addr(), framed(Method::Ping.tag()));
 
         assert_eq!(
             dispatcher.dispatch(&request).await,
-            Some(frame_reply(7, ping::PONG))
+            Some(frame_reply(7, &pong()))
         );
     }
 
@@ -619,7 +636,7 @@ mod tests {
         let (echoed, body) = datagram.split_at(ID_LEN);
         let echoed = u64::from_be_bytes(echoed.try_into().unwrap());
         assert_eq!(echoed, reply_id(id));
-        assert_eq!(body, ping::PONG);
+        assert_eq!(body, pong());
     }
 
     /// A served node, wired the way a real one is: one UDP socket whose
@@ -645,7 +662,7 @@ mod tests {
         let (requests, rx) = mpsc::channel(8);
         let transport = UdpTransport::with_requests(udp_socket, requests);
 
-        let context = Context::new(recommended([0u8; 20]));
+        let context = Context::new([0u8; 20], recommended([0u8; 20]));
         tokio::spawn(serve(
             Arc::clone(&context),
             rx,
@@ -682,8 +699,8 @@ mod tests {
             seen.insert(buf[..len].to_vec());
         }
 
-        assert!(seen.contains(&frame_reply(1, ping::PONG)));
-        assert!(seen.contains(&frame_reply(2, ping::PONG)));
+        assert!(seen.contains(&frame_reply(1, &pong())));
+        assert!(seen.contains(&frame_reply(2, &pong())));
     }
 
     /// A request the transport hands over is untagged; the reply it sends back
@@ -709,7 +726,46 @@ mod tests {
         let echoed = u64::from_be_bytes(buf[..ID_LEN].try_into().unwrap());
         assert_eq!(request_id(echoed), id, "the id must survive the round trip");
         assert!(is_reply(echoed), "a reply must be tagged as one");
-        assert_eq!(&buf[ID_LEN..len], ping::PONG);
+        assert_eq!(&buf[ID_LEN..len], pong());
+    }
+
+    /// A FIND_NODE driven down the real UDP path, decoded by the same
+    /// [`find_node::decode_reply`] a live [`Rpc`](crate::rpc::Rpc) uses.
+    ///
+    /// The one test that puts both halves of FIND_NODE together. Neither half
+    /// alone catches a framing disagreement between them: the handler's own
+    /// tests never reach a dispatcher, and `Rpc`'s never reach a handler. That
+    /// gap is how #34 shipped — `handle` put the request id on the front of its
+    /// reply, `frame_reply` put it there again, and every FIND_NODE on the wire
+    /// decoded to nothing while both sides' tests stayed green.
+    #[tokio::test]
+    async fn udp_find_node_round_trips_through_the_dispatcher() {
+        let (_tcp_addr, udp_addr, context, _transport) = spawn_serve().await;
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let known = Contact {
+            id: [2u8; 20],
+            address: "127.0.0.1:8001".parse().unwrap(),
+        };
+        context.close_nodes.maybe_add_contact(known);
+
+        let target = [1u8; 20];
+        let mut datagram = framed_datagram(7, Method::FindNode.tag());
+        datagram.extend(find_node::encode_request(target).unwrap());
+        client.send_to(&datagram, udp_addr).await.unwrap();
+
+        let mut buf = [0u8; 1024];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut buf))
+            .await
+            .expect("answered within 1s")
+            .unwrap();
+
+        // Exactly what `Rpc::find_node` does with the bytes it gets back.
+        let contacts = find_node::decode_reply(&buf[ID_LEN..len])
+            .expect("the reply must decode as the contacts it carries");
+        assert!(contacts.contains(&known));
+        // The requester is learned while being answered, so it comes back too.
+        assert!(contacts.iter().any(|c| c.id == sender_id()));
     }
 
     /// A STORE arriving over the TCP loop, framed exactly the way
