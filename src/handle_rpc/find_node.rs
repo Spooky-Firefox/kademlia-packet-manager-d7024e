@@ -15,16 +15,15 @@ use std::net::SocketAddr;
 /// Answer a FIND_NODE for the target id in `body`.
 pub async fn handle<A: CloseNodes>(
     context: &Context<A>,
-    id: u64,
-    from: SocketAddr,
+    _id: u64,
+    _from: SocketAddr,
     body: &[u8],
 ) -> Option<Vec<u8>> {
     let target: NodeId = bincode::deserialize(body).ok()?;
 
     let contacts = context.close_nodes.close_nodes(target);
-    let mut res = id.to_be_bytes().to_vec();
-    res.extend(bincode::serialize(&contacts).ok()?);
-    Some(res)
+
+    bincode::serialize(&contacts).ok()
 }
 
 #[cfg(test)]
@@ -71,11 +70,8 @@ mod tests {
             .await
             .unwrap();
 
-        let (resp_id_bytes, contacts_bytes) = response.split_at(8);
-        let resp_id = u64::from_be_bytes(resp_id_bytes.try_into().unwrap());
-        let contacts: Vec<Contact> = bincode::deserialize(contacts_bytes).unwrap();
+        let contacts: Vec<Contact> = bincode::deserialize(&response).unwrap();
 
-        assert_eq!(resp_id, 42);
         assert_eq!(contacts, expected_contacts);
     }
 

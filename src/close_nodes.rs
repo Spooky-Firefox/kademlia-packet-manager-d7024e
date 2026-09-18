@@ -29,6 +29,17 @@ pub trait CloseNodes {
     fn maybe_add_contact(&self, contact: Contact);
 }
 
+// safely shared between incoming/outgoing RPC handlers for routintable by wrapping the thingie in Arc
+impl<T: CloseNodes> CloseNodes for std::sync::Arc<T> {
+    fn close_nodes(&self, id: NodeId) -> Vec<Contact> {
+        self.as_ref().close_nodes(id)
+    }
+
+    fn maybe_add_contact(&self, contact: Contact) {
+        self.as_ref().maybe_add_contact(contact);
+    }
+}
+
 /// Kademlia's replication parameter: how many contacts a lookup returns.
 pub const K: usize = 20;
 
