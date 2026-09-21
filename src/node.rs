@@ -1,6 +1,7 @@
 use crate::close_nodes::{Contact, NodeId, RecommendedCloseNodes, recommended};
 use crate::handle_rpc::{self, Context};
 use crate::rpc::Rpc;
+use crate::rpc_transport::RpcTransport;
 use crate::rpc_transport::tcp_transport::TcpTransport;
 use crate::rpc_transport::udp_transport::UdpTransport;
 
@@ -12,38 +13,54 @@ use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-pub type NodeRpc = Rpc<UdpTransport, TcpTransport, Arc<RecommendedCloseNodes>>;
+pub type NodeRpc<T, U> = Rpc<T, U, Arc<RecommendedCloseNodes>>;
 
-pub struct Node {
+pub struct Node<T, U>
+where
+    T: RpcTransport,
+    U: RpcTransport,
+{
     id: NodeId,
     address: SocketAddr,
-    rpc: NodeRpc,
+    rpc: NodeRpc<T, U>,
     context: Arc<Context<Arc<RecommendedCloseNodes>>>,
-    _server_task: JoinHandle<()>,
+    _server_tasks: Vec<JoinHandle<()>>,
+}
+pub type RealNode = Node<UdpTransport, TcpTransport>;
+
+impl<T, U> Node<T, U>
+where
+    T: RpcTransport,
+    U: RpcTransport,
+{
+    pub fn id(&self) -> NodeId {
+        self.id
+    }
+
+    pub fn address(&self) -> SocketAddr {
+        self.address
+    }
+
+    pub fn rpc(&self) -> &NodeRpc<T, U> {
+        &self.rpc
+    }
 }
 
-impl Node {
+impl RealNode {
     pub async fn bind(id: NodeId, bind_address: SocketAddr) -> io::Result<Self> {
-        // Bind UDP first.
         let udp_socket = UdpSocket::bind(bind_address).await?;
         let address = udp_socket.local_addr()?;
 
-        // Use the same numbered port for TCP.
         let tcp_listener = TcpListener::bind(address).await?;
 
-        // One routing table shared by incoming and outgoing RPC logic.
         let routing = Arc::new(recommended(id));
 
-        // State used by incoming RPC handlers.
         let context = Context::new(id, Arc::clone(&routing));
 
-        // Incoming UDP requests are forwarded from the transport's receive
-        // loop to the RPC dispatcher through this channel.
         let (request_tx, request_rx) = mpsc::channel(64);
 
         let udp_transport = UdpTransport::with_requests(udp_socket, request_tx);
 
-        // Start the incoming RPC server in the background.
         let server_task = tokio::spawn(handle_rpc::serve(
             Arc::clone(&context),
             request_rx,
@@ -51,9 +68,6 @@ impl Node {
             tcp_listener,
         ));
 
-        // Outgoing RPC side.
-        //
-        // Rpc now wants our full Contact rather than only our NodeId.
         let rpc = Rpc::new(
             Contact { id, address },
             udp_transport,
@@ -66,20 +80,8 @@ impl Node {
             address,
             rpc,
             context,
-            _server_task: server_task,
+            _server_tasks: vec![server_task],
         })
-    }
-
-    pub fn id(&self) -> NodeId {
-        self.id
-    }
-
-    pub fn address(&self) -> SocketAddr {
-        self.address
-    }
-
-    pub fn rpc(&self) -> &NodeRpc {
-        &self.rpc
     }
 }
 
@@ -90,11 +92,11 @@ mod tests {
 
     #[tokio::test]
     async fn two_nodes_can_ping_each_other() {
-        let a = Node::bind([1u8; 20], "127.0.0.1:0".parse().unwrap())
+        let a = RealNode::bind([1u8; 20], "127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
 
-        let b = Node::bind([2u8; 20], "127.0.0.1:0".parse().unwrap())
+        let b = RealNode::bind([2u8; 20], "127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
 
@@ -103,11 +105,11 @@ mod tests {
 
     #[tokio::test]
     async fn two_nodes_can_ping_and_learn_each_other() {
-        let a = Node::bind([1u8; 20], "127.0.0.1:0".parse().unwrap())
+        let a = RealNode::bind([1u8; 20], "127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
 
-        let b = Node::bind([2u8; 20], "127.0.0.1:0".parse().unwrap())
+        let b = RealNode::bind([2u8; 20], "127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
 
@@ -124,15 +126,15 @@ mod tests {
 
     #[tokio::test]
     async fn node_can_discover_another_node_through_lookup() {
-        let a = Node::bind([1u8; 20], "127.0.0.1:0".parse().unwrap())
+        let a = RealNode::bind([1u8; 20], "127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
 
-        let b = Node::bind([2u8; 20], "127.0.0.1:0".parse().unwrap())
+        let b = RealNode::bind([2u8; 20], "127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
 
-        let c = Node::bind([3u8; 20], "127.0.0.1:0".parse().unwrap())
+        let c = RealNode::bind([3u8; 20], "127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
 
@@ -153,11 +155,11 @@ mod tests {
 
     #[tokio::test]
     async fn real_nodes_can_store_and_find_value() {
-        let a = Node::bind([1u8; 20], "127.0.0.1:0".parse().unwrap())
+        let a = RealNode::bind([1u8; 20], "127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
 
-        let b = Node::bind([2u8; 20], "127.0.0.1:0".parse().unwrap())
+        let b = RealNode::bind([2u8; 20], "127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
 
@@ -173,15 +175,15 @@ mod tests {
 
     #[tokio::test]
     async fn node_can_find_value_through_network() {
-        let a = Node::bind([1u8; 20], "127.0.0.1:0".parse().unwrap())
+        let a = RealNode::bind([1u8; 20], "127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
 
-        let b = Node::bind([2u8; 20], "127.0.0.1:0".parse().unwrap())
+        let b = RealNode::bind([2u8; 20], "127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
 
-        let c = Node::bind([3u8; 20], "127.0.0.1:0".parse().unwrap())
+        let c = RealNode::bind([3u8; 20], "127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
 
