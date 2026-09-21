@@ -10,6 +10,8 @@
 use std::net::SocketAddr;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+use std::sync::Arc;
+
 pub trait StreamListener {
     type Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static;
 
@@ -22,4 +24,13 @@ pub trait StreamListener {
     fn accept(
         &self,
     ) -> impl std::future::Future<Output = std::io::Result<(Self::Stream, SocketAddr)>> + Send;
+}
+impl<T: StreamListener> StreamListener for Arc<T> {
+    type Stream = T::Stream;
+
+    fn accept(
+        &self,
+    ) -> impl std::future::Future<Output = std::io::Result<(Self::Stream, SocketAddr)>> + Send {
+        self.as_ref().accept()
+    }
 }

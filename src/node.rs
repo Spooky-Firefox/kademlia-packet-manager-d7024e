@@ -2,9 +2,11 @@ use crate::close_nodes::{Contact, NodeId, RecommendedCloseNodes, recommended};
 use crate::handle_rpc::{self, Context};
 use crate::rpc::Rpc;
 use crate::rpc_transport::RpcTransport;
+use crate::rpc_transport::networked_debug_transport::{
+    Network, NetworkedDebugTransport, NetworkedStreamTransport,
+};
 use crate::rpc_transport::tcp_transport::TcpTransport;
 use crate::rpc_transport::udp_transport::UdpTransport;
-
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -27,7 +29,7 @@ where
     _server_tasks: Vec<JoinHandle<()>>,
 }
 pub type RealNode = Node<UdpTransport, TcpTransport>;
-
+pub type FakeNode = Node<NetworkedDebugTransport, NetworkedStreamTransport>;
 impl<T, U> Node<T, U>
 where
     T: RpcTransport,
@@ -84,7 +86,46 @@ impl RealNode {
         })
     }
 }
+impl FakeNode {
+    pub fn new(id: NodeId, network: &Network) -> Self {
+        let endpoint = network.bind_any();
+        let address = endpoint.local_addr();
 
+        let routing = Arc::new(recommended(id));
+
+        let context = Context::new(id, Arc::clone(&routing));
+
+        let (request_tx, request_rx) = mpsc::channel(64);
+
+        let datagram_transport = NetworkedDebugTransport::with_requests(endpoint, request_tx);
+
+        let shared_endpoint = datagram_transport.socket();
+
+        let server_task = tokio::spawn(handle_rpc::serve(
+            Arc::clone(&context),
+            request_rx,
+            Arc::clone(&shared_endpoint),
+            shared_endpoint,
+        ));
+
+        let stream_transport = NetworkedStreamTransport::new(network.clone());
+
+        let rpc = Rpc::new(
+            Contact { id, address },
+            datagram_transport,
+            stream_transport,
+            Arc::clone(&routing),
+        );
+
+        Self {
+            id,
+            address,
+            rpc,
+            context,
+            _server_tasks: vec![server_task],
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,5 +243,53 @@ mod tests {
         let found = crate::lookup::lookup_value(a.rpc(), key).await;
 
         assert_eq!(found, Some(value));
+    }
+    #[tokio::test]
+    async fn fake_nodes_can_ping_each_other() {
+        let network = Network::new();
+
+        let a = FakeNode::new([1u8; 20], &network);
+
+        let b = FakeNode::new([2u8; 20], &network);
+
+        assert_eq!(a.rpc().ping(b.address()).await, Some(b.id()));
+    }
+    #[tokio::test]
+    async fn fake_node_can_discover_another_node_through_lookup() {
+        let network = Network::new();
+
+        let a = FakeNode::new([1u8; 20], &network);
+        let b = FakeNode::new([2u8; 20], &network);
+        let c = FakeNode::new([3u8; 20], &network);
+
+        // Make A learn B.
+        assert_eq!(b.rpc().ping(a.address()).await, Some(a.id()));
+
+        // Make B learn C.
+        assert_eq!(c.rpc().ping(b.address()).await, Some(b.id()));
+
+        let found = crate::lookup::lookup_node(a.rpc(), c.id()).await;
+
+        assert!(
+            found
+                .iter()
+                .any(|contact| { contact.id == c.id() && contact.address == c.address() })
+        );
+    }
+    #[tokio::test]
+    async fn fake_nodes_can_store_and_find_value() {
+        let network = Network::new();
+
+        let a = FakeNode::new([1u8; 20], &network);
+        let b = FakeNode::new([2u8; 20], &network);
+
+        let key = [9u8; 20];
+        let value = vec![0xAB; 5000];
+
+        assert!(a.rpc().store(b.address(), key, value.clone()).await);
+
+        let result = a.rpc().find_value(b.address(), key).await;
+
+        assert_eq!(result, crate::rpc::FindValue::Value(value));
     }
 }
