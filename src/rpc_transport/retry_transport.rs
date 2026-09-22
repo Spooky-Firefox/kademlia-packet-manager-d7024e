@@ -101,7 +101,10 @@ impl<T: DataRxTx + Send + Sync + 'static> RetryTransport<T> {
                         trace!("Request {id} from {addr} but nothing serves them, dropping");
                         continue;
                     };
-                    let request = Request::new(id, addr, buf[ID_LEN..len].into());
+                    // The length check above already guaranteed this parses.
+                    let Some(request) = Request::from_datagram(addr, &buf[..len]) else {
+                        continue;
+                    };
                     // try_send, not send: a full queue sheds this request the
                     // way a lossy wire already would, rather than parking the
                     // one loop that drains this socket.

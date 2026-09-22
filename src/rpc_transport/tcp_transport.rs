@@ -1,9 +1,23 @@
+//! The connection-shaped transport over real TCP, both ways round: dialling
+//! one for [`TcpTransport`], and accepting them for
+//! [`handle_rpc::serve`](crate::handle_rpc::serve).
+//!
+//! What happens on a connection once it is open is
+//! [`super::stream_framing::stream_send_receive`], shared
+//! with the in-process fake in
+//! [`networked_debug_transport`](super::networked_debug_transport) — the same
+//! arrangement as
+//! [`RetryTransport`](super::retry_transport::RetryTransport) on the datagram
+//! side, where only the channel differs.
+
 use crate::rpc_transport::RpcTransport;
-use crate::rpc_transport::request_id;
+use crate::rpc_transport::stream_framing::stream_send_receive;
+use crate::rpc_transport::stream_listener::StreamListener;
 use std::net::SocketAddr;
 use std::vec::Vec;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 
+/// A connection per request, over a real TCP socket.
 pub struct TcpTransport;
 
 impl RpcTransport for TcpTransport {
@@ -12,25 +26,18 @@ impl RpcTransport for TcpTransport {
         payload: Vec<u8>,
         address: SocketAddr,
     ) -> std::io::Result<Vec<u8>> {
-        // Tag bit cleared: this is a request, and a random u64 would set it
-        // half the time. `frame_reply` sets it on the way back, so the echo is
-        // compared with it masked off.
-        let id = request_id(rand::random::<u64>());
-        let mut stream = tokio::net::TcpStream::connect(address).await?;
-        stream.write_all(&id.to_be_bytes()).await?;
-        stream.write_all(&payload).await?;
-        // Half-close the write side so the peer sees EOF once the whole
-        // request has arrived, then read until it closes its own side
-        // with the reply. There is no length framing, so EOF is the only
-        // signal either end has that the other is done sending.
-        stream.shutdown().await?;
-        let mut outbuff = Vec::new();
-        let mut id_bytes = [0u8; 8];
-        stream.read_exact(&mut id_bytes).await?;
-        let echoed_id = u64::from_be_bytes(id_bytes);
-        assert_eq!(request_id(echoed_id), id);
-        stream.read_to_end(&mut outbuff).await?;
-        Ok(outbuff)
+        let stream = TcpStream::connect(address).await?;
+        stream_send_receive(stream, payload).await
+    }
+}
+
+impl StreamListener for TcpListener {
+    type Stream = TcpStream;
+
+    async fn accept(&self) -> std::io::Result<(TcpStream, SocketAddr)> {
+        // Spelled as a path so it resolves to the inherent `accept` rather than
+        // recursing into this one.
+        TcpListener::accept(self).await
     }
 }
 

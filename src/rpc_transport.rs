@@ -44,6 +44,8 @@ pub mod data_rx_tx;
 pub mod debug_transport;
 pub mod networked_debug_transport;
 pub mod retry_transport;
+pub mod stream_framing;
+pub mod stream_listener;
 pub mod tcp_transport;
 pub mod udp_transport;
 
