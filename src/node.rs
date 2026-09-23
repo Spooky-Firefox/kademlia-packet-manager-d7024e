@@ -214,8 +214,8 @@ mod tests {
             .await
             .unwrap();
 
-        let key = [9u8; 32];
         let value = vec![0xAB; 5000];
+        let key = crate::hashing::key_for_value(&value);
 
         assert!(a.rpc().store(b.address(), key, value.clone(),).await);
 
@@ -238,8 +238,8 @@ mod tests {
             .await
             .unwrap();
 
-        let key = [9u8; 32];
         let value = vec![0xAB; 5000];
+        let key = crate::hashing::key_for_value(&value);
 
         // Make A learn B.
         assert_eq!(b.rpc().ping(a.address()).await, Some(a.id()));
@@ -293,13 +293,51 @@ mod tests {
         let a = FakeNode::new(&network);
         let b = FakeNode::new(&network);
 
-        let key = [9u8; 32];
         let value = vec![0xAB; 5000];
+        let key = crate::hashing::key_for_value(&value);
 
         assert!(a.rpc().store(b.address(), key, value.clone()).await);
 
         let result = a.rpc().find_value(b.address(), key).await;
 
         assert_eq!(result, crate::rpc::FindValue::Value(value));
+    }
+    #[tokio::test]
+    async fn high_level_store_replicates_value() {
+        let network = Network::new();
+
+        let a = FakeNode::new(&network);
+        let b = FakeNode::new(&network);
+        let c = FakeNode::new(&network);
+
+        // Make A learn B.
+        assert_eq!(b.rpc().ping(a.address()).await, Some(a.id()));
+
+        // Make B learn C.
+        assert_eq!(c.rpc().ping(b.address()).await, Some(b.id()));
+
+        let value = b"hello kademlia".to_vec();
+        let expected_key = crate::hashing::key_for_value(&value);
+
+        let key = crate::lookup::store_value(a.rpc(), value.clone()).await;
+
+        assert_eq!(key, expected_key);
+
+        // There are only 3 nodes and k = 10, so all three should
+        // be among the k closest and receive the value.
+        assert_eq!(
+            a.rpc().find_value(a.address(), key).await,
+            crate::rpc::FindValue::Value(value.clone())
+        );
+
+        assert_eq!(
+            a.rpc().find_value(b.address(), key).await,
+            crate::rpc::FindValue::Value(value.clone())
+        );
+
+        assert_eq!(
+            a.rpc().find_value(c.address(), key).await,
+            crate::rpc::FindValue::Value(value)
+        );
     }
 }

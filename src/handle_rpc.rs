@@ -745,8 +745,8 @@ mod tests {
     #[tokio::test]
     async fn tcp_store_is_written_and_acked() {
         let (tcp_addr, _udp_addr, context, _transport) = spawn_serve().await;
-        let key: Key = [9u8; 32];
-        let value = b"stored over tcp".to_vec();
+        let value = vec![0xAB; 5000];
+        let key = crate::hashing::key_for_value(&value);
         let id = 0x1122_3344_5566_7788u64;
 
         let mut datagram = id.to_be_bytes().to_vec();
@@ -789,8 +789,8 @@ mod tests {
         // TODO deal with spawn handle
         tokio::spawn(serve_streams(Arc::clone(&context), endpoint));
 
-        let key: Key = [9u8; 32];
-        let value = vec![0xABu8; 5000];
+        let value = vec![0xAB; 5000];
+        let key = crate::hashing::key_for_value(&value);
         let transport = NetworkedStreamTransport::new(network);
 
         let mut request = framed(Method::Store.tag());

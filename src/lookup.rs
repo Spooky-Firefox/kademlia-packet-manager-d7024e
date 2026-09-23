@@ -1,9 +1,9 @@
 use crate::close_nodes::{CloseNodes, Contact, K, Key, NodeId, xor_distance_cmp};
+use crate::hashing::key_for_value;
 use crate::rpc::{FindValue, Rpc};
 use crate::rpc_transport::RpcTransport;
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::HashSet;
-
 /// Kademlia's concurrency parameter: how many `find_node` RPCs a lookup keeps
 /// in flight at once.
 const ALPHA: usize = 3;
@@ -91,10 +91,15 @@ where
         };
 
         match reply {
-            FindValue::Value(value) => return Some(value),
+            FindValue::Value(value) => {
+                if key_for_value(&value) == key {
+                    return Some(value);
+                }
+                // Invalid content for this key. Ignore it and continue looking
+            }
+            // every contact a response teaches us about is worth offering
+            // to the routing table, whether or not the value turns up
             FindValue::Closest(contacts) => {
-                // every contact a response teaches us about is worth offering
-                // to the routing table, whether or not the value turns up
                 for contact in &contacts {
                     rpc.close_nodes().maybe_add_contact(*contact);
                 }
@@ -103,6 +108,34 @@ where
     }
 
     None
+}
+pub async fn store_value<T, U, A>(rpc: &Rpc<T, U, A>, value: Vec<u8>) -> Key
+where
+    T: RpcTransport,
+    U: RpcTransport,
+    A: CloseNodes,
+{
+    // K = SHA256(V).
+    let key = key_for_value(&value);
+
+    // Find the nodes closest to the key.
+    let mut targets = lookup_node(rpc, key).await;
+
+    // Our routing table does not contain ourselves, but we may still
+    // be one of the K closest nodes to this key.
+    targets.push(rpc.my_contact());
+
+    // Select the actual K closest nodes, including ourselves.
+    targets.sort_by(|a, b| xor_distance_cmp(a.id, b.id, key));
+    targets.dedup_by_key(|contact| contact.id);
+    targets.truncate(K);
+
+    // Replicate the value to each of the K closest nodes.
+    for target in targets {
+        rpc.store(target.address, key, value.clone()).await;
+    }
+
+    key
 }
 #[cfg(test)]
 mod tests {
@@ -181,7 +214,8 @@ mod tests {
 
     #[tokio::test]
     async fn value_lookup_finds_value_after_node_lookup() {
-        let key = [0u8; 32];
+        let value = b"hello".to_vec();
+        let key = crate::hashing::key_for_value(&value);
 
         let a = Contact {
             id: [8u8; 32],
@@ -197,8 +231,6 @@ mod tests {
             id: [2u8; 32],
             address: "127.0.0.1:8003".parse().unwrap(),
         };
-
-        let value = b"hello".to_vec();
 
         let transport = FakeTransport { a, b, c };
 
@@ -437,5 +469,43 @@ mod tests {
         let result = lookup_node(&rpc, target).await;
 
         assert!(result.is_empty());
+    }
+    #[tokio::test]
+    async fn value_lookup_rejects_value_that_does_not_match_key() {
+        let expected_value = b"correct value".to_vec();
+        let key = key_for_value(&expected_value);
+
+        let a = Contact {
+            id: [8u8; 32],
+            address: "127.0.0.1:8001".parse().unwrap(),
+        };
+
+        let b = Contact {
+            id: [4u8; 32],
+            address: "127.0.0.1:8002".parse().unwrap(),
+        };
+
+        let c = Contact {
+            id: [2u8; 32],
+            address: "127.0.0.1:8003".parse().unwrap(),
+        };
+
+        let transport = FakeTransport { a, b, c };
+
+        // C claims to have the requested key, but sends different content.
+        let robust_transport = FakeValueTransport {
+            a,
+            b,
+            c,
+            value: b"tampered value".to_vec(),
+        };
+
+        let close_nodes = FakeCloseNodes { initial: vec![a] };
+
+        let rpc = Rpc::new(me(), transport, robust_transport, close_nodes);
+
+        let result = lookup_value(&rpc, key).await;
+
+        assert_eq!(result, None);
     }
 }
