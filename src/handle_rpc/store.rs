@@ -46,9 +46,9 @@ mod tests {
 
     #[tokio::test]
     async fn store_writes_the_value_and_acks() {
-        let key: Key = [1u8; 20];
+        let key: Key = [1u8; 32];
         let value = b"hello".to_vec();
-        let my_id = [0u8; 20];
+        let my_id = [0u8; 32];
         let context = Context::new(my_id, recommended(my_id));
 
         let body = encode_request(key, value.clone()).unwrap();
@@ -60,8 +60,8 @@ mod tests {
 
     #[tokio::test]
     async fn store_overwrites_an_existing_value() {
-        let key: Key = [1u8; 20];
-        let my_id = [0u8; 20];
+        let key: Key = [1u8; 32];
+        let my_id = [0u8; 32];
         let context = Context::new(my_id, recommended(my_id));
 
         let first = encode_request(key, b"old".to_vec()).unwrap();
@@ -74,7 +74,7 @@ mod tests {
 
     #[tokio::test]
     async fn store_rejects_invalid_body() {
-        let my_id = [0u8; 20];
+        let my_id = [0u8; 32];
         let context = Context::new(my_id, recommended(my_id));
 
         let reply = handle(&context, 42, addr(), b"too short").await;

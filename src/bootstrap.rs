@@ -107,8 +107,8 @@ mod tests {
     use crate::handle_rpc::{Method, NODE_ID_LEN};
     use std::sync::Mutex;
 
-    const MY_ID: NodeId = [1u8; 20];
-    const SEED_ID: NodeId = [2u8; 20];
+    const MY_ID: NodeId = [1u8; 32];
+    const SEED_ID: NodeId = [2u8; 32];
 
     fn seed_addr() -> SocketAddr {
         "127.0.0.1:8000".parse().unwrap()
@@ -224,7 +224,7 @@ mod tests {
     #[tokio::test]
     async fn bootstrap_learns_the_seeds_neighbours() {
         let neighbour = Contact {
-            id: [3u8; 20],
+            id: [3u8; 32],
             address: "127.0.0.1:8001".parse().unwrap(),
         };
         let rpc = rpc_with(FakeTransport::new(SEED_ID, vec![neighbour]));

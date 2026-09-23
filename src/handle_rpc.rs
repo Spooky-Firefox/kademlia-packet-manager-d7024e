@@ -418,7 +418,7 @@ mod tests {
     }
 
     fn sender_id() -> NodeId {
-        [1u8; 20]
+        [1u8; 32]
     }
 
     /// Frame a request payload the way a live `Rpc` does: [`sender_id`],
@@ -438,7 +438,7 @@ mod tests {
     }
 
     /// The id every context in these tests answers under.
-    const TEST_ID: NodeId = [0u8; 20];
+    const TEST_ID: NodeId = [0u8; 32];
 
     fn test_context() -> Arc<Context<crate::close_nodes::RecommendedCloseNodes>> {
         Context::new(TEST_ID, recommended(TEST_ID))
@@ -632,7 +632,7 @@ mod tests {
         let (requests, rx) = mpsc::channel(8);
         let transport = UdpTransport::with_requests(udp_socket, requests);
 
-        let context = Context::new([0u8; 20], recommended([0u8; 20]));
+        let context = Context::new([0u8; 32], recommended([0u8; 32]));
         tokio::spawn(serve(
             Arc::clone(&context),
             rx,
@@ -714,12 +714,12 @@ mod tests {
         let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
         let known = Contact {
-            id: [2u8; 20],
+            id: [2u8; 32],
             address: "127.0.0.1:8001".parse().unwrap(),
         };
         context.close_nodes.maybe_add_contact(known);
 
-        let target = [1u8; 20];
+        let target = [1u8; 32];
         let mut datagram = framed_datagram(7, Method::FindNode.tag());
         datagram.extend(find_node::encode_request(target).unwrap());
         client.send_to(&datagram, udp_addr).await.unwrap();
@@ -745,7 +745,7 @@ mod tests {
     #[tokio::test]
     async fn tcp_store_is_written_and_acked() {
         let (tcp_addr, _udp_addr, context, _transport) = spawn_serve().await;
-        let key: Key = [9u8; 20];
+        let key: Key = [9u8; 32];
         let value = b"stored over tcp".to_vec();
         let id = 0x1122_3344_5566_7788u64;
 
@@ -789,7 +789,7 @@ mod tests {
         // TODO deal with spawn handle
         tokio::spawn(serve_streams(Arc::clone(&context), endpoint));
 
-        let key: Key = [9u8; 20];
+        let key: Key = [9u8; 32];
         let value = vec![0xABu8; 5000];
         let transport = NetworkedStreamTransport::new(network);
 

@@ -114,7 +114,7 @@ mod tests {
     /// it never competes with the contacts a lookup is meant to return.
     fn me() -> Contact {
         Contact {
-            id: [0xffu8; 20],
+            id: [0xffu8; 32],
             address: "127.0.0.1:9000".parse().unwrap(),
         }
     }
@@ -181,20 +181,20 @@ mod tests {
 
     #[tokio::test]
     async fn value_lookup_finds_value_after_node_lookup() {
-        let key = [0u8; 20];
+        let key = [0u8; 32];
 
         let a = Contact {
-            id: [8u8; 20],
+            id: [8u8; 32],
             address: "127.0.0.1:8001".parse().unwrap(),
         };
 
         let b = Contact {
-            id: [4u8; 20],
+            id: [4u8; 32],
             address: "127.0.0.1:8002".parse().unwrap(),
         };
 
         let c = Contact {
-            id: [2u8; 20],
+            id: [2u8; 32],
             address: "127.0.0.1:8003".parse().unwrap(),
         };
 
@@ -240,20 +240,20 @@ mod tests {
 
     #[tokio::test]
     async fn value_lookup_returns_none_when_value_is_not_found() {
-        let key = [0u8; 20];
+        let key = [0u8; 32];
 
         let a = Contact {
-            id: [8u8; 20],
+            id: [8u8; 32],
             address: "127.0.0.1:8001".parse().unwrap(),
         };
 
         let b = Contact {
-            id: [4u8; 20],
+            id: [4u8; 32],
             address: "127.0.0.1:8002".parse().unwrap(),
         };
 
         let c = Contact {
-            id: [2u8; 20],
+            id: [2u8; 32],
             address: "127.0.0.1:8003".parse().unwrap(),
         };
 
@@ -307,16 +307,16 @@ mod tests {
     /// table even when the lookup never turns up the value itself.
     #[tokio::test]
     async fn value_lookup_offers_closest_reply_contacts_to_the_routing_table() {
-        let key = [0u8; 20];
+        let key = [0u8; 32];
 
         let a = Contact {
-            id: [8u8; 20],
+            id: [8u8; 32],
             address: "127.0.0.1:9101".parse().unwrap(),
         };
         // only ever surfaces through find_value's Closest reply, never
         // through find_node, so its presence proves this call path.
         let newly_discovered = Contact {
-            id: [4u8; 20],
+            id: [4u8; 32],
             address: "127.0.0.1:9102".parse().unwrap(),
         };
 
@@ -346,20 +346,20 @@ mod tests {
 
     #[tokio::test]
     async fn lookup_follows_newly_discovered_contacts() {
-        let target = [0u8; 20];
+        let target = [0u8; 32];
 
         let a = Contact {
-            id: [8u8; 20],
+            id: [8u8; 32],
             address: "127.0.0.1:8001".parse().unwrap(),
         };
 
         let b = Contact {
-            id: [4u8; 20],
+            id: [4u8; 32],
             address: "127.0.0.1:8002".parse().unwrap(),
         };
 
         let c = Contact {
-            id: [2u8; 20],
+            id: [2u8; 32],
             address: "127.0.0.1:8003".parse().unwrap(),
         };
 
@@ -378,18 +378,18 @@ mod tests {
     }
     #[tokio::test]
     async fn lookup_offers_newly_discovered_contacts_to_the_routing_table() {
-        let target = [0u8; 20];
+        let target = [0u8; 32];
 
         let a = Contact {
-            id: [8u8; 20],
+            id: [8u8; 32],
             address: "127.0.0.1:9001".parse().unwrap(),
         };
         let b = Contact {
-            id: [4u8; 20],
+            id: [4u8; 32],
             address: "127.0.0.1:9002".parse().unwrap(),
         };
         let c = Contact {
-            id: [2u8; 20],
+            id: [2u8; 32],
             address: "127.0.0.1:9003".parse().unwrap(),
         };
 
@@ -412,10 +412,10 @@ mod tests {
 
     #[tokio::test]
     async fn lookup_returns_empty_when_no_contacts_are_known() {
-        let target = [0u8; 20];
+        let target = [0u8; 32];
 
         let dummy = Contact {
-            id: [1u8; 20],
+            id: [1u8; 32],
             address: "127.0.0.1:8001".parse().unwrap(),
         };
 

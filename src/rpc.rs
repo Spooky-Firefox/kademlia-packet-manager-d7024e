@@ -199,7 +199,7 @@ mod tests {
     /// the address is what the responder would observe instead.
     fn me() -> Contact {
         Contact {
-            id: [9u8; 20],
+            id: [9u8; 32],
             address: "127.0.0.1:8010".parse().unwrap(),
         }
     }
@@ -207,17 +207,17 @@ mod tests {
     #[tokio::test]
     async fn find_node_sends_request_and_decodes_contacts() {
         let my_id = me().id;
-        let target = [1u8; 20];
+        let target = [1u8; 32];
 
         let peer: SocketAddr = "127.0.0.1:8000".parse().unwrap();
 
         let expected_contacts = vec![
             Contact {
-                id: [2u8; 20],
+                id: [2u8; 32],
                 address: "127.0.0.1:8001".parse().unwrap(),
             },
             Contact {
-                id: [3u8; 20],
+                id: [3u8; 32],
                 address: "127.0.0.1:8002".parse().unwrap(),
             },
         ];
@@ -256,7 +256,7 @@ mod tests {
     #[tokio::test]
     async fn find_value_sends_request_and_decodes_value() {
         let my_id = me().id;
-        let key = [1u8; 20];
+        let key = [1u8; 32];
         let peer: SocketAddr = "127.0.0.1:8000".parse().unwrap();
 
         let expected_reply = FindValue::Value(b"hello".to_vec());
@@ -289,11 +289,11 @@ mod tests {
     #[tokio::test]
     async fn find_value_decodes_closest_contacts() {
         let my_id = me().id;
-        let key = [1u8; 20];
+        let key = [1u8; 32];
         let peer: SocketAddr = "127.0.0.1:8000".parse().unwrap();
 
         let contacts = vec![Contact {
-            id: [2u8; 20],
+            id: [2u8; 32],
             address: "127.0.0.1:8001".parse().unwrap(),
         }];
 

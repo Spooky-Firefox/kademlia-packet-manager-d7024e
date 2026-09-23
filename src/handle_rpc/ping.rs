@@ -56,7 +56,7 @@ mod tests {
 
     #[tokio::test]
     async fn ping_answers_with_our_own_id() {
-        let my_id = [7u8; 20];
+        let my_id = [7u8; 32];
         let context = Context::new(my_id, recommended(my_id));
 
         let reply = handle(&context, 1, addr(), b"").await.unwrap();
@@ -67,7 +67,7 @@ mod tests {
     /// An unexpected body still gets an answer: we look alive either way.
     #[tokio::test]
     async fn ping_with_an_unexpected_body_is_still_answered() {
-        let my_id = [7u8; 20];
+        let my_id = [7u8; 32];
         let context = Context::new(my_id, recommended(my_id));
 
         let reply = handle(&context, 1, addr(), b"not a ping").await.unwrap();

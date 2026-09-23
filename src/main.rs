@@ -6,6 +6,7 @@ use tokio::net::UdpSocket;
 mod bootstrap;
 mod close_nodes;
 mod handle_rpc;
+mod hashing;
 mod lookup;
 mod node;
 mod pending;

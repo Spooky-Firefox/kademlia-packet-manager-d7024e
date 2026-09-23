@@ -1,5 +1,6 @@
 use crate::close_nodes::{Contact, NodeId, RecommendedCloseNodes, recommended};
 use crate::handle_rpc::{self, Context};
+use crate::hashing::node_id_from_address;
 use crate::rpc::Rpc;
 use crate::rpc_transport::RpcTransport;
 use crate::rpc_transport::networked_debug_transport::{
@@ -49,9 +50,11 @@ where
 }
 
 impl RealNode {
-    pub async fn bind(id: NodeId, bind_address: SocketAddr) -> io::Result<Self> {
+    pub async fn bind(bind_address: SocketAddr) -> io::Result<Self> {
         let udp_socket = UdpSocket::bind(bind_address).await?;
         let address = udp_socket.local_addr()?;
+
+        let id = node_id_from_address(address);
 
         let tcp_listener = TcpListener::bind(address).await?;
 
@@ -87,9 +90,11 @@ impl RealNode {
     }
 }
 impl FakeNode {
-    pub fn new(id: NodeId, network: &Network) -> Self {
+    pub fn new(network: &Network) -> Self {
         let endpoint = network.bind_any();
         let address = endpoint.local_addr();
+
+        let id = node_id_from_address(address);
 
         let routing = Arc::new(recommended(id));
 
@@ -133,24 +138,29 @@ mod tests {
 
     #[tokio::test]
     async fn two_nodes_can_ping_each_other() {
-        let a = RealNode::bind([1u8; 20], "127.0.0.1:0".parse().unwrap())
+        let a = RealNode::bind("127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
 
-        let b = RealNode::bind([2u8; 20], "127.0.0.1:0".parse().unwrap())
+        let b = RealNode::bind("127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
+
+        assert_eq!(a.id(), node_id_from_address(a.address()));
+        assert_eq!(b.id(), node_id_from_address(b.address()));
+
+        assert_ne!(a.id(), b.id());
 
         assert_eq!(a.rpc().ping(b.address()).await, Some(b.id()));
     }
 
     #[tokio::test]
     async fn two_nodes_can_ping_and_learn_each_other() {
-        let a = RealNode::bind([1u8; 20], "127.0.0.1:0".parse().unwrap())
+        let a = RealNode::bind("127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
 
-        let b = RealNode::bind([2u8; 20], "127.0.0.1:0".parse().unwrap())
+        let b = RealNode::bind("127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
 
@@ -167,15 +177,15 @@ mod tests {
 
     #[tokio::test]
     async fn node_can_discover_another_node_through_lookup() {
-        let a = RealNode::bind([1u8; 20], "127.0.0.1:0".parse().unwrap())
+        let a = RealNode::bind("127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
 
-        let b = RealNode::bind([2u8; 20], "127.0.0.1:0".parse().unwrap())
+        let b = RealNode::bind("127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
 
-        let c = RealNode::bind([3u8; 20], "127.0.0.1:0".parse().unwrap())
+        let c = RealNode::bind("127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
 
@@ -196,15 +206,15 @@ mod tests {
 
     #[tokio::test]
     async fn real_nodes_can_store_and_find_value() {
-        let a = RealNode::bind([1u8; 20], "127.0.0.1:0".parse().unwrap())
+        let a = RealNode::bind("127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
 
-        let b = RealNode::bind([2u8; 20], "127.0.0.1:0".parse().unwrap())
+        let b = RealNode::bind("127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
 
-        let key = [9u8; 20];
+        let key = [9u8; 32];
         let value = vec![0xAB; 5000];
 
         assert!(a.rpc().store(b.address(), key, value.clone(),).await);
@@ -216,19 +226,19 @@ mod tests {
 
     #[tokio::test]
     async fn node_can_find_value_through_network() {
-        let a = RealNode::bind([1u8; 20], "127.0.0.1:0".parse().unwrap())
+        let a = RealNode::bind("127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
 
-        let b = RealNode::bind([2u8; 20], "127.0.0.1:0".parse().unwrap())
+        let b = RealNode::bind("127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
 
-        let c = RealNode::bind([3u8; 20], "127.0.0.1:0".parse().unwrap())
+        let c = RealNode::bind("127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
 
-        let key = [9u8; 20];
+        let key = [9u8; 32];
         let value = vec![0xAB; 5000];
 
         // Make A learn B.
@@ -248,9 +258,9 @@ mod tests {
     async fn fake_nodes_can_ping_each_other() {
         let network = Network::new();
 
-        let a = FakeNode::new([1u8; 20], &network);
+        let a = FakeNode::new(&network);
 
-        let b = FakeNode::new([2u8; 20], &network);
+        let b = FakeNode::new(&network);
 
         assert_eq!(a.rpc().ping(b.address()).await, Some(b.id()));
     }
@@ -258,9 +268,9 @@ mod tests {
     async fn fake_node_can_discover_another_node_through_lookup() {
         let network = Network::new();
 
-        let a = FakeNode::new([1u8; 20], &network);
-        let b = FakeNode::new([2u8; 20], &network);
-        let c = FakeNode::new([3u8; 20], &network);
+        let a = FakeNode::new(&network);
+        let b = FakeNode::new(&network);
+        let c = FakeNode::new(&network);
 
         // Make A learn B.
         assert_eq!(b.rpc().ping(a.address()).await, Some(a.id()));
@@ -280,10 +290,10 @@ mod tests {
     async fn fake_nodes_can_store_and_find_value() {
         let network = Network::new();
 
-        let a = FakeNode::new([1u8; 20], &network);
-        let b = FakeNode::new([2u8; 20], &network);
+        let a = FakeNode::new(&network);
+        let b = FakeNode::new(&network);
 
-        let key = [9u8; 20];
+        let key = [9u8; 32];
         let value = vec![0xAB; 5000];
 
         assert!(a.rpc().store(b.address(), key, value.clone()).await);
