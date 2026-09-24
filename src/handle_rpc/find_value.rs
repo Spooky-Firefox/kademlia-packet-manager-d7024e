@@ -52,11 +52,11 @@ mod tests {
 
     #[tokio::test]
     async fn find_value_returns_stored_value() {
-        let key = [1u8; 20];
+        let key = [1u8; 32];
         let value = b"hello".to_vec();
 
         let context = Context::new(
-            [0u8; 20],
+            [0u8; 32],
             FakeCloseNodes {
                 contacts: Vec::new(),
             },
@@ -75,21 +75,21 @@ mod tests {
 
     #[tokio::test]
     async fn find_value_returns_closest_contacts_when_value_missing() {
-        let key = [1u8; 20];
+        let key = [1u8; 32];
 
         let contacts = vec![
             Contact {
-                id: [2u8; 20],
+                id: [2u8; 32],
                 address: "127.0.0.1:8001".parse().unwrap(),
             },
             Contact {
-                id: [3u8; 20],
+                id: [3u8; 32],
                 address: "127.0.0.1:8002".parse().unwrap(),
             },
         ];
 
         let context = Context::new(
-            [0u8; 20],
+            [0u8; 32],
             FakeCloseNodes {
                 contacts: contacts.clone(),
             },

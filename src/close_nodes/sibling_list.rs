@@ -100,7 +100,7 @@ mod tests {
     use std::net::SocketAddr;
 
     fn contact(first_byte: u8, port: u16) -> Contact {
-        let mut id = [0u8; 20];
+        let mut id = [0u8; 32];
         id[0] = first_byte;
         Contact {
             id,
@@ -109,7 +109,7 @@ mod tests {
     }
 
     fn table<const S: usize>() -> SiblingList<StaticBucket<2, 0, 4>, S> {
-        SiblingList::new([0u8; 20], StaticBucket::new([0u8; 20]))
+        SiblingList::new([0u8; 32], StaticBucket::new([0u8; 32]))
     }
 
     #[test]
@@ -131,7 +131,7 @@ mod tests {
             table.maybe_add_contact(contact(first, 1000));
         }
         let close: Vec<u8> = table
-            .close_nodes([0u8; 20])
+            .close_nodes([0u8; 32])
             .iter()
             .map(|c| c.id[0])
             .collect();
@@ -143,7 +143,7 @@ mod tests {
         let table = table::<3>();
         table.maybe_add_contact(contact(0x01, 1000));
         // Present in both the sibling list and the fallback, returned once.
-        assert_eq!(table.close_nodes([0u8; 20]).len(), 1);
+        assert_eq!(table.close_nodes([0u8; 32]).len(), 1);
 
         table.maybe_add_contact(contact(0x01, 1001));
         assert_eq!(table.siblings()[0].address.port(), 1001);

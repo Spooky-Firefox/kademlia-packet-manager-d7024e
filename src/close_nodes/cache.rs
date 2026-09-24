@@ -158,7 +158,7 @@ mod tests {
     fn cache(ttl: Duration) -> CachedCloseNodes<Counting> {
         CachedCloseNodes::new(
             Counting {
-                inner: StaticBucket::new([0u8; 20]),
+                inner: StaticBucket::new([0u8; 32]),
                 queries: AtomicUsize::new(0),
             },
             ttl,
@@ -171,7 +171,7 @@ mod tests {
     }
 
     fn contact(first_byte: u8) -> Contact {
-        let mut id = [0u8; 20];
+        let mut id = [0u8; 32];
         id[0] = first_byte;
         Contact {
             id,
@@ -182,20 +182,20 @@ mod tests {
     #[test]
     fn repeated_targets_hit_the_cache() {
         let cache = cache(Duration::from_secs(60));
-        cache.close_nodes([1u8; 20]);
-        cache.close_nodes([1u8; 20]);
+        cache.close_nodes([1u8; 32]);
+        cache.close_nodes([1u8; 32]);
         assert_eq!(queries(&cache), 1);
 
-        cache.close_nodes([2u8; 20]);
+        cache.close_nodes([2u8; 32]);
         assert_eq!(queries(&cache), 2);
     }
 
     #[test]
     fn a_new_contact_invalidates_every_target() {
         let cache = cache(Duration::from_secs(60));
-        cache.close_nodes([1u8; 20]);
+        cache.close_nodes([1u8; 32]);
         cache.maybe_add_contact(contact(0x80));
-        assert_eq!(cache.close_nodes([1u8; 20]), vec![contact(0x80)]);
+        assert_eq!(cache.close_nodes([1u8; 32]), vec![contact(0x80)]);
         assert_eq!(queries(&cache), 2);
     }
 
@@ -203,18 +203,18 @@ mod tests {
     fn ttl_only_serves_through_writes() {
         let cache = CachedCloseNodes::ttl_only(
             Counting {
-                inner: StaticBucket::new([0u8; 20]),
+                inner: StaticBucket::new([0u8; 32]),
                 queries: AtomicUsize::new(0),
             },
             Duration::from_secs(60),
             2,
         );
-        let before = cache.close_nodes([1u8; 20]);
+        let before = cache.close_nodes([1u8; 32]);
         cache.maybe_add_contact(contact(0x80));
         // The new contact is in the table below, but the cached answer stands.
-        assert_eq!(cache.close_nodes([1u8; 20]), before);
+        assert_eq!(cache.close_nodes([1u8; 32]), before);
         assert_eq!(
-            cache.inner().inner.close_nodes([1u8; 20]),
+            cache.inner().inner.close_nodes([1u8; 32]),
             vec![contact(0x80)]
         );
         assert_eq!(queries(&cache), 1);
@@ -223,8 +223,8 @@ mod tests {
     #[test]
     fn expired_entries_are_recomputed() {
         let cache = cache(Duration::ZERO);
-        cache.close_nodes([1u8; 20]);
-        cache.close_nodes([1u8; 20]);
+        cache.close_nodes([1u8; 32]);
+        cache.close_nodes([1u8; 32]);
         assert_eq!(queries(&cache), 2);
     }
 
@@ -232,7 +232,7 @@ mod tests {
     fn stays_within_capacity() {
         let cache = cache(Duration::from_secs(60));
         for i in 0..8u8 {
-            cache.close_nodes([i; 20]);
+            cache.close_nodes([i; 32]);
         }
         assert!(cache.entries.len() <= 2);
     }

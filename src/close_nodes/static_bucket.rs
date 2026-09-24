@@ -65,6 +65,22 @@ impl<const BUCKET_SIZE: usize, const SEARCH_SHIFT: usize, const MAX_BUCKETS: usi
     fn extend_from_bucket(&self, out: &mut Vec<Contact>, index: usize) {
         out.extend_from_slice(self.contacts[index].read().unwrap().as_slice());
     }
+
+    pub fn non_empty_buckets(&self) -> Vec<(usize, Vec<Contact>)> {
+        self.contacts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, bucket)| {
+                let contacts = bucket.read().unwrap();
+
+                if contacts.is_empty() {
+                    None
+                } else {
+                    Some((index, contacts.as_slice().to_vec()))
+                }
+            })
+            .collect()
+    }
 }
 
 impl<const BUCKET_SIZE: usize, const SEARCH_SHIFT: usize, const MAX_BUCKETS: usize> CloseNodes
@@ -125,7 +141,7 @@ mod tests {
     use std::net::SocketAddr;
 
     fn contact(first_byte: u8, port: u16) -> Contact {
-        let mut id = [0u8; 20];
+        let mut id = [0u8; 32];
         id[0] = first_byte;
         Contact {
             id,
@@ -135,27 +151,27 @@ mod tests {
 
     #[test]
     fn leading_zeros_counts_whole_id() {
-        assert_eq!(leading_zeros([0u8; 20]), ID_BITS as u32);
-        assert_eq!(leading_zeros([0x80; 20]), 0);
-        let mut id = [0u8; 20];
+        assert_eq!(leading_zeros([0u8; 32]), ID_BITS as u32);
+        assert_eq!(leading_zeros([0x80; 32]), 0);
+        let mut id = [0u8; 32];
         id[2] = 0x01;
         assert_eq!(leading_zeros(id), 23);
     }
 
     #[test]
     fn bucket_index_grows_with_shared_prefix_and_clamps() {
-        let table = StaticBucket::<2, 0, 8>::new([0u8; 20]);
+        let table = StaticBucket::<2, 0, 8>::new([0u8; 32]);
         // 0x80… differs in the top bit: no shared prefix, first bucket.
         assert_eq!(table.bucket_index(contact(0x80, 0).id), 0);
         // 0x40… shares one bit.
         assert_eq!(table.bucket_index(contact(0x40, 0).id), 1);
         // Own id shares all 160 bits, far past the eight buckets that exist.
-        assert_eq!(table.bucket_index([0u8; 20]), 7);
+        assert_eq!(table.bucket_index([0u8; 32]), 7);
     }
 
     #[test]
     fn close_nodes_widens_past_the_home_bucket() {
-        let table = StaticBucket::<4, 0, 8>::new([0u8; 20]);
+        let table = StaticBucket::<4, 0, 8>::new([0u8; 32]);
         for i in 0..4u8 {
             table.maybe_add_contact(contact(0x80 | i, 1000 + i as u16));
             table.maybe_add_contact(contact(0x40 | i, 2000 + i as u16));
@@ -169,7 +185,7 @@ mod tests {
 
     #[test]
     fn maybe_add_contact_refreshes_address_and_ignores_self() {
-        let table = StaticBucket::<4, 0, 8>::new([0u8; 20]);
+        let table = StaticBucket::<4, 0, 8>::new([0u8; 32]);
         table.maybe_add_contact(contact(0x80, 1000));
         table.maybe_add_contact(contact(0x80, 1001));
         let close = table.close_nodes(contact(0x80, 0).id);
@@ -177,9 +193,9 @@ mod tests {
         assert_eq!(close[0].address.port(), 1001);
 
         table.maybe_add_contact(Contact {
-            id: [0u8; 20],
+            id: [0u8; 32],
             address: SocketAddr::from(([127, 0, 0, 1], 9)),
         });
-        assert_eq!(table.close_nodes([0u8; 20]).len(), 1);
+        assert_eq!(table.close_nodes([0u8; 32]).len(), 1);
     }
 }

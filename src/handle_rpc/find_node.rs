@@ -53,16 +53,16 @@ mod tests {
 
     #[tokio::test]
     async fn find_node_returns_the_contacts_it_knows() {
-        let my_id = [0u8; 20];
+        let my_id = [0u8; 32];
         let context = Context::new(my_id, recommended(my_id));
 
         let known = Contact {
-            id: [2u8; 20],
+            id: [2u8; 32],
             address: "127.0.0.1:8001".parse().unwrap(),
         };
         context.close_nodes.maybe_add_contact(known);
 
-        let target = [1u8; 20];
+        let target = [1u8; 32];
         let body = encode_request(target).unwrap();
         let reply = handle(&context, 42, addr(), &body).await.unwrap();
 
@@ -74,10 +74,10 @@ mod tests {
     /// exactly that shipped.
     #[tokio::test]
     async fn find_node_reply_carries_no_id_of_its_own() {
-        let my_id = [0u8; 20];
+        let my_id = [0u8; 32];
         let context = Context::new(my_id, recommended(my_id));
 
-        let body = encode_request([1u8; 20]).unwrap();
+        let body = encode_request([1u8; 32]).unwrap();
         let reply = handle(&context, 42, addr(), &body).await.unwrap();
 
         assert!(decode_reply(&reply).is_some());
@@ -85,7 +85,7 @@ mod tests {
 
     #[tokio::test]
     async fn find_node_rejects_invalid_body() {
-        let my_id = [0u8; 20];
+        let my_id = [0u8; 32];
         let context = Context::new(my_id, recommended(my_id));
 
         assert!(handle(&context, 42, addr(), b"too short").await.is_none());

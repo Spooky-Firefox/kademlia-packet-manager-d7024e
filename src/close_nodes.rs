@@ -10,10 +10,17 @@ use static_bucket::StaticBucket;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-/// 160-bit Kademlia node id.
-pub type NodeId = [u8; 20];
-/// 160-bit key in the same space as [`NodeId`].
-pub type Key = [u8; 20];
+/// Number of bits in the Kademlia key/ID space.
+pub const B: usize = 256;
+
+/// Number of bytes in a Kademlia key/ID.
+pub const ID_BYTES: usize = B / 8;
+
+/// 256-bit Kademlia node ID.
+pub type NodeId = [u8; ID_BYTES];
+
+/// 256-bit key in the same space as [`NodeId`].
+pub type Key = [u8; ID_BYTES];
 
 /// A routing-table entry: who a node is, and where to reach it.
 
@@ -41,18 +48,18 @@ impl<T: CloseNodes> CloseNodes for std::sync::Arc<T> {
 }
 
 /// Kademlia's replication parameter: how many contacts a lookup returns.
-pub const K: usize = 20;
+pub const K: usize = 10;
 
 /// The XOR distance between `id` and `target`.
 ///
-/// Byte 0 is the most significant: an id is a big-endian 160-bit unsigned
-/// integer, matching the `u64` request ids on the wire and the order a SHA-1
+/// Byte 0 is the most significant: an id is a big-endian 256-bit unsigned
+/// integer, matching the `u64` request ids on the wire and the order a SHA-256
 /// digest already arrives in. Reading it from the other end would not be the
 /// XOR metric at all, so the direction is load-bearing — don't "fix" it.
 ///
-/// It also means the derived lexicographic `Ord` on `[u8; 20]` *is* numeric
+/// It also means the derived lexicographic `Ord` on `[u8; 32]` *is* numeric
 /// ordering, so the returned distance sorts correctly as a plain sort key.
-pub fn xor_distance(id: NodeId, target: NodeId) -> [u8; 20] {
+pub fn xor_distance(id: NodeId, target: NodeId) -> NodeId {
     std::array::from_fn(|i| id[i] ^ target[i])
 }
 
@@ -92,7 +99,7 @@ pub fn leading_zeros(id: NodeId) -> u32 {
 /// clamp at the near end starts throwing contacts together, and cost about
 /// 34 KB at `K` contacts each — cheap enough that trading routing precision
 /// for a smaller table (`SEARCH_SHIFT`) buys nothing worth having.
-pub const ROUTING_BUCKETS: usize = 32;
+pub const ROUTING_BUCKETS: usize = B;
 
 /// The `s` of S/Kademlia: how many near nodes are held outside the buckets,
 /// safe from bucket eviction. Sized to [`K`] so the sibling set alone can

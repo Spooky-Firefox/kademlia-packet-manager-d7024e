@@ -1,9 +1,9 @@
 use crate::close_nodes::{CloseNodes, Contact, K, Key, NodeId, xor_distance_cmp};
+use crate::hashing::key_for_value;
 use crate::rpc::{FindValue, Rpc};
 use crate::rpc_transport::RpcTransport;
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::HashSet;
-
 /// Kademlia's concurrency parameter: how many `find_node` RPCs a lookup keeps
 /// in flight at once.
 const ALPHA: usize = 3;
@@ -62,17 +62,20 @@ where
     candidates
 }
 
-pub async fn lookup_value<T, U, A>(rpc: &Rpc<T, U, A>, key: Key) -> Option<Vec<u8>>
+pub async fn lookup_value<T, U, A>(rpc: &Rpc<T, U, A>, key: Key) -> Option<(Contact, Vec<u8>)>
 where
     T: RpcTransport,
     U: RpcTransport,
     A: CloseNodes,
 {
-    let candidates = lookup_node(rpc, key).await;
+    let mut candidates = lookup_node(rpc, key).await;
 
-    if candidates.is_empty() {
-        return None;
-    }
+    // Routing tables do not contain ourselves, but we may hold the value.
+    candidates.push(rpc.my_contact());
+
+    candidates.sort_by(|a, b| xor_distance_cmp(a.id, b.id, key));
+    candidates.dedup_by_key(|contact| contact.id);
+    candidates.truncate(K);
 
     let mut in_flight = FuturesUnordered::new();
     let mut candidates = candidates.into_iter();
@@ -83,18 +86,30 @@ where
                 break;
             };
 
-            in_flight.push(async move { rpc.find_value(next.address, key).await });
+            in_flight.push(async move {
+                let reply = rpc.find_value(next.address, key).await;
+                (next, reply)
+            });
         }
 
-        let Some(reply) = in_flight.next().await else {
+        let Some((source, reply)) = in_flight.next().await else {
             break;
         };
 
         match reply {
-            FindValue::Value(value) => return Some(value),
+            FindValue::Value(value) => {
+                // Keep the SHA-256 validation you added earlier.
+                if crate::hashing::key_for_value(&value) == key {
+                    return Some((source, value));
+                }
+
+                log::warn!(
+                    "node {} returned a value that does not match the requested key",
+                    source.address
+                );
+            }
+
             FindValue::Closest(contacts) => {
-                // every contact a response teaches us about is worth offering
-                // to the routing table, whether or not the value turns up
                 for contact in &contacts {
                     rpc.close_nodes().maybe_add_contact(*contact);
                 }
@@ -103,6 +118,34 @@ where
     }
 
     None
+}
+pub async fn store_value<T, U, A>(rpc: &Rpc<T, U, A>, value: Vec<u8>) -> Key
+where
+    T: RpcTransport,
+    U: RpcTransport,
+    A: CloseNodes,
+{
+    // K = SHA256(V).
+    let key = key_for_value(&value);
+
+    // Find the nodes closest to the key.
+    let mut targets = lookup_node(rpc, key).await;
+
+    // Our routing table does not contain ourselves, but we may still
+    // be one of the K closest nodes to this key.
+    targets.push(rpc.my_contact());
+
+    // Select the actual K closest nodes, including ourselves.
+    targets.sort_by(|a, b| xor_distance_cmp(a.id, b.id, key));
+    targets.dedup_by_key(|contact| contact.id);
+    targets.truncate(K);
+
+    // Replicate the value to each of the K closest nodes.
+    for target in targets {
+        rpc.store(target.address, key, value.clone()).await;
+    }
+
+    key
 }
 #[cfg(test)]
 mod tests {
@@ -114,7 +157,7 @@ mod tests {
     /// it never competes with the contacts a lookup is meant to return.
     fn me() -> Contact {
         Contact {
-            id: [0xffu8; 20],
+            id: [0xffu8; 32],
             address: "127.0.0.1:9000".parse().unwrap(),
         }
     }
@@ -181,24 +224,23 @@ mod tests {
 
     #[tokio::test]
     async fn value_lookup_finds_value_after_node_lookup() {
-        let key = [0u8; 20];
+        let value = b"hello".to_vec();
+        let key = crate::hashing::key_for_value(&value);
 
         let a = Contact {
-            id: [8u8; 20],
+            id: [8u8; 32],
             address: "127.0.0.1:8001".parse().unwrap(),
         };
 
         let b = Contact {
-            id: [4u8; 20],
+            id: [4u8; 32],
             address: "127.0.0.1:8002".parse().unwrap(),
         };
 
         let c = Contact {
-            id: [2u8; 20],
+            id: [2u8; 32],
             address: "127.0.0.1:8003".parse().unwrap(),
         };
-
-        let value = b"hello".to_vec();
 
         let transport = FakeTransport { a, b, c };
 
@@ -215,7 +257,7 @@ mod tests {
 
         let result = lookup_value(&rpc, key).await;
 
-        assert_eq!(result, Some(value));
+        assert_eq!(result, Some((c, value)));
     }
     struct FakeMissingValueTransport {
         a: Contact,
@@ -240,20 +282,20 @@ mod tests {
 
     #[tokio::test]
     async fn value_lookup_returns_none_when_value_is_not_found() {
-        let key = [0u8; 20];
+        let key = [0u8; 32];
 
         let a = Contact {
-            id: [8u8; 20],
+            id: [8u8; 32],
             address: "127.0.0.1:8001".parse().unwrap(),
         };
 
         let b = Contact {
-            id: [4u8; 20],
+            id: [4u8; 32],
             address: "127.0.0.1:8002".parse().unwrap(),
         };
 
         let c = Contact {
-            id: [2u8; 20],
+            id: [2u8; 32],
             address: "127.0.0.1:8003".parse().unwrap(),
         };
 
@@ -307,16 +349,16 @@ mod tests {
     /// table even when the lookup never turns up the value itself.
     #[tokio::test]
     async fn value_lookup_offers_closest_reply_contacts_to_the_routing_table() {
-        let key = [0u8; 20];
+        let key = [0u8; 32];
 
         let a = Contact {
-            id: [8u8; 20],
+            id: [8u8; 32],
             address: "127.0.0.1:9101".parse().unwrap(),
         };
         // only ever surfaces through find_value's Closest reply, never
         // through find_node, so its presence proves this call path.
         let newly_discovered = Contact {
-            id: [4u8; 20],
+            id: [4u8; 32],
             address: "127.0.0.1:9102".parse().unwrap(),
         };
 
@@ -346,20 +388,20 @@ mod tests {
 
     #[tokio::test]
     async fn lookup_follows_newly_discovered_contacts() {
-        let target = [0u8; 20];
+        let target = [0u8; 32];
 
         let a = Contact {
-            id: [8u8; 20],
+            id: [8u8; 32],
             address: "127.0.0.1:8001".parse().unwrap(),
         };
 
         let b = Contact {
-            id: [4u8; 20],
+            id: [4u8; 32],
             address: "127.0.0.1:8002".parse().unwrap(),
         };
 
         let c = Contact {
-            id: [2u8; 20],
+            id: [2u8; 32],
             address: "127.0.0.1:8003".parse().unwrap(),
         };
 
@@ -378,18 +420,18 @@ mod tests {
     }
     #[tokio::test]
     async fn lookup_offers_newly_discovered_contacts_to_the_routing_table() {
-        let target = [0u8; 20];
+        let target = [0u8; 32];
 
         let a = Contact {
-            id: [8u8; 20],
+            id: [8u8; 32],
             address: "127.0.0.1:9001".parse().unwrap(),
         };
         let b = Contact {
-            id: [4u8; 20],
+            id: [4u8; 32],
             address: "127.0.0.1:9002".parse().unwrap(),
         };
         let c = Contact {
-            id: [2u8; 20],
+            id: [2u8; 32],
             address: "127.0.0.1:9003".parse().unwrap(),
         };
 
@@ -412,10 +454,10 @@ mod tests {
 
     #[tokio::test]
     async fn lookup_returns_empty_when_no_contacts_are_known() {
-        let target = [0u8; 20];
+        let target = [0u8; 32];
 
         let dummy = Contact {
-            id: [1u8; 20],
+            id: [1u8; 32],
             address: "127.0.0.1:8001".parse().unwrap(),
         };
 
@@ -437,5 +479,43 @@ mod tests {
         let result = lookup_node(&rpc, target).await;
 
         assert!(result.is_empty());
+    }
+    #[tokio::test]
+    async fn value_lookup_rejects_value_that_does_not_match_key() {
+        let expected_value = b"correct value".to_vec();
+        let key = key_for_value(&expected_value);
+
+        let a = Contact {
+            id: [8u8; 32],
+            address: "127.0.0.1:8001".parse().unwrap(),
+        };
+
+        let b = Contact {
+            id: [4u8; 32],
+            address: "127.0.0.1:8002".parse().unwrap(),
+        };
+
+        let c = Contact {
+            id: [2u8; 32],
+            address: "127.0.0.1:8003".parse().unwrap(),
+        };
+
+        let transport = FakeTransport { a, b, c };
+
+        // C claims to have the requested key, but sends different content.
+        let robust_transport = FakeValueTransport {
+            a,
+            b,
+            c,
+            value: b"tampered value".to_vec(),
+        };
+
+        let close_nodes = FakeCloseNodes { initial: vec![a] };
+
+        let rpc = Rpc::new(me(), transport, robust_transport, close_nodes);
+
+        let result = lookup_value(&rpc, key).await;
+
+        assert_eq!(result, None);
     }
 }
