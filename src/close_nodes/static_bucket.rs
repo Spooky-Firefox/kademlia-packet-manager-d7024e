@@ -65,6 +65,22 @@ impl<const BUCKET_SIZE: usize, const SEARCH_SHIFT: usize, const MAX_BUCKETS: usi
     fn extend_from_bucket(&self, out: &mut Vec<Contact>, index: usize) {
         out.extend_from_slice(self.contacts[index].read().unwrap().as_slice());
     }
+
+    pub fn non_empty_buckets(&self) -> Vec<(usize, Vec<Contact>)> {
+        self.contacts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, bucket)| {
+                let contacts = bucket.read().unwrap();
+
+                if contacts.is_empty() {
+                    None
+                } else {
+                    Some((index, contacts.as_slice().to_vec()))
+                }
+            })
+            .collect()
+    }
 }
 
 impl<const BUCKET_SIZE: usize, const SEARCH_SHIFT: usize, const MAX_BUCKETS: usize> CloseNodes

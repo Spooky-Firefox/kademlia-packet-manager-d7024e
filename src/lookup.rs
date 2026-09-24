@@ -62,17 +62,20 @@ where
     candidates
 }
 
-pub async fn lookup_value<T, U, A>(rpc: &Rpc<T, U, A>, key: Key) -> Option<Vec<u8>>
+pub async fn lookup_value<T, U, A>(rpc: &Rpc<T, U, A>, key: Key) -> Option<(Contact, Vec<u8>)>
 where
     T: RpcTransport,
     U: RpcTransport,
     A: CloseNodes,
 {
-    let candidates = lookup_node(rpc, key).await;
+    let mut candidates = lookup_node(rpc, key).await;
 
-    if candidates.is_empty() {
-        return None;
-    }
+    // Routing tables do not contain ourselves, but we may hold the value.
+    candidates.push(rpc.my_contact());
+
+    candidates.sort_by(|a, b| xor_distance_cmp(a.id, b.id, key));
+    candidates.dedup_by_key(|contact| contact.id);
+    candidates.truncate(K);
 
     let mut in_flight = FuturesUnordered::new();
     let mut candidates = candidates.into_iter();
@@ -83,22 +86,29 @@ where
                 break;
             };
 
-            in_flight.push(async move { rpc.find_value(next.address, key).await });
+            in_flight.push(async move {
+                let reply = rpc.find_value(next.address, key).await;
+                (next, reply)
+            });
         }
 
-        let Some(reply) = in_flight.next().await else {
+        let Some((source, reply)) = in_flight.next().await else {
             break;
         };
 
         match reply {
             FindValue::Value(value) => {
-                if key_for_value(&value) == key {
-                    return Some(value);
+                // Keep the SHA-256 validation you added earlier.
+                if crate::hashing::key_for_value(&value) == key {
+                    return Some((source, value));
                 }
-                // Invalid content for this key. Ignore it and continue looking
+
+                log::warn!(
+                    "node {} returned a value that does not match the requested key",
+                    source.address
+                );
             }
-            // every contact a response teaches us about is worth offering
-            // to the routing table, whether or not the value turns up
+
             FindValue::Closest(contacts) => {
                 for contact in &contacts {
                     rpc.close_nodes().maybe_add_contact(*contact);
@@ -247,7 +257,7 @@ mod tests {
 
         let result = lookup_value(&rpc, key).await;
 
-        assert_eq!(result, Some(value));
+        assert_eq!(result, Some((c, value)));
     }
     struct FakeMissingValueTransport {
         a: Contact,

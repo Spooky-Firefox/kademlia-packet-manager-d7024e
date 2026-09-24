@@ -1,4 +1,4 @@
-use crate::close_nodes::{Contact, NodeId, RecommendedCloseNodes, recommended};
+use crate::close_nodes::{Contact, Key, NodeId, RecommendedCloseNodes, recommended};
 use crate::handle_rpc::{self, Context};
 use crate::hashing::node_id_from_address;
 use crate::rpc::Rpc;
@@ -46,6 +46,27 @@ where
 
     pub fn rpc(&self) -> &NodeRpc<T, U> {
         &self.rpc
+    }
+
+    pub fn routing_snapshot(&self) -> (Vec<Contact>, Vec<(usize, Vec<Contact>)>) {
+        let routing = self.context.close_nodes.as_ref();
+
+        let siblings = routing.inner().siblings();
+        let buckets = routing.inner().fallback().non_empty_buckets();
+
+        (siblings, buckets)
+    }
+
+    pub fn datastore_snapshot(&self) -> Vec<(Key, usize)> {
+        let mut values: Vec<_> = self
+            .context
+            .values
+            .iter()
+            .map(|entry| (*entry.key(), entry.value().len()))
+            .collect();
+
+        values.sort_by_key(|(key, _)| *key);
+        values
     }
 }
 
@@ -249,10 +270,14 @@ mod tests {
 
         // Preload C with the value.
         assert!(a.rpc().store(c.address(), key, value.clone(),).await);
+        let found: Option<(Contact, Vec<u8>)> = crate::lookup::lookup_value(a.rpc(), key).await;
 
-        let found = crate::lookup::lookup_value(a.rpc(), key).await;
+        let c_contact = Contact {
+            id: c.id(),
+            address: c.address(),
+        };
 
-        assert_eq!(found, Some(value));
+        assert_eq!(found, Some((c_contact, value)));
     }
     #[tokio::test]
     async fn fake_nodes_can_ping_each_other() {
