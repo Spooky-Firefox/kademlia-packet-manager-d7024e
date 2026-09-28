@@ -57,6 +57,12 @@ pub trait RpcTransport {
     // silence and return an `io::Error` of kind `TimedOut` once the attempt
     // budget is spent — so a caller only needs an outer `timeout` for a
     // deadline shorter than that.
-    async fn send_receive(&self, payload: Vec<u8>, address: SocketAddr)
-    -> std::io::Result<Vec<u8>>;
+    //
+    // Declared `Send` so a caller generic over the transport can still run a
+    // call inside `tokio::spawn`; an `async fn` in the impl satisfies it.
+    fn send_receive(
+        &self,
+        payload: Vec<u8>,
+        address: SocketAddr,
+    ) -> impl Future<Output = std::io::Result<Vec<u8>>> + Send;
 }

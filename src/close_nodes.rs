@@ -25,7 +25,7 @@ pub type Key = [u8; ID_BYTES];
 
 /// A routing-table entry: who a node is, and where to reach it.
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Contact {
     pub id: NodeId,
     pub address: SocketAddr,

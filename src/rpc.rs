@@ -118,8 +118,10 @@ impl<T: RpcTransport, U: RpcTransport, A: CloseNodes> Rpc<T, U, A> {
         }
     }
 
-    /// Drop `contact` from the routing table after a failed call — unless the
-    /// table holds `K` or fewer contacts.
+    /// Drop `contact` from the routing table as gone — unless the table holds
+    /// `K` or fewer contacts. Every removal for a failed call goes through
+    /// here, whether from [`call`](Self::call) or a
+    /// [liveness round](crate::maintenance::check_liveness).
     ///
     /// A timeout from [`RetryTransport`](crate::rpc_transport::retry_transport::RetryTransport)
     /// is already several unanswered sends, and a wrongly dropped contact that
@@ -127,7 +129,7 @@ impl<T: RpcTransport, U: RpcTransport, A: CloseNodes> Rpc<T, U, A> {
     /// failed call cannot tell apart is a dead peer and our own connection
     /// being down, and in the second case every call fails: the floor keeps
     /// enough of the table to rejoin through once the network is back.
-    fn forget(&self, contact: &Contact) {
+    pub fn forget(&self, contact: &Contact) {
         // `contacts_iter` may repeat a contact, so count distinct ids, and
         // stop as soon as there are enough rather than walking the table.
         let mut distinct = HashSet::new();

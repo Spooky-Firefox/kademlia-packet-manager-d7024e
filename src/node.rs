@@ -1,6 +1,7 @@
 use crate::close_nodes::{Contact, Key, NodeId, RecommendedCloseNodes, recommended};
 use crate::handle_rpc::{self, Context};
 use crate::hashing::node_id_from_address;
+use crate::maintenance;
 use crate::rpc::Rpc;
 use crate::rpc_transport::RpcTransport;
 use crate::rpc_transport::networked_debug_transport::{
@@ -16,7 +17,7 @@ use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-pub type NodeRpc<T, U> = Rpc<T, U, Arc<RecommendedCloseNodes>>;
+pub type NodeRpc<T, U> = Arc<Rpc<T, U, Arc<RecommendedCloseNodes>>>;
 
 pub struct Node<T, U>
 where
@@ -31,6 +32,7 @@ where
 }
 pub type RealNode = Node<UdpTransport, TcpTransport>;
 pub type FakeNode = Node<NetworkedDebugTransport, NetworkedStreamTransport>;
+
 impl<T, U> Node<T, U>
 where
     T: RpcTransport,
@@ -77,6 +79,29 @@ where
     }
 }
 
+impl<T, U> Node<T, U>
+where
+    T: RpcTransport + Send + Sync + 'static,
+    U: RpcTransport + Send + Sync + 'static,
+{
+    pub fn periodic_task(
+        &self,
+        _republish_interval: std::time::Duration,
+        liveness_check_interval: std::time::Duration,
+    ) {
+        // TODO deal with the spawn handles
+        let rpc = Arc::clone(&self.rpc);
+        let _liveness_task = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(maintenance::jittered(liveness_check_interval)).await;
+                maintenance::check_liveness(&rpc).await;
+            }
+        });
+
+        // TODO republish data
+    }
+}
+
 impl RealNode {
     pub async fn bind(bind_address: SocketAddr) -> io::Result<Self> {
         let udp_socket = UdpSocket::bind(bind_address).await?;
@@ -101,12 +126,12 @@ impl RealNode {
             tcp_listener,
         ));
 
-        let rpc = Rpc::new(
+        let rpc = Arc::new(Rpc::new(
             Contact { id, address },
             udp_transport,
             TcpTransport,
             Arc::clone(&routing),
-        );
+        ));
 
         Ok(Self {
             id,
@@ -143,12 +168,12 @@ impl FakeNode {
 
         let stream_transport = NetworkedStreamTransport::new(network.clone());
 
-        let rpc = Rpc::new(
+        let rpc = Arc::new(Rpc::new(
             Contact { id, address },
             datagram_transport,
             stream_transport,
             Arc::clone(&routing),
-        );
+        ));
 
         Self {
             id,
