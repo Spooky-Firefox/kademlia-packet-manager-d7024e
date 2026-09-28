@@ -2,8 +2,8 @@
 //! one for [`TcpTransport`], and accepting them for
 //! [`handle_rpc::serve`](crate::handle_rpc::serve).
 //!
-//! What happens on a connection once it is open is
-//! [`super::stream_framing::stream_send_receive`], shared
+//! Dialling, the framing on the connection, and the deadline over both are
+//! [`super::stream_framing::dial_and_send`], shared
 //! with the in-process fake in
 //! [`networked_debug_transport`](super::networked_debug_transport) — the same
 //! arrangement as
@@ -11,7 +11,7 @@
 //! side, where only the channel differs.
 
 use crate::rpc_transport::RpcTransport;
-use crate::rpc_transport::stream_framing::stream_send_receive;
+use crate::rpc_transport::stream_framing::{STREAM_DEADLINE, dial_and_send};
 use crate::rpc_transport::stream_listener::StreamListener;
 use std::net::SocketAddr;
 use std::vec::Vec;
@@ -26,8 +26,7 @@ impl RpcTransport for TcpTransport {
         payload: Vec<u8>,
         address: SocketAddr,
     ) -> std::io::Result<Vec<u8>> {
-        let stream = TcpStream::connect(address).await?;
-        stream_send_receive(stream, payload).await
+        dial_and_send(TcpStream::connect(address), payload, STREAM_DEADLINE).await
     }
 }
 
