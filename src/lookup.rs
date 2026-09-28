@@ -36,7 +36,7 @@ where
             };
 
             queried.insert(next.id);
-            in_flight.push(async move { rpc.find_node(next.address, target).await });
+            in_flight.push(async move { rpc.find_node(&next, target).await });
         }
 
         // nothing running and nothing left to start: the K closest are settled
@@ -87,7 +87,7 @@ where
             };
 
             in_flight.push(async move {
-                let reply = rpc.find_value(next.address, key).await;
+                let reply = rpc.find_value(&next, key).await;
                 (next, reply)
             });
         }
@@ -142,7 +142,7 @@ where
 
     // Replicate the value to each of the K closest nodes.
     for target in targets {
-        rpc.store(target.address, key, value.clone()).await;
+        rpc.store(&target, key, value.clone()).await;
     }
 
     key
@@ -172,6 +172,17 @@ mod tests {
         }
 
         fn maybe_add_contact(&self, _contact: Contact) {}
+
+        fn contacts_iter(&self) -> impl std::iter::Iterator<Item = Contact> {
+            unimplemented!();
+            // so the compiler wont complain
+            #[allow(unreachable_code)]
+            Vec::new().into_iter()
+        }
+
+        fn remove_contact(&self, _contact: &Contact) {
+            unimplemented!()
+        }
     }
 
     struct FakeTransport {

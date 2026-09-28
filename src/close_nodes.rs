@@ -7,6 +7,7 @@ use cache::CachedCloseNodes;
 use serde::{Deserialize, Serialize};
 use sibling_list::SiblingList;
 use static_bucket::StaticBucket;
+use std::iter;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -24,7 +25,7 @@ pub type Key = [u8; ID_BYTES];
 
 /// A routing-table entry: who a node is, and where to reach it.
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Contact {
     pub id: NodeId,
     pub address: SocketAddr,
@@ -34,6 +35,14 @@ pub trait CloseNodes {
     fn close_nodes(&self, id: NodeId) -> Vec<Contact>;
 
     fn maybe_add_contact(&self, contact: Contact);
+
+    fn remove_contact(&self, contact: &Contact);
+
+    /// This makes no garuaties that the contacts still exist in the routing table when returned from the iter
+    /// Nor that a contact that was added after this call will be available in the iterator
+    /// implementers might clone parts of the routing table during this lookup, avoid using in a hot path
+    /// it may also return duplicates
+    fn contacts_iter(&self) -> impl iter::Iterator<Item = Contact>;
 }
 
 // safely shared between incoming/outgoing RPC handlers for routintable by wrapping the thingie in Arc
@@ -44,6 +53,14 @@ impl<T: CloseNodes> CloseNodes for std::sync::Arc<T> {
 
     fn maybe_add_contact(&self, contact: Contact) {
         self.as_ref().maybe_add_contact(contact);
+    }
+
+    fn remove_contact(&self, contact: &Contact) {
+        self.as_ref().remove_contact(contact);
+    }
+
+    fn contacts_iter(&self) -> impl iter::Iterator<Item = Contact> {
+        self.as_ref().contacts_iter()
     }
 }
 

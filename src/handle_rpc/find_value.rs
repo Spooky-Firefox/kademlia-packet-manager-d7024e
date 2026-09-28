@@ -44,6 +44,13 @@ mod tests {
         }
 
         fn maybe_add_contact(&self, _contact: Contact) {}
+
+        fn contacts_iter(&self) -> impl std::iter::Iterator<Item = Contact> {
+            self.contacts.clone().into_iter()
+        }
+        fn remove_contact(&self, _contact: &Contact) {
+            unimplemented!()
+        }
     }
 
     fn addr() -> SocketAddr {
