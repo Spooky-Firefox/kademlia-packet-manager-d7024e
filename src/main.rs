@@ -52,7 +52,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 std::process::exit(1);
             }
         };
-        println!("bootstrap complete; lookup returned {} contacts", neighbours.len());
+        println!(
+            "bootstrap complete; lookup returned {} contacts",
+            neighbours.len()
+        );
     } else {
         println!("starting a new network");
     }
