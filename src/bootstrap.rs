@@ -19,6 +19,16 @@ pub enum BootstrapError {
     /// The seed answered with our own id.
     SelfSeed,
 }
+// TODO: add test for this or smth
+impl std::fmt::Display for BootstrapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreachable => f.write_str("seed did not respond"),
+            Self::SelfSeed => f.write_str("seed is this node itself"),
+        }
+    }
+}
+impl std::error::Error for BootstrapError {}
 
 /// Join the network through `seed`, returning the neighbourhood we land in.
 ///
