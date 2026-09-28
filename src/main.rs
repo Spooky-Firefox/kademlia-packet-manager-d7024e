@@ -9,6 +9,7 @@ mod hashing;
 mod instrumentation;
 mod logging;
 mod lookup;
+mod maintenance;
 mod node;
 mod pending;
 mod rpc;
@@ -62,6 +63,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     } else {
         println!("starting a new network");
     }
+
+    // Started after bootstrap, so the first round has a table to check.
+    node.periodic_task(
+        maintenance::REPUBLISH_INTERVAL,
+        maintenance::LIVENESS_CHECK_INTERVAL,
+    );
 
     cli::run(&node).await?;
 

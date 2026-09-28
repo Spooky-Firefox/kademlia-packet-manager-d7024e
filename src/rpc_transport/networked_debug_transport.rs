@@ -18,7 +18,7 @@
 //! pending-request bookkeeping, and the resend loop are all shared code, so a
 //! test against the fake wire exercises the same transport `main` runs over
 //! real UDP. [`NetworkedStreamTransport`] is the same trick on the other
-//! shape — [`stream_send_receive`] over a fake connection rather than a
+//! shape — [`dial_and_send`] over a fake connection rather than a
 //! `TcpStream`.
 //!
 //! # Two devices on one network
@@ -98,7 +98,7 @@
 use crate::rpc_transport::RpcTransport;
 use crate::rpc_transport::data_rx_tx::DataRxTx;
 use crate::rpc_transport::retry_transport::RetryTransport;
-use crate::rpc_transport::stream_framing::stream_send_receive;
+use crate::rpc_transport::stream_framing::{STREAM_DEADLINE, dial_and_send};
 use crate::rpc_transport::stream_listener::StreamListener;
 use dashmap::DashMap;
 use log::trace;
@@ -380,7 +380,7 @@ impl StreamListener for Endpoint {
 }
 
 /// The connection-shaped transport over a [`Network`]: the same
-/// [`stream_send_receive`] framing
+/// [`dial_and_send`] framing and deadline
 /// [`TcpTransport`](crate::rpc_transport::tcp_transport::TcpTransport) runs
 /// over real TCP, dialling an in-process pipe instead of a socket.
 ///
@@ -403,8 +403,8 @@ impl RpcTransport for NetworkedStreamTransport {
         payload: Vec<u8>,
         address: SocketAddr,
     ) -> std::io::Result<Vec<u8>> {
-        let stream = self.network.connect(address)?;
-        stream_send_receive(stream, payload).await
+        let connect = async { self.network.connect(address) };
+        dial_and_send(connect, payload, STREAM_DEADLINE).await
     }
 }
 

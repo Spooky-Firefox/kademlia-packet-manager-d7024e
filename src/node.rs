@@ -1,6 +1,7 @@
 use crate::close_nodes::{Contact, Key, NodeId, RecommendedCloseNodes, recommended};
 use crate::handle_rpc::{self, Context};
 use crate::hashing::node_id_from_address;
+use crate::maintenance;
 use crate::rpc::Rpc;
 use crate::rpc_transport::RpcTransport;
 use crate::rpc_transport::networked_debug_transport::{
@@ -16,7 +17,7 @@ use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-pub type NodeRpc<T, U> = Rpc<T, U, Arc<RecommendedCloseNodes>>;
+pub type NodeRpc<T, U> = Arc<Rpc<T, U, Arc<RecommendedCloseNodes>>>;
 
 pub struct Node<T, U>
 where
@@ -31,6 +32,7 @@ where
 }
 pub type RealNode = Node<UdpTransport, TcpTransport>;
 pub type FakeNode = Node<NetworkedDebugTransport, NetworkedStreamTransport>;
+
 impl<T, U> Node<T, U>
 where
     T: RpcTransport,
@@ -42,6 +44,13 @@ where
 
     pub fn address(&self) -> SocketAddr {
         self.address
+    }
+
+    pub fn contact(&self) -> Contact {
+        Contact {
+            id: self.id,
+            address: self.address,
+        }
     }
 
     pub fn rpc(&self) -> &NodeRpc<T, U> {
@@ -70,6 +79,29 @@ where
     }
 }
 
+impl<T, U> Node<T, U>
+where
+    T: RpcTransport + Send + Sync + 'static,
+    U: RpcTransport + Send + Sync + 'static,
+{
+    pub fn periodic_task(
+        &self,
+        _republish_interval: std::time::Duration,
+        liveness_check_interval: std::time::Duration,
+    ) {
+        // TODO deal with the spawn handles
+        let rpc = Arc::clone(&self.rpc);
+        let _liveness_task = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(maintenance::jittered(liveness_check_interval)).await;
+                maintenance::check_liveness(&rpc).await;
+            }
+        });
+
+        // TODO republish data
+    }
+}
+
 impl RealNode {
     pub async fn bind(bind_address: SocketAddr) -> io::Result<Self> {
         let udp_socket = UdpSocket::bind(bind_address).await?;
@@ -94,12 +126,12 @@ impl RealNode {
             tcp_listener,
         ));
 
-        let rpc = Rpc::new(
+        let rpc = Arc::new(Rpc::new(
             Contact { id, address },
             udp_transport,
             TcpTransport,
             Arc::clone(&routing),
-        );
+        ));
 
         Ok(Self {
             id,
@@ -136,12 +168,12 @@ impl FakeNode {
 
         let stream_transport = NetworkedStreamTransport::new(network.clone());
 
-        let rpc = Rpc::new(
+        let rpc = Arc::new(Rpc::new(
             Contact { id, address },
             datagram_transport,
             stream_transport,
             Arc::clone(&routing),
-        );
+        ));
 
         Self {
             id,
@@ -238,9 +270,9 @@ mod tests {
         let value = vec![0xAB; 5000];
         let key = crate::hashing::key_for_value(&value);
 
-        assert!(a.rpc().store(b.address(), key, value.clone(),).await);
+        assert!(a.rpc().store(&b.contact(), key, value.clone(),).await);
 
-        let result = a.rpc().find_value(b.address(), key).await;
+        let result = a.rpc().find_value(&b.contact(), key).await;
 
         assert_eq!(result, crate::rpc::FindValue::Value(value));
     }
@@ -269,7 +301,7 @@ mod tests {
         assert_eq!(c.rpc().ping(b.address()).await, Some(b.id()));
 
         // Preload C with the value.
-        assert!(a.rpc().store(c.address(), key, value.clone(),).await);
+        assert!(a.rpc().store(&c.contact(), key, value.clone(),).await);
         let found: Option<(Contact, Vec<u8>)> = crate::lookup::lookup_value(a.rpc(), key).await;
 
         let c_contact = Contact {
@@ -321,9 +353,9 @@ mod tests {
         let value = vec![0xAB; 5000];
         let key = crate::hashing::key_for_value(&value);
 
-        assert!(a.rpc().store(b.address(), key, value.clone()).await);
+        assert!(a.rpc().store(&b.contact(), key, value.clone()).await);
 
-        let result = a.rpc().find_value(b.address(), key).await;
+        let result = a.rpc().find_value(&b.contact(), key).await;
 
         assert_eq!(result, crate::rpc::FindValue::Value(value));
     }
@@ -351,17 +383,17 @@ mod tests {
         // There are only 3 nodes and k = 10, so all three should
         // be among the k closest and receive the value.
         assert_eq!(
-            a.rpc().find_value(a.address(), key).await,
+            a.rpc().find_value(&a.contact(), key).await,
             crate::rpc::FindValue::Value(value.clone())
         );
 
         assert_eq!(
-            a.rpc().find_value(b.address(), key).await,
+            a.rpc().find_value(&b.contact(), key).await,
             crate::rpc::FindValue::Value(value.clone())
         );
 
         assert_eq!(
-            a.rpc().find_value(c.address(), key).await,
+            a.rpc().find_value(&c.contact(), key).await,
             crate::rpc::FindValue::Value(value)
         );
     }

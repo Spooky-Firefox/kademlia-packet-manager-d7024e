@@ -11,10 +11,45 @@
 //! exercises what `main` runs over real TCP.
 
 use crate::rpc_transport::request_id;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Wire framing: an 8-byte big-endian request id, then the payload.
 const ID_LEN: usize = size_of::<u64>();
+
+/// How long a whole stream call — connect, request and reply — may take.
+///
+/// Without one, a peer that vanished without closing anything leaves the call
+/// waiting on the OS, which on Linux gives up on a connect after about two
+/// minutes and on an established connection far later. Longer than the
+/// datagram side's one second of resends, since this path carries values.
+pub const STREAM_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Open a connection with `connect` and run [`stream_send_receive`] over it,
+/// all within `deadline`.
+///
+/// Running out of time is a [`TimedOut`](std::io::ErrorKind::TimedOut) error,
+/// the same kind the datagram transport gives up with, so callers treat a
+/// silent peer the same whichever way they reached it.
+pub async fn dial_and_send<S, F>(
+    connect: F,
+    payload: Vec<u8>,
+    deadline: Duration,
+) -> std::io::Result<Vec<u8>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    F: Future<Output = std::io::Result<S>>,
+{
+    let call = async { stream_send_receive(connect.await?, payload).await };
+    tokio::time::timeout(deadline, call)
+        .await
+        .unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("no reply within {deadline:?}"),
+            ))
+        })
+}
 
 /// Send `payload` over `stream` and hand back the reply body, id stripped.
 /// `stream` is consumed: it is good for exactly one request.
@@ -116,5 +151,31 @@ mod tests {
         });
 
         assert!(stream_send_receive(client, b"ping".to_vec()).await.is_err());
+    }
+
+    /// A peer that takes the connection and then goes quiet ends the call at
+    /// the deadline, as a timeout.
+    #[tokio::test]
+    async fn a_silent_peer_times_out() {
+        let (client, _server) = tokio::io::duplex(64 * 1024);
+
+        let result = dial_and_send(
+            async { Ok(client) },
+            b"ping".to_vec(),
+            Duration::from_millis(50),
+        )
+        .await;
+
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    /// The deadline covers the connect too, not just the exchange after it.
+    #[tokio::test]
+    async fn a_connect_that_never_completes_times_out() {
+        let connect = std::future::pending::<std::io::Result<tokio::io::DuplexStream>>();
+
+        let result = dial_and_send(connect, b"ping".to_vec(), Duration::from_millis(50)).await;
+
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
     }
 }
