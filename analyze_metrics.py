@@ -5,9 +5,9 @@ import csv
 import statistics
 from collections import defaultdict
 from pathlib import Path
+from typing import Dict, List, Tuple
 
-
-def parse_line(line: str) -> dict[str, str]:
+def parse_line(line: str) -> Dict[str, str]:
     fields = {}
     for token in line.split():
         if "=" in token:
@@ -16,7 +16,7 @@ def parse_line(line: str) -> dict[str, str]:
     return fields
 
 
-def analyze_log(path: Path) -> tuple[list[int], list[int]]:
+def analyze_log(path: Path) -> Tuple[List[int], List[int]]:
     node_probes = []
     value_results = []
 
@@ -38,15 +38,15 @@ def analyze_log(path: Path) -> tuple[list[int], list[int]]:
     return node_probes, value_results
 
 
-def mean(values: list[float]) -> float:
+def mean(values: List[float]) -> float:
     return statistics.mean(values) if values else 0.0
 
 
-def variance(values: list[float]) -> float:
+def variance(values: List[float]) -> float:
     return statistics.variance(values) if len(values) > 1 else 0.0
 
 
-def print_analysis(node_probes: list[int], value_results: list[int]) -> None:
+def print_analysis(node_probes: List[int], value_results: List[int]) -> None:
     print(f"node lookups: {len(node_probes)}")
     print(f"average probes: {mean(node_probes):.3f}")
     print(f"probe variance: {variance(node_probes):.3f}")
@@ -54,7 +54,7 @@ def print_analysis(node_probes: list[int], value_results: list[int]) -> None:
     print(f"success rate: {mean(value_results):.3f}")
 
 
-def record_run(args: argparse.Namespace, node_probes: list[int], value_results: list[int]) -> None:
+def record_run(args: argparse.Namespace, node_probes: List[int], value_results: List[int]) -> None:
     fields = [
         "network_size",
         "packet_loss",
