@@ -14,13 +14,14 @@ use std::time::{Duration, Instant};
 /// Caches [`CloseNodes::close_nodes`] answers per target id.
 ///
 /// An entry is served while it is younger than `ttl` *and* no contact has been
-/// added since it was computed. The generation counter is what makes the
+/// added or removed since it was computed. The generation counter is what makes the
 /// second half cheap: a write bumps one atomic instead of walking the map, and
 /// stale entries are recognised on the way out.
 pub struct CachedCloseNodes<C> {
     inner: C,
     entries: DashMap<NodeId, Entry>,
-    /// Bumped by every write, so entries computed before it are stale.
+    /// Bumped by every write (removals only, under `ttl_only`), so entries
+    /// computed before it are stale.
     generation: AtomicU64,
     ttl: Duration,
     capacity: usize,
@@ -51,8 +52,10 @@ impl<C: CloseNodes> CachedCloseNodes<C> {
         }
     }
 
-    /// A cache bounded only by `ttl`: writes go straight through and leave
-    /// cached answers standing until they expire.
+    /// A cache bounded only by `ttl`: new contacts go straight through and
+    /// leave cached answers standing until they expire. Removals still
+    /// invalidate, as they are rare and a dead contact is worse than a missed
+    /// one.
     ///
     /// This is the variant to want when contacts arrive constantly — a table
     /// that learns one per RPC bumps the generation faster than entries can be
@@ -121,15 +124,18 @@ impl<C: CloseNodes> CloseNodes for CachedCloseNodes<C> {
     }
 
     fn remove_contact(&self, contact: &Contact) {
-        self.entries.remove(&contact.id);
         self.inner.remove_contact(contact);
+        // Entries are keyed by target, and the removed contact may sit in any
+        // of them. Unlike a new contact, a dead one costs a failed RPC every
+        // time it is served, so this invalidates even in `ttl_only`.
+        self.generation.fetch_add(1, Ordering::Release);
     }
 
     fn contacts_iter(&self) -> impl std::iter::Iterator<Item = Contact> {
-        self.entries
-            .iter()
-            .flat_map(|f| f.contacts.clone().into_iter())
-            .chain(self.inner.contacts_iter())
+        // Cached answers are only a stale subset of the table below, and a
+        // `DashMap` iterator holds a shard lock between items, so a caller
+        // querying while iterating would deadlock against its own iterator.
+        self.inner.contacts_iter()
     }
 
     fn maybe_add_contact(&self, contact: Contact) {
@@ -255,5 +261,69 @@ mod tests {
             cache.close_nodes([i; 32]);
         }
         assert!(cache.entries.len() <= 2);
+    }
+
+    #[test]
+    fn contacts_iter_covers_the_table_below() {
+        let cache = cache(Duration::from_secs(60));
+        cache.maybe_add_contact(contact(0x80));
+        cache.maybe_add_contact(contact(0x40));
+        cache.close_nodes([1u8; 32]);
+        let mut ids: Vec<u8> = cache.contacts_iter().map(|c| c.id[0]).collect();
+        // Cached answers repeat contacts the table below also yields.
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids, vec![0x40, 0x80]);
+    }
+
+    #[test]
+    fn a_removed_contact_is_not_served_from_the_cache() {
+        let cache = cache(Duration::from_secs(60));
+        cache.maybe_add_contact(contact(0x80));
+        assert_eq!(cache.close_nodes([1u8; 32]), vec![contact(0x80)]);
+
+        cache.remove_contact(&contact(0x80));
+        assert_eq!(cache.close_nodes([1u8; 32]), vec![]);
+    }
+
+    #[test]
+    fn ttl_only_still_drops_removed_contacts() {
+        let cache = CachedCloseNodes::ttl_only(
+            Counting {
+                inner: StaticBucket::new([0u8; 32]),
+                queries: AtomicUsize::new(0),
+            },
+            Duration::from_secs(60),
+            2,
+        );
+        cache.maybe_add_contact(contact(0x80));
+        assert_eq!(cache.close_nodes([1u8; 32]), vec![contact(0x80)]);
+
+        cache.remove_contact(&contact(0x80));
+        assert_eq!(cache.close_nodes([1u8; 32]), vec![]);
+    }
+
+    #[test]
+    fn close_nodes_can_be_called_while_iterating() {
+        let cache = std::sync::Arc::new(cache(Duration::from_secs(60)));
+        cache.maybe_add_contact(contact(0x80));
+        cache.maybe_add_contact(contact(0x40));
+        // Fill the cache so the next miss has to make room.
+        cache.close_nodes([1u8; 32]);
+        cache.close_nodes([2u8; 32]);
+
+        // On its own thread so a deadlock fails the test instead of hanging it.
+        let (done, finished) = std::sync::mpsc::channel();
+        let worker = std::sync::Arc::clone(&cache);
+        std::thread::spawn(move || {
+            for c in worker.contacts_iter() {
+                worker.close_nodes(c.id);
+            }
+            let _ = done.send(());
+        });
+        assert!(
+            finished.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "close_nodes deadlocked against a live contacts_iter"
+        );
     }
 }

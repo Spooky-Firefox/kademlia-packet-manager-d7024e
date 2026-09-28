@@ -104,6 +104,7 @@ impl<C: CloseNodes, const SIBLINGS: usize> CloseNodes for SiblingList<C, SIBLING
     fn remove_contact(&self, contact: &Contact) {
         let mut vec_lock = self.siblings.write().unwrap();
         if let Some(i) = vec_lock.iter().position(|c| c == contact) {
+            // Not `swap_remove`: the list must stay sorted by distance.
             vec_lock.remove(i);
         }
         self.fallback.remove_contact(contact);
@@ -164,5 +165,33 @@ mod tests {
 
         table.maybe_add_contact(contact(0x01, 1001));
         assert_eq!(table.siblings()[0].address.port(), 1001);
+    }
+
+    #[test]
+    fn contacts_iter_covers_siblings_and_fallback() {
+        let table = table::<3>();
+        // 0x04, 0x02 and 0x01 share a fallback bucket of two, so 0x01 is only
+        // a sibling; 0x80 is too far to be one and is only in the fallback.
+        for first in [0x04, 0x02, 0x01, 0x80] {
+            table.maybe_add_contact(contact(first, 1000));
+        }
+        let mut ids: Vec<u8> = table.contacts_iter().map(|c| c.id[0]).collect();
+        // Contacts held by both layers may come out twice.
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids, vec![0x01, 0x02, 0x04, 0x80]);
+    }
+
+    #[test]
+    fn remove_contact_reaches_the_fallback() {
+        let table = table::<3>();
+        table.maybe_add_contact(contact(0x01, 1000));
+        table.maybe_add_contact(contact(0x80, 1000));
+
+        table.remove_contact(&contact(0x01, 1000));
+        let siblings: Vec<u8> = table.siblings().iter().map(|c| c.id[0]).collect();
+        assert_eq!(siblings, vec![0x80]);
+        assert!(table.fallback().contacts_iter().all(|c| c.id[0] != 0x01));
+        assert_eq!(table.close_nodes([0u8; 32]), vec![contact(0x80, 1000)]);
     }
 }

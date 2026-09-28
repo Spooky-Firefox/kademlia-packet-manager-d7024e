@@ -180,7 +180,7 @@ mod tests {
             Vec::new().into_iter()
         }
 
-        fn remove_contact(&self, contact: &Contact) {
+        fn remove_contact(&self, _contact: &Contact) {
             unimplemented!()
         }
     }

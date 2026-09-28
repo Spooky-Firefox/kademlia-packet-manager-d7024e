@@ -48,7 +48,7 @@ mod tests {
         fn contacts_iter(&self) -> impl std::iter::Iterator<Item = Contact> {
             self.contacts.clone().into_iter()
         }
-        fn remove_contact(&self, contact: &Contact) {
+        fn remove_contact(&self, _contact: &Contact) {
             unimplemented!()
         }
     }

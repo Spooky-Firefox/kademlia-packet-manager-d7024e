@@ -138,7 +138,7 @@ impl<const BUCKET_SIZE: usize, const SEARCH_SHIFT: usize, const MAX_BUCKETS: usi
         let i = self.bucket_index(contact.id);
         let mut vec_lock = self.contacts[i].write().unwrap();
         if let Some(i) = vec_lock.iter().position(|c| c == contact) {
-            vec_lock.remove(i);
+            vec_lock.swap_remove(i);
         }
     }
 
@@ -211,5 +211,73 @@ mod tests {
             address: SocketAddr::from(([127, 0, 0, 1], 9)),
         });
         assert_eq!(table.close_nodes([0u8; 32]).len(), 1);
+    }
+
+    /// First id byte of every contact the table holds, sorted.
+    fn ids<const S: usize, const H: usize, const M: usize>(
+        table: &StaticBucket<S, H, M>,
+    ) -> Vec<u8> {
+        let mut ids: Vec<u8> = table.contacts_iter().map(|c| c.id[0]).collect();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn contacts_iter_yields_every_bucket() {
+        let table = StaticBucket::<2, 0, 8>::new([0u8; 32]);
+        assert!(ids(&table).is_empty());
+        for first in [0x80, 0x81, 0x40, 0x01] {
+            table.maybe_add_contact(contact(first, 1000));
+        }
+        assert_eq!(ids(&table), vec![0x01, 0x40, 0x80, 0x81]);
+    }
+
+    #[test]
+    fn contacts_iter_locks_a_bucket_only_while_cloning_it() {
+        let table = StaticBucket::<2, 0, 8>::new([0u8; 32]);
+        table.maybe_add_contact(contact(0x80, 1000)); // bucket 0
+        table.maybe_add_contact(contact(0x40, 1000)); // bucket 1
+
+        let mut iter = table.contacts_iter();
+        // Building the iterator reads nothing, and handing out a contact
+        // holds no lock afterwards.
+        assert!(table.contacts.iter().all(|b| b.try_write().is_ok()));
+        assert_eq!(iter.next().map(|c| c.id[0]), Some(0x80));
+        assert!(table.contacts.iter().all(|b| b.try_write().is_ok()));
+
+        // Bucket 1 is only read once the iterator gets there, so a change
+        // made to it in the meantime shows up.
+        table.remove_contact(&contact(0x40, 1000));
+        table.maybe_add_contact(contact(0x41, 1000));
+        assert_eq!(iter.next().map(|c| c.id[0]), Some(0x41));
+        assert_eq!(iter.next(), None);
+    }
+
+    #[test]
+    fn remove_contact_frees_its_slot() {
+        let table = StaticBucket::<2, 0, 8>::new([0u8; 32]);
+        for first in [0x80, 0x81, 0x82] {
+            table.maybe_add_contact(contact(first, 1000));
+        }
+        // The bucket holds two, so 0x82 was turned away.
+        assert_eq!(ids(&table), vec![0x80, 0x81]);
+
+        table.remove_contact(&contact(0x80, 1000));
+        table.maybe_add_contact(contact(0x82, 1000));
+        assert_eq!(ids(&table), vec![0x81, 0x82]);
+    }
+
+    #[test]
+    fn remove_contact_needs_the_exact_contact() {
+        let table = StaticBucket::<2, 0, 8>::new([0u8; 32]);
+        table.maybe_add_contact(contact(0x80, 1000));
+
+        table.remove_contact(&contact(0x81, 1000));
+        // Same node at another address: not the entry we hold.
+        table.remove_contact(&contact(0x80, 1001));
+        assert_eq!(ids(&table), vec![0x80]);
+
+        table.remove_contact(&contact(0x80, 1000));
+        assert!(ids(&table).is_empty());
     }
 }
