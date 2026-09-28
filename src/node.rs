@@ -44,6 +44,13 @@ where
         self.address
     }
 
+    pub fn contact(&self) -> Contact {
+        Contact {
+            id: self.id,
+            address: self.address,
+        }
+    }
+
     pub fn rpc(&self) -> &NodeRpc<T, U> {
         &self.rpc
     }
@@ -238,9 +245,9 @@ mod tests {
         let value = vec![0xAB; 5000];
         let key = crate::hashing::key_for_value(&value);
 
-        assert!(a.rpc().store(b.address(), key, value.clone(),).await);
+        assert!(a.rpc().store(&b.contact(), key, value.clone(),).await);
 
-        let result = a.rpc().find_value(b.address(), key).await;
+        let result = a.rpc().find_value(&b.contact(), key).await;
 
         assert_eq!(result, crate::rpc::FindValue::Value(value));
     }
@@ -269,7 +276,7 @@ mod tests {
         assert_eq!(c.rpc().ping(b.address()).await, Some(b.id()));
 
         // Preload C with the value.
-        assert!(a.rpc().store(c.address(), key, value.clone(),).await);
+        assert!(a.rpc().store(&c.contact(), key, value.clone(),).await);
         let found: Option<(Contact, Vec<u8>)> = crate::lookup::lookup_value(a.rpc(), key).await;
 
         let c_contact = Contact {
@@ -321,9 +328,9 @@ mod tests {
         let value = vec![0xAB; 5000];
         let key = crate::hashing::key_for_value(&value);
 
-        assert!(a.rpc().store(b.address(), key, value.clone()).await);
+        assert!(a.rpc().store(&b.contact(), key, value.clone()).await);
 
-        let result = a.rpc().find_value(b.address(), key).await;
+        let result = a.rpc().find_value(&b.contact(), key).await;
 
         assert_eq!(result, crate::rpc::FindValue::Value(value));
     }
@@ -351,17 +358,17 @@ mod tests {
         // There are only 3 nodes and k = 10, so all three should
         // be among the k closest and receive the value.
         assert_eq!(
-            a.rpc().find_value(a.address(), key).await,
+            a.rpc().find_value(&a.contact(), key).await,
             crate::rpc::FindValue::Value(value.clone())
         );
 
         assert_eq!(
-            a.rpc().find_value(b.address(), key).await,
+            a.rpc().find_value(&b.contact(), key).await,
             crate::rpc::FindValue::Value(value.clone())
         );
 
         assert_eq!(
-            a.rpc().find_value(c.address(), key).await,
+            a.rpc().find_value(&c.contact(), key).await,
             crate::rpc::FindValue::Value(value)
         );
     }
