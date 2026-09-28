@@ -13,12 +13,7 @@ fn encode_id(id: NodeId) -> String {
     hex::encode(id)
 }
 
-pub fn lookup_start(
-    lookup_id: u64,
-    kind: &str,
-    node: NodeId,
-    target: NodeId,
-) {
+pub fn lookup_start(lookup_id: u64, kind: &str, node: NodeId, target: NodeId) {
     info!(
         target: "metrics",
         "event=lookup_start lookup_id={} kind={} node={} target={}",
@@ -29,12 +24,7 @@ pub fn lookup_start(
     );
 }
 
-pub fn lookup_probe(
-    lookup_id: u64,
-    kind: &str,
-    node: NodeId,
-    contact: Contact,
-) {
+pub fn lookup_probe(lookup_id: u64, kind: &str, node: NodeId, contact: Contact) {
     info!(
         target: "metrics",
         "event=lookup_probe lookup_id={} kind={} node={} peer={}",
@@ -63,12 +53,7 @@ pub fn node_lookup_end(
     );
 }
 
-pub fn value_lookup_end(
-    lookup_id: u64,
-    node: NodeId,
-    probes: usize,
-    success: bool,
-) {
+pub fn value_lookup_end(lookup_id: u64, node: NodeId, probes: usize, success: bool) {
     info!(
         target: "metrics",
         "event=lookup_end lookup_id={} kind=value node={} probes={} success={}",

@@ -71,7 +71,7 @@ where
     }
 
     let exact_match = candidates.iter().any(|contact| contact.id == target);
-    
+
     // log end of lookup
     crate::instrumentation::node_lookup_end(
         lookup_id,

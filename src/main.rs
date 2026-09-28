@@ -1,12 +1,12 @@
 use std::error::Error;
 use std::net::SocketAddr;
 
-mod instrumentation;
 mod bootstrap;
 mod cli;
 mod close_nodes;
 mod handle_rpc;
 mod hashing;
+mod instrumentation;
 mod logging;
 mod lookup;
 mod node;
