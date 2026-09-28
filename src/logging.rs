@@ -16,8 +16,6 @@ pub fn setup() -> Result<(), fern::InitError> {
         .level(log::LevelFilter::Info)
         .filter(|metadata| metadata.target() == "metrics")
         .format(|out, message, _record| {
-            // Keep the metrics file machine-readable:
-            // no extra prefix around the structured message.
             out.finish(format_args!("{}", message))
         })
         .chain(fern::log_file("metrics.log")?);
