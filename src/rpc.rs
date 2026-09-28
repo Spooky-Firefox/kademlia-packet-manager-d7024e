@@ -193,6 +193,14 @@ mod tests {
         }
 
         fn maybe_add_contact(&self, _contact: Contact) {}
+
+        fn contacts_iter(&self) -> impl std::iter::Iterator<Item = Contact> {
+            unimplemented!();
+            // so the compiler dont complain
+            #[allow(unreachable_code)]
+            Vec::new().into_iter()
+        }
+        fn remove_contact(&self, _contact: &Contact) {}
     }
 
     /// The node issuing the requests under test. Only its id reaches the wire;

@@ -133,6 +133,20 @@ impl<const BUCKET_SIZE: usize, const SEARCH_SHIFT: usize, const MAX_BUCKETS: usi
         // contacts, and everything already in here has outlived this one.
         let _ = bucket.push(contact);
     }
+
+    fn remove_contact(&self, contact: &Contact) {
+        let i = self.bucket_index(contact.id);
+        let mut vec_lock = self.contacts[i].write().unwrap();
+        if let Some(i) = vec_lock.iter().position(|c| c == contact) {
+            vec_lock.remove(i);
+        }
+    }
+
+    fn contacts_iter(&self) -> impl std::iter::Iterator<Item = Contact> {
+        self.contacts
+            .iter()
+            .flat_map(|rw_v| rw_v.read().unwrap().clone().into_iter())
+    }
 }
 
 #[cfg(test)]

@@ -20,4 +20,15 @@ impl CloseNodes for DumbBucket {
         let mut contacts = self.contacts.write().unwrap();
         contacts.push(contact);
     }
+
+    fn contacts_iter(&self) -> impl std::iter::Iterator<Item = Contact> {
+        self.contacts.as_ref().read().unwrap().clone().into_iter()
+    }
+
+    fn remove_contact(&self, contact: &Contact) {
+        let mut w_lock = self.contacts.write().unwrap();
+        if let Some(i) = w_lock.iter().position(|c| c == contact) {
+            w_lock.remove(i);
+        }
+    }
 }

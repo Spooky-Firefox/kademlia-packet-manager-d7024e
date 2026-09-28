@@ -91,6 +91,23 @@ impl<C: CloseNodes, const SIBLINGS: usize> CloseNodes for SiblingList<C, SIBLING
         }
         let _ = siblings.insert(pos, contact);
     }
+
+    fn contacts_iter(&self) -> impl std::iter::Iterator<Item = Contact> {
+        self.siblings
+            .read()
+            .unwrap()
+            .clone()
+            .into_iter()
+            .chain(self.fallback.contacts_iter())
+    }
+
+    fn remove_contact(&self, contact: &Contact) {
+        let mut vec_lock = self.siblings.write().unwrap();
+        if let Some(i) = vec_lock.iter().position(|c| c == contact) {
+            vec_lock.remove(i);
+        }
+        self.fallback.remove_contact(contact);
+    }
 }
 
 #[cfg(test)]

@@ -106,6 +106,7 @@ mod tests {
     use crate::close_nodes::NodeId;
     use crate::handle_rpc::{Method, NODE_ID_LEN};
     use std::sync::Mutex;
+    use std::vec;
 
     const MY_ID: NodeId = [1u8; 32];
     const SEED_ID: NodeId = [2u8; 32];
@@ -137,6 +138,17 @@ mod tests {
             if !contacts.iter().any(|known| known.id == contact.id) {
                 contacts.push(contact);
             }
+        }
+
+        fn contacts_iter(&self) -> impl std::iter::Iterator<Item = Contact> {
+            unimplemented!();
+            // so the compiler wont complain
+            #[allow(unreachable_code)]
+            Vec::new().into_iter()
+        }
+
+        fn remove_contact(&self, _contact: &Contact) {
+            unimplemented!()
         }
     }
 

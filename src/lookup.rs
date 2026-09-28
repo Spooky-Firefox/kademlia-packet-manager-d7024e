@@ -172,6 +172,17 @@ mod tests {
         }
 
         fn maybe_add_contact(&self, _contact: Contact) {}
+
+        fn contacts_iter(&self) -> impl std::iter::Iterator<Item = Contact> {
+            unimplemented!();
+            // so the compiler wont complain
+            #[allow(unreachable_code)]
+            Vec::new().into_iter()
+        }
+
+        fn remove_contact(&self, contact: &Contact) {
+            unimplemented!()
+        }
     }
 
     struct FakeTransport {

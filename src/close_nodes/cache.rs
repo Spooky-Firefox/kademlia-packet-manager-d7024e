@@ -120,6 +120,18 @@ impl<C: CloseNodes> CloseNodes for CachedCloseNodes<C> {
         contacts
     }
 
+    fn remove_contact(&self, contact: &Contact) {
+        self.entries.remove(&contact.id);
+        self.inner.remove_contact(contact);
+    }
+
+    fn contacts_iter(&self) -> impl std::iter::Iterator<Item = Contact> {
+        self.entries
+            .iter()
+            .flat_map(|f| f.contacts.clone().into_iter())
+            .chain(self.inner.contacts_iter())
+    }
+
     fn maybe_add_contact(&self, contact: Contact) {
         self.inner.maybe_add_contact(contact);
         // A write invalidates every target, not just nearby ones: a contact
@@ -152,6 +164,14 @@ mod tests {
 
         fn maybe_add_contact(&self, contact: Contact) {
             self.inner.maybe_add_contact(contact);
+        }
+
+        fn contacts_iter(&self) -> impl std::iter::Iterator<Item = Contact> {
+            self.inner.contacts_iter()
+        }
+
+        fn remove_contact(&self, contact: &Contact) {
+            self.inner.remove_contact(contact);
         }
     }
 
