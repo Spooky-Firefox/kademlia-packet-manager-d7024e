@@ -81,7 +81,7 @@ hello kademlia
 
 `get <key> /tmp/out.txt` if you want to save it to a file.
 
-## 6. See where the copies ended up
+## P4: See where the copies ended up
 
 Attach to a few nodes and run:
 
@@ -92,7 +92,7 @@ kademlia> show ds
 most nodes print `<empty>`. The ones that hold the value print
 `abcd…1234  15 bytes` should be at most 10 of them.
 
-## 7. Failure test: stop a node that holds the value
+## P5: Failure test: stop a node that holds the value
 
 Note the address in step 5's `received ... from 172.28.1.x` line, and find
 which container has that address:
@@ -118,7 +118,7 @@ request may take a moment longer: a stopped node is retried a few times,
 
 Bring the node back with `docker start <container-name>`.
 
-## shut down
+## P6: shut down
 
 ```sh
 docker compose down
