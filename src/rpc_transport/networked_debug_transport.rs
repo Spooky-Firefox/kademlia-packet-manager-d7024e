@@ -104,7 +104,7 @@ use dashmap::DashMap;
 use log::trace;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::DuplexStream;
 use tokio::sync::{Mutex, mpsc};
@@ -144,6 +144,10 @@ pub struct NetworkConfig {
 struct Bound {
     datagrams: mpsc::UnboundedSender<Datagram>,
     connections: mpsc::UnboundedSender<Incoming>,
+    /// Which binding of the address this is, so an endpoint that was
+    /// [`unbind`](Network::unbind)ed and outlived a rebind does not tear down
+    /// its successor when it is finally dropped.
+    binding: u64,
 }
 
 struct Inner {
@@ -151,6 +155,7 @@ struct Inner {
     sockets: DashMap<SocketAddr, Bound>,
     config: NetworkConfig,
     next_port: AtomicU16,
+    next_binding: AtomicU64,
 }
 
 /// The fake wire. Cheap to clone: every clone refers to the same network.
@@ -176,6 +181,7 @@ impl Network {
                 sockets: DashMap::new(),
                 config,
                 next_port: AtomicU16::new(FIRST_EPHEMERAL_PORT),
+                next_binding: AtomicU64::new(0),
             }),
         }
     }
@@ -190,18 +196,32 @@ impl Network {
         match self.inner.sockets.entry(addr) {
             dashmap::Entry::Occupied(_) => None,
             dashmap::Entry::Vacant(slot) => {
+                let binding = self.inner.next_binding.fetch_add(1, Ordering::Relaxed);
                 slot.insert(Bound {
                     datagrams,
                     connections,
+                    binding,
                 });
                 Some(Endpoint {
                     addr,
+                    binding,
                     network: self.clone(),
                     inbox: Mutex::new(datagram_inbox),
                     connections: Mutex::new(connection_inbox),
                 })
             }
         }
+    }
+
+    /// Take `addr` off the wire, as if its host went down.
+    ///
+    /// Datagrams to it are swallowed and connections refused from now on. The
+    /// endpoint bound there sees its inboxes close: `recv_from` returns `None`
+    /// and `accept` fails with `NotConnected`, which is what stops a node's
+    /// receive and serve loops. Unlike dropping the [`Endpoint`], this works
+    /// while those loops still hold it.
+    pub fn unbind(&self, addr: SocketAddr) {
+        self.inner.sockets.remove(&addr);
     }
 
     /// Bind a fresh loopback address, the way `UdpSocket::bind("127.0.0.1:0")`
@@ -279,7 +299,7 @@ impl Network {
         }
         // In flight: the delay is per-datagram, so ordering is not preserved.
         let network = self.clone();
-        tokio::spawn(async move {
+        crate::node_scope::spawn(async move {
             tokio::time::sleep(latency).await;
             network.deliver(from, to, payload);
         });
@@ -302,6 +322,7 @@ impl Network {
 #[non_exhaustive]
 pub struct Endpoint {
     addr: SocketAddr,
+    binding: u64,
     network: Network,
     /// `&self` receive, to match `UdpSocket::recv_from`.
     inbox: Mutex<mpsc::UnboundedReceiver<Datagram>>,
@@ -327,7 +348,11 @@ impl Endpoint {
 
 impl Drop for Endpoint {
     fn drop(&mut self) {
-        self.network.inner.sockets.remove(&self.addr);
+        let binding = self.binding;
+        self.network
+            .inner
+            .sockets
+            .remove_if(&self.addr, |_, bound| bound.binding == binding);
     }
 }
 
@@ -366,11 +391,10 @@ impl StreamListener for Endpoint {
     async fn accept(&self) -> std::io::Result<(DuplexStream, SocketAddr)> {
         match self.connections.lock().await.recv().await {
             Some((from, stream)) => Ok((stream, from)),
-            // Unreachable: the sender sits in the network's map and is removed
-            // only when this endpoint is dropped, which cannot happen while
-            // `&self` is borrowed. It is an error rather than an `Option` in
-            // the signature because the trait is also implemented by things
-            // that really can fail to accept, like a `TcpListener`.
+            // The endpoint was unbound with [`Network::unbind`]: its sender is
+            // gone from the network's map, so nothing more will arrive.
+            // `NotConnected` tells the serve loop to stop, rather than retry
+            // as it would on a transient accept failure.
             None => Err(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
                 "endpoint unbound",
@@ -535,6 +559,29 @@ mod tests {
             .unwrap(),
             b"ping"
         );
+    }
+
+    #[tokio::test]
+    async fn unbinding_closes_the_endpoint_and_frees_its_address() {
+        let network = Network::new();
+        let endpoint = network.bind_any();
+        let addr = endpoint.local_addr();
+
+        network.unbind(addr);
+
+        assert!(endpoint.recv_from().await.is_none());
+        assert_eq!(
+            endpoint.accept().await.unwrap_err().kind(),
+            std::io::ErrorKind::NotConnected
+        );
+        assert!(network.connect(addr).is_err());
+
+        // The address is free again, and the stale endpoint going away later
+        // must not take its successor with it.
+        let successor = network.bind(addr).expect("the address was freed");
+        drop(endpoint);
+        assert!(network.bind(addr).is_none(), "the successor is still bound");
+        drop(successor);
     }
 
     #[tokio::test]
