@@ -7,10 +7,10 @@ edition = "2024"
 hex = "0.4.3"
 sha2 = "0.10"
 dashmap = "6.2.1"
-env_logger = "0.11.11"
 futures = "0.3"
 heapless = "0.9.3"
 log = "0.4.34"
+fern = "0.7"
 rand = "0.10.2"
 tokio = {version = "1.53.*", features = ["full"]}
 

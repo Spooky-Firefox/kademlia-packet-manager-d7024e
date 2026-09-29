@@ -14,6 +14,12 @@ where
     U: RpcTransport,
     A: CloseNodes,
 {
+    let lookup_id = crate::instrumentation::next_lookup_id();
+    let my_id = rpc.my_contact().id;
+
+    crate::instrumentation::lookup_start(lookup_id, "node", my_id, target);
+
+    let mut probe_count = 0usize;
     // contacts we know closest to target
     let mut candidates = rpc.close_nodes().close_nodes(target);
     candidates.sort_by(|a, b| xor_distance_cmp(a.id, b.id, target));
@@ -36,6 +42,11 @@ where
             };
 
             queried.insert(next.id);
+
+            crate::instrumentation::lookup_probe(lookup_id, "node", my_id, next);
+
+            probe_count += 1;
+
             in_flight.push(async move { rpc.find_node(&next, target).await });
         }
 
@@ -59,6 +70,17 @@ where
         candidates.truncate(K);
     }
 
+    let exact_match = candidates.iter().any(|contact| contact.id == target);
+
+    // log end of lookup
+    crate::instrumentation::node_lookup_end(
+        lookup_id,
+        my_id,
+        probe_count,
+        candidates.len(),
+        exact_match,
+    );
+
     candidates
 }
 
@@ -68,6 +90,12 @@ where
     U: RpcTransport,
     A: CloseNodes,
 {
+    let lookup_id = crate::instrumentation::next_lookup_id();
+    let my_id = rpc.my_contact().id;
+    let mut probe_count = 0usize;
+
+    crate::instrumentation::lookup_start(lookup_id, "value", my_id, key);
+
     let mut candidates = lookup_node(rpc, key).await;
 
     // Routing tables do not contain ourselves, but we may hold the value.
@@ -86,6 +114,9 @@ where
                 break;
             };
 
+            crate::instrumentation::lookup_probe(lookup_id, "value", my_id, next);
+
+            probe_count += 1;
             in_flight.push(async move {
                 let reply = rpc.find_value(&next, key).await;
                 (next, reply)
@@ -98,8 +129,9 @@ where
 
         match reply {
             FindValue::Value(value) => {
-                // Keep the SHA-256 validation you added earlier.
                 if crate::hashing::key_for_value(&value) == key {
+                    crate::instrumentation::value_lookup_end(lookup_id, my_id, probe_count, true);
+
                     return Some((source, value));
                 }
 
@@ -116,6 +148,8 @@ where
             }
         }
     }
+
+    crate::instrumentation::value_lookup_end(lookup_id, my_id, probe_count, false);
 
     None
 }

@@ -6,6 +6,8 @@ mod cli;
 mod close_nodes;
 mod handle_rpc;
 mod hashing;
+mod instrumentation;
+mod logging;
 mod lookup;
 mod maintenance;
 mod node;
@@ -17,8 +19,7 @@ use node::RealNode;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    env_logger::init();
-
+    logging::setup()?;
     let mut args = std::env::args().skip(1);
 
     let Some(bind) = args.next() else {
