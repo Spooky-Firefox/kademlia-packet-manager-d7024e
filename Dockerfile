@@ -11,6 +11,8 @@ RUN touch src/main.rs && cargo build --release
 
 FROM debian:trixie-slim
 RUN useradd --system kademlia
+RUN mkdir /logs && chown kademlia /logs
+WORKDIR /logs
 COPY --from=builder /app/target/release/kademlia-packet-manager-d7024e /usr/local/bin/kademlia
 USER kademlia
 EXPOSE 4000/udp 
