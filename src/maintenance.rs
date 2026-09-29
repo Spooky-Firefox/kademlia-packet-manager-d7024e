@@ -34,6 +34,34 @@ pub fn jittered(period: Duration) -> Duration {
     period.mul_f64(rand::random_range(1.0 - JITTER..1.0 + JITTER))
 }
 
+/// Republish every value this node currently holds to the current K closest
+/// nodes.
+///
+/// The datastore is snapshotted before any network operations are awaited.
+/// This avoids holding DashMap guards while a lookup or STORE is in progress.
+pub async fn republish_values<T, U, A>(
+    rpc: &Rpc<T, U, A>,
+    values: Vec<(crate::close_nodes::Key, Vec<u8>)>,
+) where
+    T: RpcTransport,
+    U: RpcTransport,
+    A: CloseNodes,
+{
+    for (key, value) in values {
+        let mut targets = crate::lookup::lookup_node(rpc, key).await;
+
+        targets.push(rpc.my_contact());
+
+        targets.sort_by(|a, b| crate::close_nodes::xor_distance_cmp(a.id, b.id, key));
+        targets.dedup_by_key(|contact| contact.id);
+        targets.truncate(crate::close_nodes::K);
+
+        for target in targets {
+            rpc.store(&target, key, value.clone()).await;
+        }
+    }
+}
+
 /// Ping every contact in the routing table and drop the ones that are gone.
 ///
 /// Gone means no answer at all, or an answer from a different id: whoever
@@ -85,7 +113,11 @@ mod tests {
     fn contacts(node: &FakeNode) -> HashSet<Contact> {
         node.rpc().close_nodes().contacts_iter().collect()
     }
-
+    fn holds(node: &FakeNode, key: crate::close_nodes::Key) -> bool {
+        node.datastore_snapshot()
+            .iter()
+            .any(|(stored_key, _)| *stored_key == key)
+    }
     /// A contact at an address nothing on the network is bound to, so pings
     /// to it go unanswered.
     fn dead_contact() -> Contact {
@@ -94,7 +126,87 @@ mod tests {
             address: SocketAddr::from(([10, 0, 0, 1], 9)),
         }
     }
+    #[tokio::test]
+    async fn republishing_keeps_value_alive_after_original_holders_leave() {
+        let network = Network::new();
 
+        // These nodes are the original replica set.
+        let originals: Vec<FakeNode> = (0..K).map(|_| FakeNode::new(&network)).collect();
+
+        // These nodes did not initially store the value. They are the nodes that
+        // republishing can move copies to after churn.
+        let replacements: Vec<FakeNode> = (0..K).map(|_| FakeNode::new(&network)).collect();
+
+        // A separate node that will try to retrieve the value after every
+        // original holder has left.
+        let reader = FakeNode::new(&network);
+
+        let value = b"value that must survive churn".to_vec();
+        let key = crate::hashing::key_for_value(&value);
+
+        let publisher = &originals[0];
+
+        // Simulate the original replication of the value onto K nodes.
+        for holder in &originals {
+            assert!(
+                publisher
+                    .rpc()
+                    .store(&holder.contact(), key, value.clone())
+                    .await
+            );
+        }
+
+        assert!(
+            originals.iter().all(|node| holds(node, key)),
+            "every original replica should initially hold the value"
+        );
+
+        // The surviving holder now knows about nodes that can become the new
+        // replica set.
+        for replacement in &replacements {
+            publisher
+                .rpc()
+                .close_nodes()
+                .maybe_add_contact(replacement.contact());
+        }
+
+        // Simulate churn: all original holders except one disappear.
+        for holder in originals.iter().skip(1) {
+            assert!(network.unbind(holder.address()));
+        }
+
+        // The last surviving replica performs one republishing round.
+        republish_values(publisher.rpc(), vec![(key, value.clone())]).await;
+
+        // Copies should now exist on replacement nodes.
+        let republished_to: Vec<Contact> = replacements
+            .iter()
+            .filter(|node| holds(node, key))
+            .map(|node| node.contact())
+            .collect();
+
+        assert!(
+            republished_to.len() >= K - 1,
+            "republishing should place copies on the current close nodes"
+        );
+
+        // Now remove the final member of the original replica set.
+        assert!(network.unbind(publisher.address()));
+
+        // The reader only knows about nodes that received the republished copy.
+        for contact in &republished_to {
+            reader.rpc().close_nodes().maybe_add_contact(*contact);
+        }
+
+        // The value must still be retrievable even though every original holder
+        // is gone.
+        let result = crate::lookup::lookup_value(reader.rpc(), key).await;
+
+        assert!(
+            matches!(result, Some((_source, found)) if found == value),
+            "value should remain retrievable after all original holders leave"
+        );
+    }
     /// A node that knows `K + 1` live nodes: enough that the floor lets a
     /// round remove one more contact.
     fn node_with_live_contacts(network: &Network) -> (FakeNode, Vec<FakeNode>) {
@@ -164,5 +276,27 @@ mod tests {
         check_liveness(node.rpc()).await;
 
         assert_eq!(contacts(&node), before);
+    }
+    #[tokio::test]
+    async fn republish_sends_value_to_current_close_nodes() {
+        let network = Network::new();
+
+        let publisher = FakeNode::new(&network);
+        let peer = FakeNode::new(&network);
+
+        // Make the publisher able to discover the peer.
+        publisher
+            .rpc()
+            .close_nodes()
+            .maybe_add_contact(peer.contact());
+
+        let value = b"republished value".to_vec();
+        let key = crate::hashing::key_for_value(&value);
+
+        republish_values(publisher.rpc(), vec![(key, value.clone())]).await;
+
+        let result = publisher.rpc().find_value(&peer.contact(), key).await;
+
+        assert_eq!(result, crate::rpc::FindValue::Value(value));
     }
 }

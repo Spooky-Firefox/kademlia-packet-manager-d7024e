@@ -86,7 +86,7 @@ where
 {
     pub fn periodic_task(
         &self,
-        _republish_interval: std::time::Duration,
+        republish_interval: std::time::Duration,
         liveness_check_interval: std::time::Duration,
     ) {
         // TODO deal with the spawn handles
@@ -98,7 +98,22 @@ where
             }
         });
 
-        // TODO republish data
+        let rpc = Arc::clone(&self.rpc);
+        let context = Arc::clone(&self.context);
+
+        let _republish_task = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(maintenance::jittered(republish_interval)).await;
+
+                let values: Vec<(Key, Vec<u8>)> = context
+                    .values
+                    .iter()
+                    .map(|entry| (*entry.key(), entry.value().clone()))
+                    .collect();
+
+                maintenance::republish_values(&rpc, values).await;
+            }
+        });
     }
 }
 
