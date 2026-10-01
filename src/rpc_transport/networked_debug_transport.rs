@@ -213,7 +213,13 @@ impl Network {
             }
         }
     }
-
+    /// Remove an address from the simulated network.
+    ///
+    /// After this, datagrams to the address are dropped and connection attempts
+    /// are refused, which lets tests simulate a node leaving or crashing.
+    pub fn unbind(&self, addr: SocketAddr) -> bool {
+        self.inner.sockets.remove(&addr).is_some()
+    }
     /// Open a connection to `to` and return the dialling end of it.
     ///
     /// `ConnectionRefused` when nothing is bound there. Unlike a datagram,
