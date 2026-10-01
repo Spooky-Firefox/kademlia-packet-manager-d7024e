@@ -6,7 +6,7 @@ use crate::node_scope;
 use crate::rpc::Rpc;
 use crate::rpc_transport::RpcTransport;
 use crate::rpc_transport::networked_debug_transport::{
-    Network, NetworkedDebugTransport, NetworkedStreamTransport,
+    Endpoint, Network, NetworkedDebugTransport, NetworkedStreamTransport,
 };
 use crate::rpc_transport::tcp_transport::TcpTransport;
 use crate::rpc_transport::udp_transport::UdpTransport;
@@ -88,6 +88,11 @@ where
         let buckets = routing.inner().fallback().non_empty_buckets();
 
         (siblings, buckets)
+    }
+
+    /// Whether this node holds a value under `key`.
+    pub fn holds(&self, key: &Key) -> bool {
+        self.context.values.contains_key(key)
     }
 
     pub fn datastore_snapshot(&self) -> Vec<(Key, usize)> {
@@ -172,7 +177,17 @@ impl RealNode {
 }
 impl FakeNode {
     pub fn new(network: &Network) -> Self {
-        let endpoint = network.bind_any();
+        Self::on(network, network.bind_any())
+    }
+
+    /// A node at `address`, or `None` if something on `network` already holds
+    /// it. Since a node's id is the hash of its address, choosing addresses is
+    /// how a simulation chooses where in the id space its nodes land.
+    pub fn at(network: &Network, address: SocketAddr) -> Option<Self> {
+        Some(Self::on(network, network.bind(address)?))
+    }
+
+    fn on(network: &Network, endpoint: Endpoint) -> Self {
         let address = endpoint.local_addr();
 
         let id = node_id_from_address(address);
@@ -367,6 +382,20 @@ mod tests {
         assert_eq!(a.rpc().ping(b.address()).await, Some(b.id()));
     }
     #[tokio::test]
+    async fn a_fake_node_can_be_placed_at_a_chosen_address() {
+        let network = Network::new();
+        let address: SocketAddr = "10.1.2.3:4567".parse().unwrap();
+
+        let a = FakeNode::at(&network, address).expect("the address is free");
+        assert_eq!(a.address(), address);
+        assert_eq!(a.id(), node_id_from_address(address));
+        assert!(FakeNode::at(&network, address).is_none(), "already taken");
+
+        let b = FakeNode::new(&network);
+        assert_eq!(b.rpc().ping(address).await, Some(a.id()));
+    }
+
+    #[tokio::test]
     async fn a_shut_down_fake_node_stops_answering_and_frees_its_address() {
         let network = Network::new();
 
@@ -413,7 +442,9 @@ mod tests {
         let value = vec![0xAB; 5000];
         let key = crate::hashing::key_for_value(&value);
 
+        assert!(!b.holds(&key));
         assert!(a.rpc().store(&b.contact(), key, value.clone()).await);
+        assert!(b.holds(&key));
 
         let result = a.rpc().find_value(&b.contact(), key).await;
 

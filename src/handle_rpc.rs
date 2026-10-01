@@ -124,11 +124,16 @@ impl Method {
     /// match a given payload and the matching order is not load-bearing. Keep
     /// it that way when adding a tag, or the scan below has to start caring.
     pub fn tag(self) -> &'static [u8] {
+        self.tag_str().as_bytes()
+    }
+
+    /// [`tag`](Self::tag) as text, for log lines.
+    pub fn tag_str(self) -> &'static str {
         match self {
-            Method::Ping => b"PING",
-            Method::Store => b"STORE",
-            Method::FindNode => b"FIND_NODE",
-            Method::FindValue => b"FIND_VALUE",
+            Method::Ping => "PING",
+            Method::Store => "STORE",
+            Method::FindNode => "FIND_NODE",
+            Method::FindValue => "FIND_VALUE",
         }
     }
 

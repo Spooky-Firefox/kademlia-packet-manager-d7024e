@@ -102,6 +102,8 @@ use crate::rpc_transport::stream_framing::{STREAM_DEADLINE, dial_and_send};
 use crate::rpc_transport::stream_listener::StreamListener;
 use dashmap::DashMap;
 use log::trace;
+use rand::rngs::StdRng;
+use rand::{RngExt, SeedableRng};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
@@ -131,12 +133,21 @@ type Incoming = (SocketAddr, DuplexStream);
 ///
 /// Datagrams only. A connection is delivered whole whatever this says, because
 /// a connection is what a node reaches for when it will not lose the message.
+///
+/// Latency and loss are where the network starts; [`Network::set_latency`]
+/// and [`Network::set_loss`] change them while it runs.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NetworkConfig {
     /// Delay applied to every delivered datagram.
     pub latency: Duration,
     /// Fraction of datagrams dropped in flight, `0.0..=1.0`.
     pub loss: f64,
+    /// Seed for the draws that decide which datagrams are lost. `None` draws
+    /// from the thread's own generator.
+    ///
+    /// A seed fixes the sequence of draws, not which datagram gets which one:
+    /// that follows the order concurrent tasks happen to send in.
+    pub seed: Option<u64>,
 }
 
 /// The two queues an [`Endpoint`] drains, held together so a bound address
@@ -153,7 +164,11 @@ struct Bound {
 struct Inner {
     /// The bound endpoints' inboxes. A missing address is a dead port.
     sockets: DashMap<SocketAddr, Bound>,
-    config: NetworkConfig,
+    /// The loss fraction, as `f64` bits so it can change under a shared ref.
+    loss: AtomicU64,
+    latency_us: AtomicU64,
+    /// The seeded loss generator, when [`NetworkConfig::seed`] asked for one.
+    rng: Option<std::sync::Mutex<StdRng>>,
     next_port: AtomicU16,
     next_binding: AtomicU64,
 }
@@ -179,10 +194,45 @@ impl Network {
         Self {
             inner: Arc::new(Inner {
                 sockets: DashMap::new(),
-                config,
+                loss: AtomicU64::new(config.loss.to_bits()),
+                latency_us: AtomicU64::new(config.latency.as_micros() as u64),
+                rng: config
+                    .seed
+                    .map(|seed| std::sync::Mutex::new(StdRng::seed_from_u64(seed))),
                 next_port: AtomicU16::new(FIRST_EPHEMERAL_PORT),
                 next_binding: AtomicU64::new(0),
             }),
+        }
+    }
+
+    /// The fraction of datagrams currently dropped.
+    pub fn loss(&self) -> f64 {
+        f64::from_bits(self.inner.loss.load(Ordering::Relaxed))
+    }
+
+    /// Drop `loss` (clamped to `0.0..=1.0`) of the datagrams sent from now on.
+    pub fn set_loss(&self, loss: f64) {
+        let loss = loss.clamp(0.0, 1.0);
+        self.inner.loss.store(loss.to_bits(), Ordering::Relaxed);
+    }
+
+    /// The delay currently applied to each datagram.
+    pub fn latency(&self) -> Duration {
+        Duration::from_micros(self.inner.latency_us.load(Ordering::Relaxed))
+    }
+
+    /// Delay the datagrams sent from now on by `latency`.
+    pub fn set_latency(&self, latency: Duration) {
+        self.inner
+            .latency_us
+            .store(latency.as_micros() as u64, Ordering::Relaxed);
+    }
+
+    /// A uniform draw in `0.0..1.0` for deciding a loss.
+    fn draw(&self) -> f64 {
+        match &self.inner.rng {
+            Some(rng) => rng.lock().unwrap().random(),
+            None => rand::random(),
         }
     }
 
@@ -288,11 +338,12 @@ impl Network {
     /// promise delivery: an unbound address, a lossy wire, or a receiver that
     /// went away all look the same from here.
     fn send(&self, from: SocketAddr, to: SocketAddr, payload: Vec<u8>) {
-        if self.inner.config.loss > 0.0 && rand::random::<f64>() < self.inner.config.loss {
+        let loss = self.loss();
+        if loss > 0.0 && self.draw() < loss {
             trace!("Dropped {} bytes {from} -> {to} (loss)", payload.len());
             return;
         }
-        let latency = self.inner.config.latency;
+        let latency = self.latency();
         if latency.is_zero() {
             self.deliver(from, to, payload);
             return;
@@ -559,6 +610,55 @@ mod tests {
             .unwrap(),
             b"ping"
         );
+    }
+
+    /// Loss can be turned up and back down on a running network.
+    #[tokio::test]
+    async fn loss_can_change_while_the_network_runs() {
+        let network = Network::new();
+        let peer = spawn_echo_peer(&network);
+        let transport = NetworkedDebugTransport::new(network.bind_any());
+
+        network.set_loss(1.0);
+        assert_eq!(network.loss(), 1.0);
+        let lost = tokio::time::timeout(
+            Duration::from_millis(100),
+            transport.send_receive(b"ping".to_vec(), peer),
+        )
+        .await
+        .is_err();
+        assert!(lost, "nothing gets through a wire that drops everything");
+
+        network.set_loss(0.0);
+        let reply = transport
+            .send_receive(b"ping".to_vec(), peer)
+            .await
+            .unwrap();
+        assert_eq!(reply, b"ping");
+    }
+
+    #[test]
+    fn loss_is_clamped_and_latency_round_trips() {
+        let network = Network::new();
+        network.set_loss(2.0);
+        assert_eq!(network.loss(), 1.0);
+        network.set_loss(-1.0);
+        assert_eq!(network.loss(), 0.0);
+        network.set_latency(Duration::from_millis(7));
+        assert_eq!(network.latency(), Duration::from_millis(7));
+    }
+
+    /// Two networks with the same seed draw the same losses.
+    #[test]
+    fn a_seeded_network_draws_the_same_sequence() {
+        let config = NetworkConfig {
+            seed: Some(42),
+            ..NetworkConfig::default()
+        };
+        let a = Network::with_config(config);
+        let b = Network::with_config(config);
+        let draws = |network: &Network| (0..16).map(|_| network.draw()).collect::<Vec<_>>();
+        assert_eq!(draws(&a), draws(&b));
     }
 
     #[tokio::test]

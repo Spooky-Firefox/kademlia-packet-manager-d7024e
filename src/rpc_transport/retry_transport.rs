@@ -20,7 +20,7 @@
 //! [`new`](RetryTransport::new) has no channel and drops requests, which is
 //! all a client-only node ever needs.
 
-use crate::handle_rpc::Request;
+use crate::handle_rpc::{Method, NODE_ID_LEN, Request};
 use crate::pending::Pending;
 use crate::rpc_transport::RpcTransport;
 use crate::rpc_transport::data_rx_tx::DataRxTx;
@@ -28,7 +28,7 @@ use crate::rpc_transport::{is_reply, request_id};
 use log::trace;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 
@@ -36,10 +36,25 @@ use tokio::time::sleep;
 const ID_LEN: usize = size_of::<u64>();
 
 /// How long to wait for a reply before resending the request.
-const RESEND_INTERVAL: Duration = Duration::from_millis(200);
+pub const RESEND_INTERVAL: Duration = Duration::from_millis(200);
 
 /// How many times to send a request before giving up on it.
-const MAX_ATTEMPTS: usize = 5;
+pub const MAX_ATTEMPTS: usize = 5;
+
+/// Log one finished call as an [`rpc_end`](crate::instrumentation::rpc_end)
+/// event. The method is read off the payload, which [`Rpc`](crate::rpc::Rpc)
+/// frames as the sender's node id followed by the method tag; anything else
+/// is logged as `OTHER`.
+fn log_rpc(payload: &[u8], peer: SocketAddr, attempts: usize, success: bool, took: Duration) {
+    if !crate::instrumentation::rpc_events() {
+        return;
+    }
+    let method = payload
+        .get(NODE_ID_LEN..)
+        .and_then(Method::split_tag)
+        .map_or("OTHER", |(method, _)| method.tag_str());
+    crate::instrumentation::rpc_end(method, peer, attempts, success, took);
+}
 
 #[non_exhaustive]
 pub struct RetryTransport<T: DataRxTx + Send + Sync + 'static> {
@@ -143,16 +158,21 @@ impl<T: DataRxTx + Send + Sync + 'static> RpcTransport for RetryTransport<T> {
         datagram.extend_from_slice(&id.to_be_bytes());
         datagram.extend_from_slice(&payload);
 
-        for _attempt in 0..MAX_ATTEMPTS {
+        let started = Instant::now();
+        for attempt in 1..=MAX_ATTEMPTS {
             self.socket.send_packet(&datagram, address).await?;
             tokio::select! {
                 // None is unreachable: the slot outlives this await.
-                res = &mut msg => return Ok(res.unwrap()),
+                res = &mut msg => {
+                    log_rpc(&payload, address, attempt, true, started.elapsed());
+                    return Ok(res.unwrap());
+                }
                 _ = sleep(RESEND_INTERVAL) => {
                     trace!("No reply for id {id}, resending");
                 }
             }
         }
+        log_rpc(&payload, address, MAX_ATTEMPTS, false, started.elapsed());
 
         Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,

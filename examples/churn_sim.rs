@@ -228,7 +228,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let _ = std::fs::remove_file("sim.log");
     logging::setup_sim("sim.log", level)?;
 
-    let network = Network::with_config(NetworkConfig { latency, loss });
+    let network = Network::with_config(NetworkConfig {
+        latency,
+        loss,
+        ..NetworkConfig::default()
+    });
     let nodes: Nodes = Arc::default();
     let stats = Arc::new(Stats::default());
     let start = Instant::now();
