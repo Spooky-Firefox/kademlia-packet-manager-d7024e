@@ -51,9 +51,10 @@ where
         }
 
         // nothing running and nothing left to start: the K closest are settled
-        let Some(new_contacts) = in_flight.next().await else {
+        let Some(mut new_contacts) = in_flight.next().await else {
             break;
         };
+        new_contacts.retain(|c| c.id != my_id);
 
         // every contact a response teaches us about is worth offering to the
         // routing table, whether or not it ends up among the K closest here
