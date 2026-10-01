@@ -1,10 +1,4 @@
-//! Joining an existing network.
-//!
-//! Kademlia has no broadcast, no directory, and no announcement of new
-//! arrivals — so a node that knows nobody has no way to find anybody, because
-//! finding anybody means asking somebody. [`bootstrap`] breaks that circle
-//! with the one fact a joining node is given from outside the protocol: the
-//! address of a node already in the network.
+//! Joining an existing network through a node already in it (the seed).
 
 use crate::close_nodes::{CloseNodes, Contact};
 use crate::lookup;
@@ -14,7 +8,7 @@ use std::net::SocketAddr;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BootstrapError {
-    /// The seed never answered, so there is no networking to join it.
+    /// The seed did not answer the PING.
     Unreachable,
     /// The seed answered with our own id.
     SelfSeed,
@@ -32,51 +26,21 @@ impl std::error::Error for BootstrapError {}
 
 /// Join the network through `seed`, returning the neighbourhood we land in.
 ///
-/// # Why a PING first
-///
-/// A routing table stores [`Contact`]s, and we arrived holding half of one:
-/// `seed` is an address, and only the node living there can say which id goes
-/// with it. [`Rpc::ping`](crate::rpc::Rpc::ping) answers with the responder's
-/// id for exactly this reason. With both halves the seed becomes the single
-/// entry a lookup needs in order to start.
-///
-/// # Why we look ourselves up
-///
-/// Searching for an id we already hold reads as a no-op, and is the opposite.
-/// A lookup is a walk, not a query: we ask the seed for the nodes it knows
-/// nearest us, ask those nodes the same question, and keep going while the
-/// answers get closer. [`lookup_node`](crate::lookup::lookup_node) files every
-/// contact it meets along the way, so the walk is what populates the table.
-///
-/// Aiming it at our own id makes it converge on our own neighbourhood, which
-/// is the part of the keyspace we most need to know: those are the nodes that
-/// will hold values whose keys land near us, and the nodes we answer for.
-///
-/// The walk also runs in the other direction, which is easy to miss and is
-/// half the point. Every request carries our [`NodeId`](crate::close_nodes::NodeId)
-/// ahead of its method tag, and the receiving node pairs it with the address
-/// the request arrived from — so each node we touch records us while
-/// answering. Without that the join would be read-only: a thousand nodes could
-/// each bootstrap off the same seed and that seed would still know none of
-/// them, answering every query with an empty list while the network failed to
-/// form.
+/// We only know the seed's address, so we PING it to learn its id and add it
+/// to our routing table. Then we look up our own id: the lookup fills our
+/// table with the nodes closest to us, and since every request carries our
+/// id, each node we query learns about us too.
 ///
 /// # Errors
 ///
-/// [`Unreachable`](BootstrapError::Unreachable) if the seed never answers:
-/// there is no network to join through a node that is not there. It folds
-/// together timeout, transport error and garbled reply, none of which a caller
-/// could act on differently.
+/// - [`Unreachable`](BootstrapError::Unreachable) if the PING fails for any
+///   reason (timeout, transport error or garbled reply).
+/// - [`SelfSeed`](BootstrapError::SelfSeed) if the seed is us. The routing
+///   table never stores our own id, so without this check the join would
+///   quietly find nobody.
 ///
-/// [`SelfSeed`](BootstrapError::SelfSeed) if the seed answers with our own id,
-/// meaning we were pointed at ourselves. That is a configuration mistake
-/// rather than a network condition, and it earns its own variant because the
-/// alternative is silent: the sibling list declines to store our own id, so we
-/// would start the lookup with an empty table and return an empty vector with
-/// nothing to explain it.
-///
-/// An empty-handed success is not an error. The second node on a network
-/// legitimately finds only the seed.
+/// Finding only the seed is not an error; the second node in a network has
+/// nobody else to find.
 pub async fn bootstrap<T, U, A>(
     rpc: &Rpc<T, U, A>,
     seed: SocketAddr,
@@ -97,16 +61,9 @@ where
         address: seed,
     });
 
-    // TODO: refresh the buckets past our nearest neighbour. Kademlia's join
-    // follows the self-lookup with a lookup for a random id in each bucket
-    // farther out than our closest contact. That is what fills the distant
-    // buckets, which the self-lookup never reaches: it converges on our own
-    // neighbourhood by design, so it leaves the table dense around us and
-    // thin everywhere else, and lookups for far-off keys then take more
-    // rounds than they should. Inbound requests fill those buckets over time
-    // via `maybe_add_contact`, so this is a refinement rather than a hole —
-    // but it starts to matter once the network is large enough that "far
-    // off" is most of it.
+    // TODO: after the self-lookup, refresh each bucket farther away than our
+    // closest neighbour by looking up a random id in it, as the Kademlia
+    // paper's join does. The self-lookup alone leaves the far buckets thin.
     Ok(lookup::lookup_node(rpc, rpc.my_id()).await)
 }
 
@@ -198,9 +155,7 @@ mod tests {
                     "no answer",
                 ));
             }
-            // Every request is framed with the sender's NodeId ahead of the
-            // method tag, the way `Rpc::call` writes it. A real responder
-            // learns the sender from it; this one only needs to skip it.
+            // Skip the sender's NodeId that `Rpc::call` puts before the method tag.
             let rest = payload
                 .split_at_checked(NODE_ID_LEN)
                 .map(|(_sender, rest)| rest)
