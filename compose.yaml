@@ -1,0 +1,32 @@
+x-node-common: &common
+  image: kademlia
+  stdin_open: true
+  tty: true
+  restart: on-failure
+
+services:
+  seed:
+    <<: *common #reuses common
+    build: . # build the seed, calls it kademlia
+    command: sh -c 'exec kademlia "$$(hostname -i):4000"'
+    networks:
+      kademlia:
+        ipv4_address: 172.28.0.10 #fixed ip outside ip range
+
+  node: 
+    <<: *common
+    # replaces shell with node and bootstraps from seed
+    command: sh -c 'sleep $$(shuf -i 0-5 -n 1) && exec kademlia "$$(hostname -i):4000" 172.28.0.10:4000'
+    depends_on:
+      - seed
+    deploy:
+      replicas: 49
+    networks:
+      - kademlia
+
+networks:
+  kademlia:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16   # every address on network
+          ip_range: 172.28.1.0/24 # what docker hands out

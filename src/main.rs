@@ -34,19 +34,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if let Some(seed) = bootstrap_address {
         println!("bootstrapping through {seed}...");
 
-        match bootstrap::bootstrap(node.rpc(), seed).await {
-            Ok(contacts) => {
-                println!(
-                    "bootstrap complete; lookup returned {} contacts",
-                    contacts.len()
-                );
+        let neighbours = match bootstrap::bootstrap(node.rpc(), seed).await {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("bootstrap failed: {e}"); // uses your Display
+                std::process::exit(1);
             }
-
-            Err(error) => {
-                eprintln!("bootstrap failed: {error:?}");
-                return Ok(());
-            }
-        }
+        };
+        println!(
+            "bootstrap complete; lookup returned {} contacts",
+            neighbours.len()
+        );
     } else {
         println!("starting a new network");
     }
