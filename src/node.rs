@@ -129,8 +129,9 @@ where
 
         let rpc = Arc::clone(&self.rpc);
         let context = Arc::clone(&self.context);
-
-        let _republish_task = tokio::spawn(async move {
+        // Kept with the others so it stops with the node: a fake node that was
+        // shut down can still send, and would otherwise go on republishing.
+        let republish_task = tokio::spawn(node_scope::scope(self.address, async move {
             loop {
                 tokio::time::sleep(maintenance::jittered(republish_interval)).await;
 
@@ -142,7 +143,8 @@ where
 
                 maintenance::republish_values(&rpc, values).await;
             }
-        });
+        }));
+        self.tasks.lock().unwrap().push(republish_task);
     }
 }
 

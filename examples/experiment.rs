@@ -4,6 +4,11 @@
 //! cargo run --release --example experiment -- --nodes 500 --seed 3 --loss 0.2 --out runs/demo
 //! ```
 //!
+//! Every lookup the run measures is wrapped in
+//! [`instrumentation::with_op`], so its `lookup_end` and `rpc` lines carry the
+//! same `op=` as the `event=op` line that reports it; background work
+//! (republishing, liveness pings) logs `op=0`.
+//!
 //! Everything goes to `metrics.log` in the `--out` directory as one
 //! `event=NAME key=value ...` line per event, for `experiments/analyze.py`.
 //! `experiments/run_suite.py` runs many of these, one directory per run.
@@ -79,6 +84,8 @@ struct Config {
     concurrency: usize,
     threads: usize,
     liveness: Duration,
+    /// How often each node republishes the values it holds.
+    republish: Duration,
     settle: Duration,
     refresh: usize,
     /// When set, the measured lookups are spread evenly over this long
@@ -102,6 +109,7 @@ impl Default for Config {
             concurrency: 16,
             threads: 2,
             liveness: maintenance::LIVENESS_CHECK_INTERVAL,
+            republish: maintenance::REPUBLISH_INTERVAL,
             settle: Duration::from_secs(2),
             refresh: 0,
             duration: None,
@@ -114,7 +122,7 @@ impl Default for Config {
 const USAGE: &str = "\
 usage: experiment [--nodes N] [--seed S] [--loss P] [--latency-ms MS] [--alpha A]
                   [--lookups M] [--values V] [--churn PER_SEC] [--concurrency C]
-                  [--threads T] [--liveness-secs S] [--settle-secs S]
+                  [--threads T] [--liveness-secs S] [--republish-secs S] [--settle-secs S]
                   [--refresh R] [--duration-secs S] [--no-rpc-events] [--out DIR]";
 
 fn parse_args() -> Result<Config, Box<dyn Error>> {
@@ -144,6 +152,7 @@ fn parse_args() -> Result<Config, Box<dyn Error>> {
             "--concurrency" => config.concurrency = value.parse()?,
             "--threads" => config.threads = value.parse()?,
             "--liveness-secs" => config.liveness = Duration::from_secs_f64(value.parse()?),
+            "--republish-secs" => config.republish = Duration::from_secs_f64(value.parse()?),
             "--settle-secs" => config.settle = Duration::from_secs_f64(value.parse()?),
             "--refresh" => config.refresh = value.parse()?,
             "--duration-secs" => config.duration = Some(Duration::from_secs_f64(value.parse()?)),
@@ -247,14 +256,14 @@ impl Experiment {
             node.shutdown();
             return false;
         }
-        node.periodic_task(maintenance::REPUBLISH_INTERVAL, self.config.liveness);
+        node.periodic_task(self.config.republish, self.config.liveness);
         self.nodes.lock().unwrap().push(Arc::new(node));
         true
     }
 
     async fn build(&self, rng: &mut StdRng) {
         let first = self.new_node(rng);
-        first.periodic_task(maintenance::REPUBLISH_INTERVAL, self.config.liveness);
+        first.periodic_task(self.config.republish, self.config.liveness);
         self.nodes.lock().unwrap().push(Arc::new(first));
 
         let mut failures = 0;
@@ -367,6 +376,7 @@ impl Experiment {
         // seed, whatever churn and scheduling do to the timing.
         let ops: Vec<Op> = (0..self.config.lookups * 2)
             .map(|i| Op {
+                id: i as u64 + 1,
                 kind: if i % 2 == 0 {
                     OpKind::Value
                 } else {
@@ -424,12 +434,15 @@ impl Experiment {
                 let nodes = self.snapshot();
                 let holders = nodes.iter().filter(|node| node.holds(key)).count();
                 let started = Instant::now();
-                let found = origin
-                    .scoped(lookup::lookup_value(origin.rpc(), *key))
-                    .await;
+                let found = instrumentation::with_op(
+                    op.id,
+                    origin.scoped(lookup::lookup_value(origin.rpc(), *key)),
+                )
+                .await;
                 let took = started.elapsed();
                 metric!(
-                    "event=op kind=value t_ms={} origin={} key={} success={} correct={} available={} holders={} duration_us={}",
+                    "event=op op={} kind=value t_ms={} origin={} key={} success={} correct={} available={} holders={} duration_us={}",
+                    op.id,
                     t_ms,
                     origin.address(),
                     hex::encode(key),
@@ -445,16 +458,19 @@ impl Experiment {
                 let nodes = self.snapshot();
                 let closest = true_closest(&nodes, target.id());
                 let started = Instant::now();
-                let found = origin
-                    .scoped(lookup::lookup_node(origin.rpc(), target.id()))
-                    .await;
+                let found = instrumentation::with_op(
+                    op.id,
+                    origin.scoped(lookup::lookup_node(origin.rpc(), target.id())),
+                )
+                .await;
                 let took = started.elapsed();
                 let recall = closest
                     .iter()
                     .filter(|node| found.iter().any(|c| c.id == node.id()))
                     .count();
                 metric!(
-                    "event=op kind=node t_ms={} origin={} target={} success={} recall={} of={} duration_us={}",
+                    "event=op op={} kind=node t_ms={} origin={} target={} success={} recall={} of={} duration_us={}",
+                    op.id,
                     t_ms,
                     origin.address(),
                     target.address(),
@@ -476,6 +492,9 @@ enum OpKind {
 
 #[derive(Clone, Copy)]
 struct Op {
+    /// Logged as `op=` on the op's own line and on every lookup and RPC it
+    /// makes, which is how the analysis tells them from background work.
+    id: u64,
     kind: OpKind,
     origin: u64,
     target: u64,
@@ -527,7 +546,7 @@ async fn run(config: Config) {
     });
 
     metric!(
-        "event=run_config nodes={} seed={} loss={} latency_ms={} alpha={} k={} lookups={} values={} churn={} concurrency={} threads={} liveness_s={} refresh={} duration_s={} resend_ms={} max_attempts={} stream_deadline_ms={}",
+        "event=run_config nodes={} seed={} loss={} latency_ms={} alpha={} k={} lookups={} values={} churn={} concurrency={} threads={} liveness_s={} republish_s={} refresh={} duration_s={} resend_ms={} max_attempts={} stream_deadline_ms={}",
         config.nodes,
         config.seed,
         config.loss,
@@ -540,6 +559,7 @@ async fn run(config: Config) {
         config.concurrency,
         config.threads,
         config.liveness.as_secs_f64(),
+        config.republish.as_secs_f64(),
         config.refresh,
         config.duration.map_or(0.0, |d| d.as_secs_f64()),
         RESEND_INTERVAL.as_millis(),

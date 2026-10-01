@@ -83,7 +83,11 @@ across them.
    lookups run, alternating, 16 at a time. In churn runs they are instead
    started at an even pace over `--duration-secs`.
 
-Only lookups from the *measure* phase are counted. Loss is switched on only
+Only lookups the harness starts during *measure* are counted. Each one runs
+inside `instrumentation::with_op`, so its `lookup_end` and `rpc` lines carry
+the same `op=` as the `event=op` line that reports it. Background work
+(republishing, liveness pings, joins under churn) logs `op=0` and is left
+out of the lookup statistics. Loss is switched on only
 after the network is built and the values stored, so the loss experiment
 measures lookups and is not confounded by a network that formed badly under
 loss.
@@ -142,6 +146,10 @@ every run's `event=run_config` line:
   network), with a **2 s** deadline. The simulated loss applies only to
   datagrams, so these calls are not lost. A value lookup can therefore fail
   only in its node-lookup phase, or because nobody holds the value anymore.
+- **Republishing**: every node re-stores each value it holds onto the
+  current K closest nodes, on a jittered `--republish-secs` interval. The
+  default is the node's own one hour, which never fires inside a run. The
+  churn experiment compares that with every 60 s.
 - **When a call fails**, the contact is removed from the routing table,
   unless the table has K or fewer contacts left. Every node also pings its
   whole table on a jittered liveness interval (60 s by default; 10 s and 60 s
@@ -173,10 +181,11 @@ every run's `event=run_config` line:
 - **α.** Larger α means more probes (speculative queries) but fewer rounds,
   so lower latency, with diminishing returns as α approaches K. Under loss,
   a larger α hides timeouts.
-- **Churn.** Nothing republishes values (`REPUBLISH_INTERVAL` is a TODO). A
-  node survives t seconds with probability e^(−ct/N), so a value with h
-  holders is still available with probability `1 − (1 − e^(−ct/N))^h`. On
-  top of that, lookups lose time and probes on departed contacts until a
+- **Churn.** A node survives t seconds with probability e^(−ct/N). Without
+  republishing, a value with h holders is therefore still available with
+  probability `1 − (1 − e^(−ct/N))^h`. With republishing every T seconds, a
+  value is lost only if all K holders leave within one interval, which
+  happens with probability `(1 − e^(−cT/N))^K` per interval. On top of that, lookups lose time and probes on departed contacts until a
   failed call or a liveness round removes them. That is why the experiment
   compares a 10 s liveness interval with a 60 s one.
 
@@ -189,13 +198,13 @@ contain spaces.
 ```text
 event=run_config nodes=1000 seed=3 loss=0.3 latency_ms=5 alpha=3 k=10 ... resend_ms=200 max_attempts=5 stream_deadline_ms=2000
 event=phase name=measure t_ms=4982 live=1000
-event=lookup_start lookup_id=88 kind=node node=<hex> target=<hex>
+event=lookup_start lookup_id=88 op=12 kind=node node=<hex> target=<hex>
 event=lookup_probe lookup_id=88 kind=node node=<hex> peer=10.3.4.5:2210
-event=lookup_end lookup_id=88 kind=node parent=0 node=<hex> probes=13 result_count=10 exact_match=true hops=2 duration_us=41730
-event=lookup_end lookup_id=87 kind=value node=<hex> probes=1 success=true duration_us=52011
-event=rpc method=FIND_NODE peer=10.3.4.5:2210 attempts=2 success=true duration_us=210533
-event=op kind=value t_ms=120 origin=10.1.2.3:4000 key=<hex> success=true correct=true available=true holders=10 duration_us=52100
-event=op kind=node t_ms=121 origin=10.1.2.3:4000 target=10.9.8.7:1234 success=true recall=10 of=10 duration_us=41800
+event=lookup_end lookup_id=88 op=12 kind=node parent=0 node=<hex> probes=13 result_count=10 exact_match=true hops=2 duration_us=41730
+event=lookup_end lookup_id=87 op=11 kind=value node=<hex> probes=1 success=true duration_us=52011
+event=rpc op=12 method=FIND_NODE peer=10.3.4.5:2210 attempts=2 success=true duration_us=210533
+event=op op=11 kind=value t_ms=120 origin=10.1.2.3:4000 key=<hex> success=true correct=true available=true holders=10 duration_us=52100
+event=op op=12 kind=node t_ms=121 origin=10.1.2.3:4000 target=10.9.8.7:1234 success=true recall=10 of=10 duration_us=41800
 event=stored key=<hex> holders=10 closest_holders=9
 event=churn action=leave node=10.4.4.4:5555
 event=join node=10.5.5.5:6666 seed=10.1.2.3:4000 success=true contacts=10

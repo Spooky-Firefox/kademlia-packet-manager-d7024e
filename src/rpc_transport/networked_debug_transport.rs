@@ -270,8 +270,10 @@ impl Network {
     /// and `accept` fails with `NotConnected`, which is what stops a node's
     /// receive and serve loops. Unlike dropping the [`Endpoint`], this works
     /// while those loops still hold it.
-    pub fn unbind(&self, addr: SocketAddr) {
-        self.inner.sockets.remove(&addr);
+    ///
+    /// Returns whether anything was bound there.
+    pub fn unbind(&self, addr: SocketAddr) -> bool {
+        self.inner.sockets.remove(&addr).is_some()
     }
 
     /// Bind a fresh loopback address, the way `UdpSocket::bind("127.0.0.1:0")`
@@ -282,13 +284,6 @@ impl Network {
                 return endpoint;
             }
         }
-    }
-    /// Remove an address from the simulated network.
-    ///
-    /// After this, datagrams to the address are dropped and connection attempts
-    /// are refused, which lets tests simulate a node leaving or crashing.
-    pub fn unbind(&self, addr: SocketAddr) -> bool {
-        self.inner.sockets.remove(&addr).is_some()
     }
     /// Open a connection to `to` and return the dialling end of it.
     ///

@@ -36,7 +36,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
-CACHE_VERSION = 3
+CACHE_VERSION = 4
 
 # Palette: categorical slots in fixed order, and a one-hue ramp for ordered
 # series (a churn rate, a network size).
@@ -100,6 +100,7 @@ def parse_run(path):
     churn_leaves = 0
     joins = Counter()
     build_probes = []
+    background_lookups = 0
 
     opener = gzip.open if path.suffix == ".gz" else open
     with opener(path, "rt", encoding="utf-8") as f:
@@ -111,17 +112,21 @@ def parse_run(path):
             elif event == "phase":
                 phase = e["name"]
             elif event == "lookup_end":
+                # op=0 is background work: joins, stores, republishing.
+                measured = phase == "measure" and e.get("op", "0") != "0"
+                if not measured and phase == "measure":
+                    background_lookups += 1
                 if e["kind"] == "node":
                     if phase == "build" and e.get("parent") == "0":
                         build_probes.append(int(e["probes"]))
-                    if phase != "measure":
+                    if not measured:
                         continue
                     node_lookups[e["lookup_id"]] = {
                         "parent": e.get("parent", "0"), "probes": int(e["probes"]),
                         "hops": int(e.get("hops", 0)), "exact": truthy(e["exact_match"]),
                         "us": int(e.get("duration_us", 0)),
                     }
-                elif phase == "measure":
+                elif measured:
                     value_lookups.append({
                         "id": e["lookup_id"], "probes": int(e["probes"]), "success": truthy(e["success"]),
                         "us": int(e.get("duration_us", 0)),
@@ -187,6 +192,7 @@ def parse_run(path):
         "churn_leaves": churn_leaves,
         "joins": dict(joins),
         "build_probes_mean": statistics.mean(build_probes) if build_probes else None,
+        "background_lookups": background_lookups,
     }
 
 
@@ -264,10 +270,12 @@ def run_metrics(run):
         "replicas_in_k_closest": mean([c for _, c in run["stored"]]) / 10 if run["stored"] else float("nan"),
         "holders_mean": mean([h for h, _ in run["stored"]]),
         "churned_fraction": run["churn_leaves"] / nodes,
+        "background_lookups_per_s": run.get("background_lookups", 0) / max(1.0, param(run, "duration_s")),
     }
 
 
-PARAMS = ["nodes", "loss", "latency_ms", "alpha", "churn", "liveness_s", "refresh", "duration_s", "lookups"]
+PARAMS = ["nodes", "loss", "latency_ms", "alpha", "churn", "liveness_s", "republish_s", "refresh", "duration_s",
+          "lookups"]
 
 
 def param(run, key):
@@ -833,76 +841,92 @@ def churn(runs, report):
     report.section(
         "Lookup reliability vs churn",
         "During a paced measurement window, c random nodes per second leave (stop "
-        "answering, without notice) and as many new ones join. Values were stored "
-        "once before churn and nothing republishes them, so a value disappears once "
-        "every node holding it has left. A node survives t seconds with probability "
-        "about e<sup>−ct/N</sup>, so a value with h holders is still available with "
-        "probability 1 − (1 − e<sup>−ct/N</sup>)<sup>h</sup>. Lookups can also fail "
-        "while the value exists, when routing tables still point at departed nodes; "
-        "the liveness interval decides how long those dead contacts linger.")
+        "answering, without notice) and as many new ones join. Values are stored "
+        "once before churn. Without republishing, a value disappears once every "
+        "node holding it has left: a node survives t seconds with probability about "
+        "e<sup>−ct/N</sup>, so a value with h holders is still available with "
+        "probability 1 − (1 − e<sup>−ct/N</sup>)<sup>h</sup>. With republishing "
+        "every T seconds, each surviving holder copies the value back onto the "
+        "current K closest, so a value is lost only if all K holders leave within "
+        "one interval, (1 − e<sup>−cT/N</sup>)<sup>K</sup> per interval. Lookups "
+        "can also fail while the value exists, when routing tables still point at "
+        "departed nodes; the liveness interval decides how long those linger.")
     rates = values_of(runs, "churn", "churn")
-    livenesses = values_of(runs, "churn", "liveness_s")
+    variants = [k[1:] for k in group(runs, "churn", ["churn", "liveness_s", "republish_s"])]
+    variants = sorted(set(variants))
+
+    def label(live, republish):
+        window = max(param(r, "duration_s") for r in runs if r["experiment"] == "churn")
+        rep_text = "no republish" if republish >= window else f"republish {republish:g} s"
+        return f"liveness {live:g} s, {rep_text}"
 
     for metric, ylabel, title, name in [
         ("value_success", "value lookup success", "Value lookups vs churn", "churn_value"),
+        ("value_available", "value still held by a live node", "Value availability vs churn",
+         "churn_available"),
         ("value_success_given_available", "success when the value still exists",
          "Routing reliability vs churn", "churn_routing"),
         ("node_success", "node lookup finds target", "Node lookups vs churn", "churn_node"),
         ("node_recall", "recall of true K closest", "Node lookup recall vs churn", "churn_recall"),
         ("node_ms_median", "median node lookup time, ms", "Lookup time vs churn", "churn_time"),
+        ("node_probes", "probes per node lookup", "Probes vs churn", "churn_probes"),
     ]:
         fig, ax = plt.subplots(figsize=(7, 4.4))
-        for i, live in enumerate(livenesses):
-            x, m, s = series(runs, "churn", "churn", metric, {"liveness_s": live})
-            band(ax, x, m, s, SERIES[i], f"liveness every {live:g} s", marker="os"[i % 2])
-        if metric == "value_success":
-            x, m, s = series(runs, "churn", "churn", "value_available")
-            band(ax, x, m, s, INK_2, "value still held somewhere", marker="^", linestyle=":")
+        for i, (live, republish) in enumerate(variants):
+            x, m, s = series(runs, "churn", "churn", metric, {"liveness_s": live, "republish_s": republish})
+            band(ax, x, m, s, SERIES[i], label(live, republish), marker="os^D"[i % 4])
         ax.set_xlabel("churn, nodes replaced per second")
         ax.set_ylabel(ylabel)
+        if metric not in ("node_ms_median", "node_probes"):
+            ax.set_ylim(-0.02, 1.02)
         ax.set_title(title)
-        ax.legend()
+        ax.legend(fontsize=8)
         report.save(fig, name, f"{ylabel} vs churn rate over the whole window, ±1 std over seeds.")
 
-    # Over time, against the availability model.
-    live = min(livenesses)
-    groups = group(runs, "churn", ["churn", "liveness_s"])
+    # Over time, against the availability model, one panel per variant.
+    groups = group(runs, "churn", ["churn", "liveness_s", "republish_s"])
     colors = ramp(len(rates))
-    for kind, name, title in [("success", "churn_success_time", "Value lookup success over time"),
-                              ("available", "churn_available_time", "Value availability over time vs model")]:
-        fig, ax = plt.subplots(figsize=(7, 4.4))
-        for c, rate_ in zip(colors, rates):
-            members = groups.get((rate_, live), [])
-            if not members:
-                continue
-            duration = param(members[0], "duration_s") or 1
-            n = param(members[0], "nodes")
-            bins = np.linspace(0, duration * 1000, 11)
-            ops = pooled(members, lambda r: r["ops_value"])
-            t = np.array([o["t"] for o in ops])
-            y = np.array([o[kind] for o in ops], dtype=float)
-            centers, means = [], []
-            for lo, hi in zip(bins[:-1], bins[1:]):
-                sel = (t >= lo) & (t < hi)
-                if sel.any():
-                    centers.append((lo + hi) / 2000)
-                    means.append(y[sel].mean())
-            ax.plot(centers, means, color=c, marker="o", label=f"c = {rate_:g}/s")
-            if kind == "available" and rate_ > 0:
-                h = mean(pooled(members, lambda r: [hh for hh, _ in r["stored"]])) or K
-                ts = np.linspace(0, duration, 100)
-                ax.plot(ts, 1 - (1 - np.exp(-rate_ * ts / n)) ** h, color=c, linestyle=":", linewidth=1.3)
-        ax.set_xlabel("seconds into the churn window")
-        ax.set_ylabel(kind)
-        ax.set_ylim(-0.02, 1.02)
-        ax.set_title(title + f" (liveness {live:g} s)")
-        ax.legend(fontsize=8, ncol=2)
-        report.save(fig, name, "Binned into tenths of the window, seeds pooled. Dotted lines: availability "
-                    "model with h = the mean number of holders at store time." if kind == "available"
-                    else "Binned into tenths of the window, seeds pooled.")
-    report.table(summary_table(runs, "churn", ["liveness_s", "churn"],
+    for kind, title in [("available", "Availability over time"), ("success", "Value lookup success over time")]:
+        fig, axes = plt.subplots(1, len(variants), figsize=(5 * len(variants), 4.2), sharey=True, squeeze=False)
+        for ax, (live, republish) in zip(axes[0], variants):
+            for c, rate_ in zip(colors, rates):
+                members = groups.get((rate_, live, republish), [])
+                if not members:
+                    continue
+                duration = param(members[0], "duration_s") or 1
+                n = param(members[0], "nodes")
+                bins = np.linspace(0, duration * 1000, 11)
+                ops = pooled(members, lambda r: r["ops_value"])
+                t = np.array([o["t"] for o in ops])
+                y = np.array([o[kind] for o in ops], dtype=float)
+                centers, means = [], []
+                for lo, hi in zip(bins[:-1], bins[1:]):
+                    sel = (t >= lo) & (t < hi)
+                    if sel.any():
+                        centers.append((lo + hi) / 2000)
+                        means.append(y[sel].mean())
+                ax.plot(centers, means, color=c, marker="o", markersize=4, label=f"c = {rate_:g}/s")
+                if kind == "available" and rate_ > 0:
+                    ts = np.linspace(0, duration, 100)
+                    if republish >= duration:
+                        h = mean(pooled(members, lambda r: [hh for hh, _ in r["stored"]])) or K
+                        model = 1 - (1 - np.exp(-rate_ * ts / n)) ** h
+                    else:
+                        per_interval = (1 - np.exp(-rate_ * republish / n)) ** K
+                        model = (1 - per_interval) ** (ts / republish)
+                    ax.plot(ts, model, color=c, linestyle=":", linewidth=1.3)
+            ax.set_title(label(live, republish), fontsize=10)
+            ax.set_xlabel("seconds into the churn window")
+            ax.set_ylim(-0.02, 1.02)
+        axes[0][0].set_ylabel(kind)
+        axes[0][-1].legend(fontsize=8, ncol=2)
+        fig.suptitle(title, x=0.01, ha="left", fontweight="bold", color=INK)
+        report.save(fig, f"churn_{kind}_time", f"{title}, binned into tenths of the window, seeds pooled."
+                    + (" Dotted: the availability model for each rate." if kind == "available" else ""))
+
+    report.table(summary_table(runs, "churn", ["republish_s", "liveness_s", "churn"],
                                ["value_success", "value_available", "value_success_given_available",
-                                "node_success", "churned_fraction"]))
+                                "node_success", "background_lookups_per_s"]))
 
 
 def setup_html(runs):

@@ -47,6 +47,7 @@ BASE = {
     "churn": 0.0,
     "concurrency": 16,
     "liveness-secs": 60,
+    "republish-secs": 3600,  # the node's default; never fires inside a run
     "settle-secs": 2,
     "refresh": 0,
 }
@@ -112,7 +113,8 @@ def experiments(suite: str):
             Experiment("loss", "success vs loss", {"loss": [0.0, 0.5, 0.9]}, 2, {"nodes": 300, "lookups": 100}),
             Experiment("latency", "time vs latency", {"latency-ms": [1, 50, 300], "loss": [0.0, 0.3]}, 1, {"nodes": 300, "lookups": 100}),
             Experiment("alpha", "probes vs alpha", {"alpha": [1, 3, 6], "loss": [0.0, 0.3]}, 1, {"nodes": 300, "lookups": 100}),
-            Experiment("churn", "reliability vs churn", {"churn": [0, 2, 10], "liveness-secs": [10]}, 1,
+            Experiment("churn", "reliability vs churn",
+                       {"churn": [0, 2, 10], "liveness-secs": [10], "republish-secs": [3600, 10]}, 1,
                        {"nodes": 300, "lookups": 150, "duration-secs": 30}),
         ]
     return [
@@ -136,10 +138,12 @@ def experiments(suite: str):
         Experiment("alpha", "Probes and lookup time vs alpha",
                    {"alpha": [1, 2, 3, 4, 5, 6, 8, 10], "loss": [0.0, 0.3]}, 8, {"nodes": 2000}),
         # Optional: reliability under churn, paced over ten minutes so the
-        # churn has time to act. Two liveness intervals: how fast dead
-        # contacts get noticed matters as much as how fast nodes die.
+        # churn has time to act. Two liveness intervals (how fast dead
+        # contacts get noticed) and republishing off (the 1 h default, which
+        # never fires in the window) or every minute.
         Experiment("churn", "Lookup reliability vs churn rate",
-                   {"churn": [0, 0.5, 1, 2, 5, 10, 20], "liveness-secs": [10, 60]}, 5,
+                   {"churn": [0, 0.5, 1, 2, 5, 10, 20], "liveness-secs": [10, 60],
+                    "republish-secs": [3600, 60]}, 4,
                    {"lookups": 1500, "duration-secs": 600}),
     ]
 
