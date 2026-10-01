@@ -55,7 +55,7 @@ where
             break;
         };
         // removes self from contacts, we must never be our own candidate
-        // TODO: add test for it?
+        // (tested by bootstrap::tests::bootstrap_never_returns_us)
         new_contacts.retain(|c| c.id != my_id);
 
         // every contact a response teaches us about is worth offering to the

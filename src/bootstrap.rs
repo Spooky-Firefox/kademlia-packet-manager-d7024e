@@ -273,4 +273,34 @@ mod tests {
         );
         assert!(rpc.close_nodes().close_nodes(MY_ID).is_empty());
     }
+
+    #[tokio::test]
+    async fn bootstrap_never_returns_us() {
+        // A real seed learns us from our request before it answers, so its
+        // FIND_NODE reply lists us too.
+        let neighbour = Contact {
+            id: [3u8; 32],
+            address: "127.0.0.1:8001".parse().unwrap(),
+        };
+        let rpc = rpc_with(FakeTransport::new(SEED_ID, vec![me(), neighbour]));
+
+        let found = bootstrap(&rpc, seed_addr()).await.unwrap();
+
+        assert!(found.contains(&neighbour));
+        assert!(!found.iter().any(|contact| contact.id == MY_ID));
+    }
+
+    #[test]
+    fn random_id_in_bucket_lands_in_that_bucket() {
+        for bucket in [0, 1, 7, 8, 9, 100, 255] {
+            for _ in 0..100 {
+                let target = random_id_in_bucket(MY_ID, bucket);
+                assert_eq!(
+                    leading_zeros(xor_distance(target, MY_ID)),
+                    bucket as u32,
+                    "bucket {bucket}"
+                );
+            }
+        }
+    }
 }
