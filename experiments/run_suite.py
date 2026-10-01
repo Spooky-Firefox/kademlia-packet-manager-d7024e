@@ -231,8 +231,10 @@ def main():
         nonlocal stopping
         stopping = True
 
-    signal.signal(signal.SIGTERM, stop)
-    signal.signal(signal.SIGINT, stop)
+    # SIGHUP too: closing the tmux session must stop the runs, which sit in
+    # sessions of their own and would not get the hangup themselves.
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, stop)
     started_all = time.time()
 
     while (todo and not stopping) or running:
