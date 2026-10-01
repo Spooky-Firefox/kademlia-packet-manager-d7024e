@@ -54,6 +54,8 @@ where
         let Some(mut new_contacts) = in_flight.next().await else {
             break;
         };
+        // removes self from contacts, we must never be our own candidate
+        // TODO: add test for it?
         new_contacts.retain(|c| c.id != my_id);
 
         // every contact a response teaches us about is worth offering to the
