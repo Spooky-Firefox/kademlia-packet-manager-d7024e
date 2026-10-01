@@ -1,6 +1,6 @@
 //! Joining an existing network through a node already in it (the seed).
 
-use crate::close_nodes::{CloseNodes, Contact};
+use crate::close_nodes::{CloseNodes, Contact, NodeId, leading_zeros, xor_distance};
 use crate::lookup;
 use crate::rpc::Rpc;
 use crate::rpc_transport::RpcTransport;
@@ -29,7 +29,11 @@ impl std::error::Error for BootstrapError {}
 /// We only know the seed's address, so we PING it to learn its id and add it
 /// to our routing table. Then we look up our own id: the lookup fills our
 /// table with the nodes closest to us, and since every request carries our
-/// id, each node we query learns about us too.
+/// id, each node we query learns about us too. Finally we refresh every bucket
+/// farther away than our closest neighbour, so the far side of the keyspace
+/// isn't left with a contact or two.
+///
+/// The returned contacts are from the self-lookup only.
 ///
 /// # Errors
 ///
@@ -61,10 +65,35 @@ where
         address: seed,
     });
 
-    // TODO: after the self-lookup, refresh each bucket farther away than our
-    // closest neighbour by looking up a random id in it, as the Kademlia
-    // paper's join does. The self-lookup alone leaves the far buckets thin.
-    Ok(lookup::lookup_node(rpc, rpc.my_id()).await)
+    let contacts = lookup::lookup_node(rpc, rpc.my_id()).await;
+
+    let Some(closest_neighbour) = contacts.first() else {
+        return Ok(contacts);
+    };
+    let cn_distance = xor_distance(closest_neighbour.id, rpc.my_id());
+    let cn_leading_zeroes = leading_zeros(cn_distance);
+
+    // The self-lookup only fills the buckets near us. As in the Kademlia
+    // paper's join, refresh every bucket farther away than our closest
+    // neighbour (lower index = farther) by looking up a random id in it.
+    for bucket in 0..cn_leading_zeroes {
+        let target = random_id_in_bucket(rpc.my_id(), bucket as usize);
+        lookup::lookup_node(rpc, target).await;
+    }
+
+    Ok(contacts)
+}
+
+/// A random id that shares exactly `bucket` leading bits with `my_id`, so it
+/// falls in that bucket. Builds the XOR distance first (`bucket` zero bits,
+/// then a one, then random bits) and XORs it onto `my_id`.
+// TODO: add test
+fn random_id_in_bucket(my_id: NodeId, bucket: usize) -> NodeId {
+    let mut distance: NodeId = rand::random();
+    distance[..bucket / 8].fill(0);
+    distance[bucket / 8] &= 0xFF >> (bucket % 8);
+    distance[bucket / 8] |= 0x80 >> (bucket % 8);
+    xor_distance(my_id, distance)
 }
 
 #[cfg(test)]
@@ -243,5 +272,35 @@ mod tests {
             Err(BootstrapError::SelfSeed)
         );
         assert!(rpc.close_nodes().close_nodes(MY_ID).is_empty());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_never_returns_us() {
+        // A real seed learns us from our request before it answers, so its
+        // FIND_NODE reply lists us too.
+        let neighbour = Contact {
+            id: [3u8; 32],
+            address: "127.0.0.1:8001".parse().unwrap(),
+        };
+        let rpc = rpc_with(FakeTransport::new(SEED_ID, vec![me(), neighbour]));
+
+        let found = bootstrap(&rpc, seed_addr()).await.unwrap();
+
+        assert!(found.contains(&neighbour));
+        assert!(!found.iter().any(|contact| contact.id == MY_ID));
+    }
+
+    #[test]
+    fn random_id_in_bucket_lands_in_that_bucket() {
+        for bucket in [0, 1, 7, 8, 9, 100, 255] {
+            for _ in 0..100 {
+                let target = random_id_in_bucket(MY_ID, bucket);
+                assert_eq!(
+                    leading_zeros(xor_distance(target, MY_ID)),
+                    bucket as u32,
+                    "bucket {bucket}"
+                );
+            }
+        }
     }
 }
