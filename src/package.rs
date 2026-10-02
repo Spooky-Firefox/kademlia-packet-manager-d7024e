@@ -23,6 +23,14 @@ struct VersionRecord {
     prev: Key,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LatestPointer {
+    domain: String,              // "rfin.ch"
+    package: String,             // "java-pair"
+    version: Version,            // 1.1.0
+    version_record_hash: Key,    // which record is the newest
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct ParseVersionError;
 
@@ -55,7 +63,7 @@ impl std::fmt::Display for Version {
 
 #[cfg(test)]
 mod tests {
-    use crate::package::{ParseVersionError, Signed, Version, VersionRecord};
+    use crate::package::{LatestPointer, ParseVersionError, Signed, Version, VersionRecord};
     #[test]
     fn version_ordering() {
         let a: Version = "1.9.0".parse().unwrap();
@@ -111,6 +119,25 @@ mod tests {
 
         let bytes = bincode::serialize(&signed).unwrap();
         let decoded: Signed<VersionRecord> = bincode::deserialize(&bytes).unwrap();
+
+        assert_eq!(decoded, signed);
+    }
+
+    #[test]
+    fn signed_latest_pointer_survives_the_wire() {
+        let latest_pointer = LatestPointer {
+            domain: "rfin.ch".to_string(),
+            package: "java-pair".to_string(),
+            version: "1.0.0".parse().unwrap(),
+            version_record_hash: [2; 32],
+        };
+        let signed = Signed {
+            body: latest_pointer,
+            sig: Vec::new(),
+        };
+
+        let bytes = bincode::serialize(&signed).unwrap();
+        let decoded: Signed<LatestPointer> = bincode::deserialize(&bytes).unwrap();
 
         assert_eq!(decoded, signed);
     }
