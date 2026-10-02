@@ -75,7 +75,7 @@ impl<T: DataRxTx + Send + Sync + 'static> RetryTransport<T> {
         let pending = Pending::new();
         let pending_clone = pending.clone();
         // TODO deal with spawn handle
-        tokio::spawn(async move {
+        crate::node_scope::spawn(async move {
             let mut buf = vec![0u8; 1024];
             loop {
                 let (len, addr) = match socket_clone.receive_packet(&mut buf).await {

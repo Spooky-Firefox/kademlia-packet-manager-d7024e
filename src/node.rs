@@ -2,6 +2,7 @@ use crate::close_nodes::{Contact, Key, NodeId, RecommendedCloseNodes, recommende
 use crate::handle_rpc::{self, Context};
 use crate::hashing::node_id_from_address;
 use crate::maintenance;
+use crate::node_scope;
 use crate::rpc::Rpc;
 use crate::rpc_transport::RpcTransport;
 use crate::rpc_transport::networked_debug_transport::{
@@ -11,7 +12,7 @@ use crate::rpc_transport::tcp_transport::TcpTransport;
 use crate::rpc_transport::udp_transport::UdpTransport;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc;
@@ -28,7 +29,24 @@ where
     address: SocketAddr,
     rpc: NodeRpc<T, U>,
     context: Arc<Context<Arc<RecommendedCloseNodes>>>,
-    _server_tasks: Vec<JoinHandle<()>>,
+    /// The fake wire this node is on, so [`FakeNode::shutdown`] can take it
+    /// off. `None` for a real node.
+    network: Option<Network>,
+    /// Everything spawned on the node's behalf that would otherwise outlive
+    /// it: aborted when the node is dropped.
+    tasks: Mutex<Vec<JoinHandle<()>>>,
+}
+
+impl<T, U> Drop for Node<T, U>
+where
+    T: RpcTransport,
+    U: RpcTransport,
+{
+    fn drop(&mut self) {
+        for task in self.tasks.get_mut().unwrap().drain(..) {
+            task.abort();
+        }
+    }
 }
 pub type RealNode = Node<UdpTransport, TcpTransport>;
 pub type FakeNode = Node<NetworkedDebugTransport, NetworkedStreamTransport>;
@@ -55,6 +73,12 @@ where
 
     pub fn rpc(&self) -> &NodeRpc<T, U> {
         &self.rpc
+    }
+
+    /// Run `future` as this node, so what it logs is tagged with this node's
+    /// address. See [`node_scope`](crate::node_scope).
+    pub async fn scoped<F: Future>(&self, future: F) -> F::Output {
+        node_scope::scope(self.address, future).await
     }
 
     pub fn routing_snapshot(&self) -> (Vec<Contact>, Vec<(usize, Vec<Contact>)>) {
@@ -89,14 +113,14 @@ where
         republish_interval: std::time::Duration,
         liveness_check_interval: std::time::Duration,
     ) {
-        // TODO deal with the spawn handles
         let rpc = Arc::clone(&self.rpc);
-        let _liveness_task = tokio::spawn(async move {
+        let liveness_task = tokio::spawn(node_scope::scope(self.address, async move {
             loop {
                 tokio::time::sleep(maintenance::jittered(liveness_check_interval)).await;
                 maintenance::check_liveness(&rpc).await;
             }
-        });
+        }));
+        self.tasks.lock().unwrap().push(liveness_task);
 
         let rpc = Arc::clone(&self.rpc);
         let context = Arc::clone(&self.context);
@@ -126,35 +150,39 @@ impl RealNode {
 
         let tcp_listener = TcpListener::bind(address).await?;
 
-        let routing = Arc::new(recommended(id));
+        // Everything the node spawns from here on is tagged as it.
+        Ok(node_scope::sync_scope(address, || {
+            let routing = Arc::new(recommended(id));
 
-        let context = Context::new(id, Arc::clone(&routing));
+            let context = Context::new(id, Arc::clone(&routing));
 
-        let (request_tx, request_rx) = mpsc::channel(64);
+            let (request_tx, request_rx) = mpsc::channel(64);
 
-        let udp_transport = UdpTransport::with_requests(udp_socket, request_tx);
+            let udp_transport = UdpTransport::with_requests(udp_socket, request_tx);
 
-        let server_task = tokio::spawn(handle_rpc::serve(
-            Arc::clone(&context),
-            request_rx,
-            udp_transport.socket(),
-            tcp_listener,
-        ));
+            let server_task = node_scope::spawn(handle_rpc::serve(
+                Arc::clone(&context),
+                request_rx,
+                udp_transport.socket(),
+                tcp_listener,
+            ));
 
-        let rpc = Arc::new(Rpc::new(
-            Contact { id, address },
-            udp_transport,
-            TcpTransport,
-            Arc::clone(&routing),
-        ));
+            let rpc = Arc::new(Rpc::new(
+                Contact { id, address },
+                udp_transport,
+                TcpTransport,
+                Arc::clone(&routing),
+            ));
 
-        Ok(Self {
-            id,
-            address,
-            rpc,
-            context,
-            _server_tasks: vec![server_task],
-        })
+            Self {
+                id,
+                address,
+                rpc,
+                context,
+                network: None,
+                tasks: Mutex::new(vec![server_task]),
+            }
+        }))
     }
 }
 impl FakeNode {
@@ -164,38 +192,55 @@ impl FakeNode {
 
         let id = node_id_from_address(address);
 
-        let routing = Arc::new(recommended(id));
+        // Everything the node spawns from here on is tagged as it.
+        node_scope::sync_scope(address, || {
+            let routing = Arc::new(recommended(id));
 
-        let context = Context::new(id, Arc::clone(&routing));
+            let context = Context::new(id, Arc::clone(&routing));
 
-        let (request_tx, request_rx) = mpsc::channel(64);
+            let (request_tx, request_rx) = mpsc::channel(64);
 
-        let datagram_transport = NetworkedDebugTransport::with_requests(endpoint, request_tx);
+            let datagram_transport = NetworkedDebugTransport::with_requests(endpoint, request_tx);
 
-        let shared_endpoint = datagram_transport.socket();
+            let shared_endpoint = datagram_transport.socket();
 
-        let server_task = tokio::spawn(handle_rpc::serve(
-            Arc::clone(&context),
-            request_rx,
-            Arc::clone(&shared_endpoint),
-            shared_endpoint,
-        ));
+            let server_task = node_scope::spawn(handle_rpc::serve(
+                Arc::clone(&context),
+                request_rx,
+                Arc::clone(&shared_endpoint),
+                shared_endpoint,
+            ));
 
-        let stream_transport = NetworkedStreamTransport::new(network.clone());
+            let stream_transport = NetworkedStreamTransport::new(network.clone());
 
-        let rpc = Arc::new(Rpc::new(
-            Contact { id, address },
-            datagram_transport,
-            stream_transport,
-            Arc::clone(&routing),
-        ));
+            let rpc = Arc::new(Rpc::new(
+                Contact { id, address },
+                datagram_transport,
+                stream_transport,
+                Arc::clone(&routing),
+            ));
 
-        Self {
-            id,
-            address,
-            rpc,
-            context,
-            _server_tasks: vec![server_task],
+            Self {
+                id,
+                address,
+                rpc,
+                context,
+                network: Some(network.clone()),
+                tasks: Mutex::new(vec![server_task]),
+            }
+        })
+    }
+
+    /// Take the node off the network, as if its host went down: it stops
+    /// answering, its address is freed, and its receive and serve loops wind
+    /// down. Its remaining tasks are aborted once the node is dropped.
+    ///
+    /// Dropping the node alone would not do it. The transport's receive loop
+    /// holds the endpoint, so the address would stay bound and keep being
+    /// served.
+    pub fn shutdown(&self) {
+        if let Some(network) = &self.network {
+            network.unbind(self.address);
         }
     }
 }
@@ -336,6 +381,21 @@ mod tests {
 
         assert_eq!(a.rpc().ping(b.address()).await, Some(b.id()));
     }
+    #[tokio::test]
+    async fn a_shut_down_fake_node_stops_answering_and_frees_its_address() {
+        let network = Network::new();
+
+        let a = FakeNode::new(&network);
+        let b = FakeNode::new(&network);
+        let b_address = b.address();
+        assert_eq!(a.rpc().ping(b_address).await, Some(b.id()));
+
+        b.shutdown();
+
+        assert_eq!(a.rpc().ping(b_address).await, None);
+        assert!(network.bind(b_address).is_some());
+    }
+
     #[tokio::test]
     async fn fake_node_can_discover_another_node_through_lookup() {
         let network = Network::new();
