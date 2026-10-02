@@ -20,14 +20,25 @@ use crate::close_nodes::{Contact, NodeId};
 use log::info;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 
 static NEXT_LOOKUP_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Whether [`rpc_end`] writes anything. Off by default: every liveness ping
-/// is an RPC, so a large network would otherwise fill the log with them.
-static RPC_EVENTS: AtomicBool = AtomicBool::new(false);
+/// Which RPCs [`rpc_end`] writes, as a [`RpcEvents`] discriminant. Off by
+/// default: every liveness ping is an RPC, so a large network would
+/// otherwise fill the log with them.
+static RPC_EVENTS: AtomicU8 = AtomicU8::new(RpcEvents::Off as u8);
+
+/// Which RPCs get an [`rpc_end`] line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RpcEvents {
+    Off = 0,
+    /// Only those made inside a [`with_op`]: what an experiment measures.
+    Ops = 1,
+    /// Every one, background traffic included.
+    All = 2,
+}
 
 tokio::task_local! {
     static OP: u64;
@@ -48,13 +59,18 @@ pub fn next_lookup_id() -> u64 {
     NEXT_LOOKUP_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Turn [`rpc_end`] events on or off, for the whole process.
-pub fn set_rpc_events(enabled: bool) {
-    RPC_EVENTS.store(enabled, Ordering::Relaxed);
+/// Choose which RPCs get [`rpc_end`] lines, for the whole process.
+pub fn set_rpc_events(which: RpcEvents) {
+    RPC_EVENTS.store(which as u8, Ordering::Relaxed);
 }
 
+/// Whether an RPC finishing in the running code should be logged.
 pub fn rpc_events() -> bool {
-    RPC_EVENTS.load(Ordering::Relaxed)
+    match RPC_EVENTS.load(Ordering::Relaxed) {
+        2 => true,
+        1 => current_op() != 0,
+        _ => false,
+    }
 }
 
 fn encode_id(id: NodeId) -> String {
@@ -174,9 +190,15 @@ mod tests {
         assert_eq!(current_op(), 0);
     }
 
-    #[test]
-    fn rpc_events_can_be_toggled() {
-        set_rpc_events(true);
+    /// The only test that touches the process-wide setting, so the steps run
+    /// in order here rather than racing each other.
+    #[tokio::test]
+    async fn rpc_events_follow_the_setting() {
+        set_rpc_events(RpcEvents::Ops);
+        assert!(!rpc_events(), "background work is not an op");
+        assert!(with_op(3, async { rpc_events() }).await);
+
+        set_rpc_events(RpcEvents::All);
         assert!(rpc_events());
         // Logging with no logger installed is a no-op, but runs the formatting.
         rpc_end(
@@ -186,8 +208,9 @@ mod tests {
             true,
             Duration::from_millis(3),
         );
-        set_rpc_events(false);
+        set_rpc_events(RpcEvents::Off);
         assert!(!rpc_events());
+        assert!(!with_op(3, async { rpc_events() }).await);
         rpc_end(
             "PING",
             "127.0.0.1:1".parse().unwrap(),

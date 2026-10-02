@@ -3,7 +3,8 @@
 Scripts and a harness for the experimental evaluation: lookup scalability vs
 N, lookup reliability vs packet loss (both mandatory), and, optionally,
 request/response time vs latency and loss, probes and time vs α, and
-reliability vs churn.
+reliability vs churn, plus heatmaps and 3D surfaces over two parameters at
+a time.
 
 | File | What it is |
 |---|---|
@@ -15,14 +16,46 @@ reliability vs churn.
 ## Running it
 
 ```sh
-experiments/start.sh                     # the full suite (~7-10 h on 6 cores), then analysis
+experiments/start.sh                     # the full suite (~16-24 h), then analysis
 tmux attach -t kademlia-experiments      # watch; Ctrl-b d detaches again
 tail -f experiments/results/suite.log    # or follow the log
 ```
 
 The suite survives a dropped SSH session because it runs inside tmux. If it
-is stopped anyway (reboot, `tmux kill-session`), run the same command again:
-every run whose directory has a `DONE` file is skipped.
+is stopped anyway (reboot, `tmux kill-session`), run the same command again.
+A run is skipped if its directory has a `DONE` file and its `params.json`
+matches the run's current settings exactly. Changing any setting, including
+a fixed one like the network size, therefore re-runs the affected runs.
+
+Up to 8 runs go at once, as long as their estimated memory (about 0.26 MB
+per node) stays under 7000 MB. `--jobs` and `--mem-budget-mb` change these
+limits.
+
+## What the suite runs
+
+Every experiment states its own network size in `experiments/run_suite.py`.
+Each configuration is repeated with the listed number of seeds.
+
+| Experiment | Nodes N | Varies | Seeds |
+|---|---|---|---|
+| `scalability` | 16 … 16384, doubling | N | 10 |
+| `scalability_refresh` | 16 … 16384, ×4 steps | N, with bucket refresh after join | 5 |
+| `loss` | 5000 | loss 0 … 0.95 | 10 |
+| `latency` | 5000 | one-way latency 0 … 600 ms × loss {0, 0.3} | 5 |
+| `alpha` | 5000 | α 1 … 10 × loss {0, 0.3} | 8 |
+| `churn` | 5000 | churn 0 … 100 nodes/s × liveness {10, 60 s} × republish {off, 60 s}, 10 min | 4 |
+| `heat_loss_size` | 250 … 16000 | N × loss 0 … 0.9 | 3 |
+| `heat_alpha_size` | 250 … 16000 | N × α 1 … 10 | 3 |
+| `heat_latency_loss` | 2000 | latency 0 … 600 ms × loss 0 … 0.8 | 3 |
+| `heat_churn_republish` | 2000 | churn 0 … 40/s × republish 15 s … 1 h, 5 min | 3 |
+| `heat_churn_liveness` | 2000 | churn 0 … 40/s × liveness 5 … 80 s, 5 min | 3 |
+
+Each report section begins with a "What the numbers mean" box. It turns
+the measured and modelled numbers into sentences, for example how long a
+churn rate takes to replace the whole network, or at what loss rate lookups
+stop succeeding. The heatmap sections also put a model heatmap next to a
+measured one where a model exists (RPC success over latency × loss, value
+availability over churn × republish).
 
 Other forms:
 
@@ -70,7 +103,7 @@ across them.
 
 **Phases.** Each run goes through these phases, logged as `event=phase` lines:
 
-1. *build*: lossless wire; all N nodes join.
+1. *build*: lossless wire, latency at most 5 ms; all N nodes join.
 2. *refresh* (only in `scalability_refresh`): each node looks up 4 random
    ids. This stands in for the bucket refresh that `bootstrap` does not do
    yet (see the TODO in `src/bootstrap.rs`).
@@ -78,7 +111,8 @@ across them.
 4. *store*: still lossless. `--values` values are stored from random nodes.
    Then the run counts how many nodes hold each value, and how many of the
    K nodes truly closest to its key do.
-5. *measure*: the wire's loss is set to `--loss`, and churn starts if
+5. *measure*: the wire's loss is set to `--loss` and its latency to
+   `--latency-ms`, and churn starts if
    requested. Then `--lookups` value lookups and the same number of node
    lookups run, alternating, 16 at a time. In churn runs they are instead
    started at an even pace over `--duration-secs`.
@@ -87,10 +121,12 @@ Only lookups the harness starts during *measure* are counted. Each one runs
 inside `instrumentation::with_op`, so its `lookup_end` and `rpc` lines carry
 the same `op=` as the `event=op` line that reports it. Background work
 (republishing, liveness pings, joins under churn) logs `op=0` and is left
-out of the lookup statistics. Loss is switched on only
-after the network is built and the values stored, so the loss experiment
-measures lookups and is not confounded by a network that formed badly under
-loss.
+out of the lookup statistics. Loss and latency are applied only after the
+network is built and the values stored. The loss experiment therefore
+measures lookups, not a network that formed badly under loss. And at
+latencies whose round trip outlasts the 1 s retry budget, there is still a
+network to measure: in an earlier version, those runs failed because no
+node could join.
 
 **How things are measured.**
 
@@ -116,8 +152,10 @@ loss.
 - *Time*: wall-clock time from the start of a lookup or RPC to its end,
   measured in the process. For RPCs, the time runs from the first send to
   the reply (or to giving up), and the number of sends is logged too. RPC
-  events are enabled only during *measure*, and are logged for every
-  datagram RPC, liveness pings included.
+  events are enabled only during *measure*, and by default only for the
+  RPCs measured lookups make (`--rpc-events ops`). `--rpc-events all` adds
+  the background traffic, which at 5000 nodes is thousands of liveness
+  pings per second.
 
 **Why these measurements can be trusted.** The probe count comes from the
 lookup code itself. Success and recall are checked against ground truth the
@@ -126,7 +164,7 @@ compared with a closed-form model. At p = 0.5, the model predicts a 25%
 first-attempt success and a 23.7% timeout rate; a test run measured 24.9%
 and 23.6%. The analysis plots this comparison for every loss level
 (`loss_rpc_fail.png`). Times include scheduling delay inside the process, and
-up to 6 runs share the CPU. The simulated latency (5 ms one way by default)
+up to 8 runs share the CPU. The simulated latency (5 ms one way by default)
 and the 200 ms resend timer are much larger than that delay, so timings stay
 meaningful. Even so, read times as approximate and probe counts as exact.
 

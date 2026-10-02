@@ -337,7 +337,11 @@ class Report:
         self.sections = []  # (title, intro, [(png, caption)], [table html])
 
     def section(self, title, intro):
-        self.sections.append({"title": title, "intro": intro, "figures": [], "tables": []})
+        self.sections.append({"title": title, "intro": intro, "figures": [], "tables": [], "notes": []})
+
+    def note(self, text):
+        """A sentence for the section's "what the numbers mean" box: HTML."""
+        self.sections[-1]["notes"].append(text)
 
     def save(self, fig, name, caption):
         fig.tight_layout()
@@ -368,12 +372,20 @@ table {{ border-collapse:collapse; font-size:13px; margin:14px 0; display:block;
 th, td {{ border-bottom:1px solid var(--rule); padding:4px 10px; text-align:right; white-space:nowrap; }}
 th {{ color:var(--ink2); font-weight:600; }}
 code {{ font-size:13px; }}
+.notes {{ border-left:3px solid var(--accent); padding:4px 16px; margin:18px 0; }}
+.notes h3 {{ font-size:14px; margin:8px 0 4px; }}
+.notes table {{ margin:8px 0; }}
 </style></head><body>
 <h1>Kademlia Experiments</h1>
 <nav>{' '.join(f'<a href="#s{i}">{html.escape(s["title"])}</a>' for i, s in enumerate(self.sections))}</nav>
 {setup_html}"""]
         for i, s in enumerate(self.sections):
-            parts.append(f'<h2 id="s{i}">{html.escape(s["title"])}</h2><p>{s["intro"]}</p><div class="grid">')
+            parts.append(f'<h2 id="s{i}">{html.escape(s["title"])}</h2><p>{s["intro"]}</p>')
+            if s["notes"]:
+                items = "".join(f"<li>{n}</li>" for n in s["notes"] if not n.startswith("<table"))
+                tables = "".join(n for n in s["notes"] if n.startswith("<table"))
+                parts.append(f'<div class="notes"><h3>What the numbers mean</h3><ul>{items}</ul>{tables}</div>')
+            parts.append('<div class="grid">')
             for src, caption in s["figures"]:
                 parts.append(f'<figure><img src="{src}" alt="{html.escape(caption)}" loading="lazy">'
                              f'<figcaption>{html.escape(caption)}</figcaption></figure>')
@@ -929,6 +941,518 @@ def churn(runs, report):
                                 "node_success", "background_lookups_per_s"]))
 
 
+# ---------------------------------------------------------------- notes: numbers in words
+
+def duration_text(seconds):
+    """'8 min 20 s', '47 s', '2.3 h'."""
+    if seconds == math.inf:
+        return "never"
+    if seconds >= 3 * 3600:
+        return f"{seconds / 3600:.1f} h"
+    if seconds >= 60:
+        m, s_ = divmod(round(seconds), 60)
+        return f"{m} min {s_} s" if s_ else f"{m} min"
+    return f"{seconds:.0f} s" if seconds >= 10 else f"{seconds:.1f} s"
+
+
+def html_table(head, rows):
+    th = "".join(f"<th>{h}</th>" for h in head)
+    body = "".join("<tr>" + "".join(f"<td>{c}</td>" for c in row) + "</tr>" for row in rows)
+    return f"<table><thead><tr>{th}</tr></thead><tbody>{body}</tbody></table>"
+
+
+def metric_at(runs, experiment, metric, **where):
+    """Mean over seeds of `metric` for the runs matching every `where`."""
+    members = [r for r in runs if r["experiment"] == experiment
+               and all(param(r, k) == v for k, v in where.items())]
+    return across_seeds(members, metric)[0] if members else float("nan")
+
+
+def f2(x, digits=2):
+    return "–" if x is None or (isinstance(x, float) and math.isnan(x)) else f"{x:.{digits}f}"
+
+
+def pct_text(x):
+    return "–" if math.isnan(x) else f"{100 * x:.1f}%"
+
+
+def expected_sends(p, attempts=ATTEMPTS):
+    """Mean sends per datagram RPC: send i happens if sends 1..i-1 all failed."""
+    fail = 1 - (1 - p) ** 2
+    return sum(fail ** i for i in range(attempts))
+
+
+def useful_sends(latency_ms):
+    """Sends whose reply can still arrive before the call gives up: send i
+    goes out at 0.2(i-1) s and its reply lands 2L later, which must be
+    before the 1 s budget ends."""
+    rtt = 2 * latency_ms / 1000
+    return max(0, min(ATTEMPTS, math.ceil((RESEND_S * ATTEMPTS - rtt) / RESEND_S - 1e-9)))
+
+
+def rpc_success_latency(p, latency_ms):
+    return 1 - (1 - (1 - p) ** 2) ** useful_sends(latency_ms)
+
+
+def survival(c, t, n):
+    """Share of the nodes alive at time 0 still alive after t seconds, when
+    c random live nodes per second are replaced in a network of n."""
+    return math.exp(-c * t / n) if n else 0.0
+
+
+def availability_model(c, t, n, republish, holders=K):
+    """Chance a value stored at time 0 is still held somewhere at time t.
+    Without a republish inside [0, t], all `holders` must leave; with one
+    every T seconds, all K holders must leave within a single interval."""
+    if c == 0:
+        return 1.0
+    if republish >= t:
+        return 1 - (1 - survival(c, t, n)) ** holders
+    per_interval = (1 - survival(c, republish, n)) ** K
+    return (1 - per_interval) ** (t / republish)
+
+
+def churn_sentence(c, n, window):
+    turnover = n / c
+    half = n * math.log(2) / c
+    replaced = 1 - survival(c, window, n)
+    return (f"With churn c = {c:g} nodes/s in N = {n:g} nodes ({100 * c / n:.2g}% of the network per second), "
+            f"as many nodes as the whole network have been replaced every {duration_text(turnover)} (N/c). "
+            f"Because a leaving node is drawn from everyone alive, newcomers included, that point only means "
+            f"1 − 1/e ≈ 63% of the nodes are new; half of them are new after N·ln2/c = {duration_text(half)}, "
+            f"and by the end of the {duration_text(window)} window {100 * replaced:.0f}% have been replaced.")
+
+
+def scalability_notes(runs, report):
+    groups = group(runs, "scalability", ["nodes"])
+    rows = []
+    for (n,), members in groups.items():
+        probes = across_seeds(members, "node_probes")[0]
+        hops = across_seeds(members, "node_hops")[0]
+        table = across_seeds(members, "table_mean")[0]
+        rows.append([f"{n:g}", f2(math.log2(n), 1), f"{min(n - 1, K):g}", f2(probes), f2(hops),
+                     f2(hops / math.log2(n)), f2(expected_table_size(n), 0), f2(table, 0)])
+    if len(groups) >= 2:
+        (n0,), (n1,) = list(groups)[0], list(groups)[-1]
+        p0, p1 = metric_at(runs, "scalability", "node_probes", nodes=n0), metric_at(runs, "scalability", "node_probes", nodes=n1)
+        h0, h1 = metric_at(runs, "scalability", "node_hops", nodes=n0), metric_at(runs, "scalability", "node_hops", nodes=n1)
+        doublings = math.log2(n1 / n0)
+        report.note(f"From N = {n0:g} to N = {n1:g} the network grows {n1 / n0:g}× ({doublings:.0f} doublings), "
+                    f"but a lookup only needs {p1 - p0:.1f} more probes ({p0:.1f} → {p1:.1f}, "
+                    f"{(p1 - p0) / doublings:.2f} per doubling) and {h1 - h0:.2f} more hops "
+                    f"({(h1 - h0) / doublings:.2f} per doubling, against 1 per doubling for log₂N).")
+        report.note(f"Hops stay far under log₂N (log₂{n1:g} = {math.log2(n1):.1f}, measured {h1:.2f}): each reply "
+                    f"carries up to K = {K} contacts from the bucket nearest the target, so one hop usually gains "
+                    "several bits of shared prefix, not one.")
+        report.note(f"The floor: a lookup only stops once its K closest candidates have all answered, so it can "
+                    f"never send fewer than min(N−1, K) probes; at N ≤ {K + 1} that is the whole network.")
+    nr = values_of(runs, "scalability_refresh", "nodes")
+    common = [n for n in nr if n in [k[0] for k in groups]]
+    if common:
+        n = common[-1]
+        a = metric_at(runs, "scalability", "node_probes", nodes=n)
+        b = metric_at(runs, "scalability_refresh", "node_probes", nodes=n)
+        ha = metric_at(runs, "scalability", "node_hops", nodes=n)
+        hb = metric_at(runs, "scalability_refresh", "node_hops", nodes=n)
+        report.note(f"Bucket refresh after joining (4 random lookups per node) at N = {n:g}: "
+                    f"{a:.2f} → {b:.2f} probes and {ha:.2f} → {hb:.2f} hops; that difference is what the missing "
+                    "refresh in <code>bootstrap</code> costs.")
+    report.note(html_table(["N", "log₂N", "probe floor", "probes", "hops", "hops / log₂N",
+                            "full table (model)", "table (measured)"], rows))
+
+
+def loss_notes(runs, report):
+    ps = values_of(runs, "loss", "loss")
+    if not ps:
+        return
+    n = values_of(runs, "loss", "nodes")[0]
+    rows = []
+    for p in ps:
+        rows.append([f"{p:g}", pct_text((1 - p) ** 2), pct_text(rpc_success(p)),
+                     pct_text(1 - metric_at(runs, "loss", "find_node_fail_rate", loss=p)),
+                     f2(expected_sends(p)), f2(metric_at(runs, "loss", "find_node_attempts", loss=p)),
+                     pct_text(metric_at(runs, "loss", "value_success", loss=p)),
+                     pct_text(metric_at(runs, "loss", "node_success", loss=p)),
+                     f2(metric_at(runs, "loss", "node_ms_median", loss=p), 0)])
+    value = {p: metric_at(runs, "loss", "value_success", loss=p) for p in ps}
+    node = {p: metric_at(runs, "loss", "node_success", loss=p) for p in ps}
+    safe = [p for p in ps if value[p] >= 0.99]
+    half = [p for p in ps if node[p] < 0.5]
+    report.note(f"Measured in a network of N = {n:g} nodes. Each datagram is lost independently with probability "
+                "p, and an RPC needs a request and its reply to both survive: one send gets through with "
+                "probability (1−p)², and with 5 sends the call succeeds with 1 − (1 − (1−p)²)⁵.")
+    if safe:
+        report.note(f"Value lookups stay at ≥ 99% success up to p = {max(safe):g}, where a single send gets "
+                    f"through only {pct_text((1 - max(safe)) ** 2)} of the time and a whole RPC "
+                    f"{pct_text(rpc_success(max(safe)))}. A lookup sends 10–20 probes, needs only some of them to "
+                    "answer, and has K = 10 replicas to find; FIND_VALUE itself goes over the connection, "
+                    "which loss does not touch.")
+    if half:
+        p = min(half)
+        report.note(f"Node lookups (which must find one specific node) drop below 50% at p = {p:g}, where a "
+                    f"single RPC still succeeds {pct_text(rpc_success(p))} of the time: finding one exact node needs "
+                    "the one path to it to work, finding a value needs any of K.")
+    t0, t5 = metric_at(runs, "loss", "node_ms_median", loss=0.0), metric_at(runs, "loss", "node_ms_median", loss=0.5)
+    if not math.isnan(t0) and not math.isnan(t5):
+        report.note(f"Time pays first: at p = 0.5 lookups still succeed but take {t5 / t0:.0f}× longer "
+                    f"({t0:.0f} → {t5:.0f} ms median), since every lost datagram costs a 200 ms resend wait. "
+                    f"At very high loss the time flattens near ⌈K/α⌉ s = {math.ceil(K / 3)} s: almost every probe times "
+                    "out after the full 1 s, and the lookup works through its ~K starting contacts α = 3 at a time "
+                    "without learning new ones.")
+    report.note(html_table(["p", "one send (1−p)²", "RPC model", "RPC measured", "sends model", "sends measured",
+                            "value lookup", "node lookup", "median node ms"], rows))
+
+
+def latency_notes(runs, report):
+    ls = values_of(runs, "latency", "latency_ms")
+    if not ls:
+        return
+    n = values_of(runs, "latency", "nodes")[0]
+    rows = []
+    for L in ls:
+        rows.append([f"{L:g}", f"{2 * L:g}", str(useful_sends(L)), pct_text(rpc_success_latency(0, L)),
+                     f2(metric_at(runs, "latency", "find_node_rtt_ms", latency_ms=L, loss=0.0), 0),
+                     f2(metric_at(runs, "latency", "find_node_attempts", latency_ms=L, loss=0.0)),
+                     pct_text(metric_at(runs, "latency", "value_success", latency_ms=L, loss=0.0)),
+                     pct_text(metric_at(runs, "latency", "value_success", latency_ms=L, loss=0.3))])
+    configs = [r["config"] for r in runs if r["experiment"] == "latency"]
+    if all("setup_latency_ms" in c for c in configs):
+        report.note(f"Measured in a network of N = {n:g} nodes, built at ≤ {max(float(c['setup_latency_ms']) for c in configs):g} ms "
+                    "latency and switched to L for the measure phase, so the network exists even at latencies it "
+                    "could not have formed under.")
+    else:
+        report.note(f"Measured in a network of N = {n:g} nodes, built at the same latency L, so at latencies "
+                    "whose round trip outlasts the retry budget the network could not form at all.")
+    report.note("A reply takes 2L. The transport resends every 200 ms of silence, so from L = 100 ms on (2L ≥ 200 ms) "
+                "every request is sent at least twice before its reply can arrive: duplicate traffic, same answer. "
+                "A send only helps if its reply lands before the call gives up at 1 s, so only "
+                "⌈(1 s − 2L) / 200 ms⌉ of the 5 sends count; at L ≥ 500 ms none do and every datagram RPC fails, "
+                "however reliable the network.")
+    report.note(html_table(["L ms", "2L ms", "useful sends", "RPC model (p=0)", "median RTT ms", "sends measured",
+                            "value lookup p=0", "value lookup p=0.3"], rows))
+
+
+def alpha_notes(runs, report):
+    alphas = values_of(runs, "alpha", "alpha")
+    if not alphas:
+        return
+    n = values_of(runs, "alpha", "nodes")[0]
+    lo, hi = alphas[0], alphas[-1]
+    for p in values_of(runs, "alpha", "loss"):
+        p_lo = metric_at(runs, "alpha", "node_probes", alpha=lo, loss=p)
+        p_hi = metric_at(runs, "alpha", "node_probes", alpha=hi, loss=p)
+        t_lo = metric_at(runs, "alpha", "node_ms_median", alpha=lo, loss=p)
+        t_3 = metric_at(runs, "alpha", "node_ms_median", alpha=3, loss=p)
+        t_hi = metric_at(runs, "alpha", "node_ms_median", alpha=hi, loss=p)
+        report.note(f"At loss {p:g} (N = {n:g}): going from α = {lo:g} to α = {hi:g} costs "
+                    f"{p_hi - p_lo:.1f} more probes ({p_lo:.1f} → {p_hi:.1f}, +{100 * (p_hi / p_lo - 1):.0f}%) "
+                    f"and buys a {100 * (1 - t_hi / t_lo):.0f}% faster lookup ({t_lo:.0f} → {t_hi:.0f} ms); "
+                    f"α = 1 → 3 alone cuts the time by {100 * (1 - t_3 / t_lo):.0f}%.")
+    report.note(f"Why it flattens: a lookup ends once its K = {K} closest candidates have answered, so with α "
+                f"queries per round it needs at least ⌈K/α⌉ rounds to confirm them; that is {math.ceil(K / lo)} "
+                f"rounds at α = {lo:g} but 1 round at α ≥ {K}. Past that, extra parallel queries only hit nodes "
+                "that turn out not to be among the closest: more probes, no fewer rounds.")
+
+
+def churn_notes(runs, report, experiment="churn"):
+    rates = [c for c in values_of(runs, experiment, "churn") if c > 0]
+    if not rates:
+        return
+    n = values_of(runs, experiment, "nodes")[0]
+    window = values_of(runs, experiment, "duration_s")[0]
+    republishes = values_of(runs, experiment, "republish_s")
+    t_short = min([t for t in republishes if t < window] or [60])
+    mid = rates[len(rates) // 2]
+    report.note(churn_sentence(mid, n, window))
+    rows = []
+    for c in rates:
+        rows.append([f"{c:g}", f"{100 * c / n:.2g}%", duration_text(n / c), duration_text(n * math.log(2) / c),
+                     f"{100 * (1 - survival(c, window, n)):.0f}%",
+                     pct_text(availability_model(c, window, n, math.inf)),
+                     pct_text(availability_model(c, window, n, t_short)),
+                     pct_text(metric_at(runs, experiment, "value_available", churn=c))])
+    report.note(f"Value availability at the end of the window, by model: without republishing a value is gone once "
+                f"all K = {K} of its holders have left, 1 − (1 − e^(−cD/N))^K; republishing every T s re-copies it "
+                "onto the current K closest, so it is lost only if all K leave within one interval, "
+                f"(1 − e^(−cT/N))^K per interval. The table uses T = {t_short:g} s.")
+    report.note("Lookups can fail even while the value exists: routing tables keep pointing at departed nodes "
+                "until a failed call or a liveness round removes them, and each probe to a dead node costs the "
+                "full 1 s retry budget.")
+    report.note(html_table(["c /s", "c/N", "turnover N/c", "half new N·ln2/c", "replaced in window",
+                            "available, no republish (model)", f"available, republish {t_short:g} s (model)",
+                            "available (measured, all variants)"], rows))
+
+
+# ---------------------------------------------------------------- heatmaps and surfaces
+
+def heat_grid(runs, experiment, xkey, ykey, metric):
+    xs = values_of(runs, experiment, xkey)
+    ys = values_of(runs, experiment, ykey)
+    Z = np.full((len(ys), len(xs)), np.nan)
+    for (x, y), members in group(runs, experiment, [xkey, ykey]).items():
+        Z[ys.index(y), xs.index(x)] = across_seeds(members, metric)[0]
+    return xs, ys, Z
+
+
+def draw_heatmap(report, xs, ys, Z, name, title, caption, xlabel, ylabel, cbar, fmt="{:.2f}",
+                 vmin=None, vmax=None, log=False, cmap="Blues"):
+    from matplotlib.colors import LogNorm, Normalize
+    fig, ax = plt.subplots(figsize=(max(6.0, 0.72 * len(xs) + 2.4), max(4.0, 0.42 * len(ys) + 1.8)))
+    finite = Z[np.isfinite(Z)]
+    if log:
+        positive = finite[finite > 0]
+        norm = LogNorm(vmin=vmin or (positive.min() if positive.size else 1),
+                       vmax=vmax or (positive.max() if positive.size else 10))
+    else:
+        norm = Normalize(vmin=vmin if vmin is not None else (finite.min() if finite.size else 0),
+                         vmax=vmax if vmax is not None else (finite.max() if finite.size else 1))
+    im = ax.imshow(np.ma.masked_invalid(Z), origin="lower", aspect="auto", cmap=cmap, norm=norm)
+    ax.grid(False)
+    ax.set_xticks(range(len(xs)))
+    ax.set_xticklabels([f"{x:g}" for x in xs], rotation=45)
+    ax.set_yticks(range(len(ys)))
+    ax.set_yticklabels([f"{y:g}" for y in ys])
+    size = 8 if len(xs) * len(ys) <= 80 else 6.5
+    for i in range(len(ys)):
+        for j in range(len(xs)):
+            v = Z[i, j]
+            if np.isfinite(v):
+                dark = norm(v) > 0.55
+                ax.text(j, i, fmt.format(v), ha="center", va="center", fontsize=size,
+                        color="#ffffff" if dark else INK)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    bar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.03)
+    bar.set_label(cbar, color=INK_2)
+    bar.outline.set_visible(False)
+    report.save(fig, name, caption)
+
+
+def draw_surface(report, xs, ys, Z, name, title, caption, xlabel, ylabel, zlabel,
+                 xlog=False, ylog=False, zlim=None):
+    fig = plt.figure(figsize=(7.5, 5.6))
+    ax = fig.add_subplot(projection="3d")
+    xv = np.log2(xs) if xlog else np.asarray(xs, dtype=float)
+    yv = np.log2(ys) if ylog else np.asarray(ys, dtype=float)
+    X, Y = np.meshgrid(xv, yv)
+    Zm = np.ma.masked_invalid(Z)
+    # A fixed z range fixes the colours too, so a sliver of difference is not
+    # painted as the whole scale.
+    vmin, vmax = zlim if zlim else (None, None)
+    ax.plot_surface(X, Y, Zm, cmap="Blues", vmin=vmin, vmax=vmax, edgecolor=RAMP[7], linewidth=0.3,
+                    antialiased=True, alpha=0.95)
+    ax.set_xticks(xv)
+    ax.set_xticklabels([f"{x:g}" for x in xs], fontsize=7)
+    ax.set_yticks(yv)
+    ax.set_yticklabels([f"{y:g}" for y in ys], fontsize=7)
+    if zlim:
+        ax.set_zlim(*zlim)
+    ax.set_xlabel(xlabel, labelpad=8)
+    ax.set_ylabel(ylabel, labelpad=8)
+    ax.set_zlabel(zlabel, labelpad=6)
+    ax.view_init(elev=26, azim=-128)
+    for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+        axis.pane.set_facecolor(SURFACE)
+        axis.pane.set_edgecolor(GRID)
+    ax.set_title(title, loc="left", fontweight="bold", color=INK)
+    report.save(fig, name, caption)
+
+
+def heat_loss_size(runs, report):
+    E = "heat_loss_size"
+    if not any(r["experiment"] == E for r in runs):
+        return
+    report.section(
+        "Heatmaps: network size × packet loss",
+        "Every combination of N (250 to 16000 nodes, doubling) and loss p (0 to 0.9), 3 seeds each. "
+        "Each cell is the mean over seeds. The question: does a bigger network make lookups more or less "
+        "fragile under loss?")
+    for metric, title, cbar, fmt, kw in [
+        ("value_success", "Value lookup success", "success", "{:.2f}", {"vmin": 0, "vmax": 1}),
+        ("node_success", "Node lookup finds its target", "success", "{:.2f}", {"vmin": 0, "vmax": 1}),
+        ("node_probes", "Probes per node lookup", "probes", "{:.1f}", {}),
+        ("node_ms_median", "Median node lookup time", "ms (log colour)", "{:.0f}", {"log": True}),
+    ]:
+        xs, ys, Z = heat_grid(runs, E, "loss", "nodes", metric)
+        draw_heatmap(report, xs, ys, Z, f"heat_loss_size_{metric}", title,
+                     f"{title}: rows are network sizes, columns loss rates.", "packet loss p", "network size N",
+                     cbar, fmt, **kw)
+    xs, ys, Z = heat_grid(runs, E, "nodes", "loss", "value_success")
+    draw_surface(report, xs, ys, Z, "surf_loss_size_value", "Value lookup success over N and loss",
+                 "The same value-lookup success as a surface; N on a log axis.", "N", "loss p", "success",
+                 xlog=True, zlim=(0, 1))
+    xs, ys, Z = heat_grid(runs, E, "nodes", "loss", "node_probes")
+    draw_surface(report, xs, ys, Z, "surf_loss_size_probes", "Probes over N and loss",
+                 "Probes per node lookup as a surface: log growth along N, and loss bending it.", "N", "loss p",
+                 "probes", xlog=True)
+    # Lines per size, for reading exact values.
+    sizes = values_of(runs, E, "nodes")
+    fig, ax = plt.subplots(figsize=(7, 4.4))
+    for c, n in zip(ramp(len(sizes)), sizes):
+        x, m, sd = series(runs, E, "loss", "value_success", {"nodes": n})
+        band(ax, x, m, sd, c, f"N = {n:g}")
+    p_grid = np.linspace(0, 0.99, 100)
+    ax.plot(p_grid, rpc_success(p_grid), color=INK_2, linestyle=":", label="single RPC, model")
+    ax.set_xlabel("packet loss p")
+    ax.set_ylabel("value lookup success")
+    ax.set_ylim(-0.02, 1.02)
+    ax.set_title("Value lookups vs loss, one line per N")
+    ax.legend(fontsize=8)
+    report.save(fig, "heat_loss_size_lines", "Value lookup success vs loss for each network size, ±1 std over seeds.")
+    for p in values_of(runs, E, "loss"):
+        if p in (0.7, 0.8):
+            small, big = sizes[0], sizes[-1]
+            a = metric_at(runs, E, "value_success", nodes=small, loss=p)
+            b = metric_at(runs, E, "value_success", nodes=big, loss=p)
+            report.note(f"At p = {p:g}: value lookups succeed {pct_text(a)} in N = {small:g} and {pct_text(b)} in "
+                        f"N = {big:g}. A bigger network needs more hops, and each hop is another chance for loss "
+                        "to cut the lookup short.")
+
+
+def heat_alpha_size(runs, report):
+    E = "heat_alpha_size"
+    if not any(r["experiment"] == E for r in runs):
+        return
+    report.section(
+        "Heatmaps: network size × α",
+        "Every combination of N (250 to 16000) and α (1 to 10), no loss, 3 seeds each.")
+    for metric, title, cbar, fmt, kw in [
+        ("node_probes", "Probes per node lookup", "probes", "{:.1f}", {}),
+        ("node_ms_median", "Median node lookup time", "ms", "{:.0f}", {}),
+        ("node_hops", "Hops", "hops", "{:.2f}", {}),
+    ]:
+        xs, ys, Z = heat_grid(runs, E, "alpha", "nodes", metric)
+        draw_heatmap(report, xs, ys, Z, f"heat_alpha_size_{metric}", title,
+                     f"{title}: rows are network sizes, columns α.", "α", "network size N", cbar, fmt, **kw)
+    for metric, title, z in [("node_probes", "Probes over N and α", "probes"),
+                             ("node_ms_median", "Lookup time over N and α", "median ms")]:
+        xs, ys, Z = heat_grid(runs, E, "nodes", "alpha", metric)
+        draw_surface(report, xs, ys, Z, f"surf_alpha_size_{metric}", title, f"{title}; N on a log axis.",
+                     "N", "α", z, xlog=True)
+    sizes = values_of(runs, E, "nodes")
+    alphas = values_of(runs, E, "alpha")
+    rows = []
+    for n in sizes:
+        times = {a: metric_at(runs, E, "node_ms_median", nodes=n, alpha=a) for a in alphas}
+        best = min(times, key=lambda a: times[a])
+        knee = next((a for a in alphas if times[a] <= 1.1 * times[best]), best)
+        rows.append([f"{n:g}", f"{best:g}", f2(times[best], 0), f"{knee:g}", f2(times[alphas[0]], 0)])
+    report.note("For each N: the fastest α, and the smallest α within 10% of it; past that knee, extra "
+                "parallelism only adds probes.")
+    report.note(html_table(["N", "fastest α", "its median ms", "smallest α within 10%", "median ms at α = 1"], rows))
+
+
+def heat_latency_loss(runs, report):
+    E = "heat_latency_loss"
+    if not any(r["experiment"] == E for r in runs):
+        return
+    n = values_of(runs, E, "nodes")[0]
+    report.section(
+        "Heatmaps: latency × packet loss",
+        f"N = {n:g} nodes; every combination of one-way latency (0 to 600 ms) and loss (0 to 0.8), 3 seeds each. "
+        "The RPC model here is 1 − (1 − (1−p)²)<sup>u</sup>, where u = ⌈(1 s − 2L) / 200 ms⌉ is how many of the "
+        "5 sends can still get a reply back before the call gives up.")
+    xs, ys, Z = heat_grid(runs, E, "loss", "latency_ms", "find_node_fail_rate")
+    measured = 1 - Z
+    model = np.array([[rpc_success_latency(p, L) for p in xs] for L in ys])
+    draw_heatmap(report, xs, ys, model, "heat_lat_loss_rpc_model", "Single RPC success, model",
+                 "Modelled FIND_NODE success from loss and latency alone.", "packet loss p", "one-way latency L, ms",
+                 "success", vmin=0, vmax=1)
+    draw_heatmap(report, xs, ys, measured, "heat_lat_loss_rpc_measured", "Single RPC success, measured",
+                 "Measured FIND_NODE success; compare cell by cell with the model.", "packet loss p",
+                 "one-way latency L, ms", "success", vmin=0, vmax=1)
+    for metric, title, cbar, fmt, kw in [
+        ("value_success", "Value lookup success", "success", "{:.2f}", {"vmin": 0, "vmax": 1}),
+        ("node_success", "Node lookup finds its target", "success", "{:.2f}", {"vmin": 0, "vmax": 1}),
+        ("node_ms_median", "Median node lookup time", "ms (log colour)", "{:.0f}", {"log": True}),
+        ("find_node_attempts", "Sends per FIND_NODE", "sends", "{:.2f}", {"vmin": 1, "vmax": 5}),
+    ]:
+        xs, ys, Z = heat_grid(runs, E, "loss", "latency_ms", metric)
+        draw_heatmap(report, xs, ys, Z, f"heat_lat_loss_{metric}", title,
+                     f"{title}: rows are latencies, columns loss rates.", "packet loss p", "one-way latency L, ms",
+                     cbar, fmt, **kw)
+    xs, ys, Z = heat_grid(runs, E, "latency_ms", "loss", "node_ms_median")
+    draw_surface(report, xs, ys, np.log10(Z), "surf_lat_loss_time", "Lookup time over latency and loss",
+                 "log₁₀ of the median node lookup time in ms.", "latency ms", "loss p", "log₁₀ ms")
+    xs, ys, Z = heat_grid(runs, E, "latency_ms", "loss", "value_success")
+    draw_surface(report, xs, ys, Z, "surf_lat_loss_value", "Value lookup success over latency and loss",
+                 "The cliff at L = 500 ms is the retry budget running out.", "latency ms", "loss p", "success",
+                 zlim=(0, 1))
+    diff = measured - model
+    if np.isfinite(diff).any():
+        report.note(f"Measured RPC success differs from the model by at most {np.nanmax(np.abs(diff)):.3f} "
+                    f"(mean absolute difference {np.nanmean(np.abs(diff)):.3f}) across the grid.")
+    report.note("Two cliffs: along loss the success falls smoothly, as (1−p)² per send; along latency it "
+                "drops in steps, one per 100 ms of L, each step one fewer send whose reply can arrive in time, "
+                "down to zero at L = 500 ms.")
+
+
+def heat_churn(runs, report, E, other, other_label, title, intro):
+    if not any(r["experiment"] == E for r in runs):
+        return
+    n = values_of(runs, E, "nodes")[0]
+    window = values_of(runs, E, "duration_s")[0]
+    report.section(title, intro.format(n=f"{n:g}", window=duration_text(window)))
+    churn_notes(runs, report, E)
+    log_other = other == "republish_s"
+    for metric, mtitle, cbar, fmt, kw in [
+        ("value_success", "Value lookup success", "success", "{:.2f}", {"vmin": 0, "vmax": 1}),
+        ("value_available", "Value still held by a live node", "share", "{:.2f}", {"vmin": 0, "vmax": 1}),
+        ("value_success_given_available", "Success when the value still exists", "success", "{:.2f}",
+         {"vmin": 0, "vmax": 1}),
+        ("node_success", "Node lookup finds its target", "success", "{:.2f}", {"vmin": 0, "vmax": 1}),
+        ("node_ms_median", "Median node lookup time", "ms (log colour)", "{:.0f}", {"log": True}),
+    ]:
+        xs, ys, Z = heat_grid(runs, E, "churn", other, metric)
+        draw_heatmap(report, xs, ys, Z, f"{E}_{metric}", mtitle,
+                     f"{mtitle}: rows are {other_label}s, columns churn rates.", "churn, nodes replaced per second",
+                     other_label, cbar, fmt, **kw)
+    if other == "republish_s":
+        xs, ys, _ = heat_grid(runs, E, "churn", other, "value_available")
+        holders = mean([h for r in runs if r["experiment"] == E for h, _ in r["stored"]]) or K
+        # The mean over the window, as the measured share is.
+        ts = np.linspace(0, window, 60)
+        model = np.array([[np.mean([availability_model(c, t, n, T, holders) for t in ts]) for c in xs] for T in ys])
+        draw_heatmap(report, xs, ys, model, f"{E}_available_model", "Value availability, model",
+                     "Modelled availability averaged over the window, to compare with the measured heatmap.",
+                     "churn, nodes replaced per second", other_label, "share", vmin=0, vmax=1)
+    xs, ys, Z = heat_grid(runs, E, "churn", other, "value_success")
+    draw_surface(report, xs, ys, Z, f"surf_{E}", f"Value lookup success over churn and {other_label}",
+                 "The same data as the first heatmap, as a surface.", "churn /s", other_label, "success",
+                 ylog=log_other, zlim=(0, 1))
+    rows = []
+    for c in xs:
+        cells = {o: metric_at(runs, E, "value_success", churn=c, **{other: o}) for o in ys}
+        good = [o for o in ys if cells[o] >= 0.99]
+        best = max(cells, key=lambda o: cells[o])
+        rows.append([f"{c:g}", duration_text(n / c) if c else "never", f"{best:g}", pct_text(cells[best]),
+                     f"{max(good):g}" if good and other == "republish_s" else (f"{max(good):g}" if good else "none")])
+    report.note(f"For each churn rate: the best {other_label} and, among those reaching ≥ 99% value success, the "
+                f"largest (cheapest) one.")
+    report.note(html_table(["churn /s", "turnover N/c", f"best {other_label}", "its success",
+                            f"largest {other_label} with ≥ 99%"], rows))
+
+
+def heat_churn_republish(runs, report):
+    heat_churn(runs, report, "heat_churn_republish", "republish_s", "republish interval s",
+               "Heatmaps: churn × republish interval",
+               "N = {n} nodes over a {window} window, liveness every 10 s; every combination of churn rate and "
+               "republish interval (3600 s means no republish inside the window), 3 seeds each.")
+
+
+def heat_churn_liveness(runs, report):
+    heat_churn(runs, report, "heat_churn_liveness", "liveness_s", "liveness interval s",
+               "Heatmaps: churn × liveness interval",
+               "N = {n} nodes over a {window} window, republish every 60 s; every combination of churn rate and "
+               "how often each node pings its whole routing table, 3 seeds each. A shorter interval evicts "
+               "departed contacts sooner, at the price of pinging every contact that often.")
+
+
+NOTES = {"scalability": scalability_notes, "loss": loss_notes, "latency": latency_notes, "alpha": alpha_notes,
+         "churn": churn_notes}
+
+
 def setup_html(runs):
     configs = [r["config"] for r in runs]
     c = configs[0] if configs else {}
@@ -999,6 +1523,11 @@ def main():
     write_csvs(runs, args.results)
     report = Report(args.results)
     for section in (scalability, loss, latency, alpha, churn):
+        before = len(report.sections)
+        section(runs, report)
+        if len(report.sections) > before:
+            NOTES[section.__name__](runs, report)
+    for section in (heat_loss_size, heat_alpha_size, heat_latency_loss, heat_churn_republish, heat_churn_liveness):
         section(runs, report)
     report.write(setup_html(runs))
     figures = sum(len(s["figures"]) for s in report.sections)

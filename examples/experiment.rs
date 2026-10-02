@@ -18,13 +18,15 @@
 //! 1. **build** — places `--nodes` nodes at addresses drawn from the seed
 //!    (random `10.x.y.z:port`), so the seed decides every node id, since an id
 //!    is the hash of its address. They join in batches, each through a random
-//!    node that has already joined. The wire is lossless during this phase.
+//!    node that has already joined. The wire is lossless during this phase,
+//!    and its latency is at most 5 ms (`SETUP_LATENCY`).
 //! 2. **refresh** (optional) — each node looks up `--refresh` random ids,
 //!    standing in for the bucket refresh that `bootstrap` does not do yet.
 //! 3. **settle** — waits `--settle` seconds.
 //! 4. **store** — stores `--values` random values from random nodes, still
 //!    lossless, then counts which nodes hold each one.
-//! 5. **measure** — sets the wire's loss to `--loss`, starts churn if
+//! 5. **measure** — sets the wire's loss to `--loss` and latency to
+//!    `--latency-ms`, starts churn if
 //!    `--churn` asks for it, and runs `--lookups` value lookups and as many
 //!    node lookups, alternating: `--concurrency` at a time, or, with
 //!    `--duration-secs`, started at an even pace over that long.
@@ -39,6 +41,7 @@
 //! configuration is run with several seeds.
 
 use kademlia_packet_manager_d7024e::close_nodes::{CloseNodes, K, Key, NodeId, xor_distance_cmp};
+use kademlia_packet_manager_d7024e::instrumentation::RpcEvents;
 use kademlia_packet_manager_d7024e::node::FakeNode;
 use kademlia_packet_manager_d7024e::rpc_transport::networked_debug_transport::{
     Network, NetworkConfig,
@@ -64,6 +67,12 @@ const JOIN_BATCH: usize = 50;
 
 /// How big each stored value is.
 const VALUE_LEN: usize = 64;
+
+/// The most latency the network is built and the values stored under. The
+/// requested `--latency-ms` only applies once measuring starts, so a latency
+/// whose round trip outlasts the RPC retry budget still gets a network to
+/// measure, instead of one whose joins all timed out.
+const SETUP_LATENCY: Duration = Duration::from_millis(5);
 
 /// A `metrics` line, the same target `instrumentation` writes to.
 macro_rules! metric {
@@ -91,7 +100,7 @@ struct Config {
     /// When set, the measured lookups are spread evenly over this long
     /// instead of run `concurrency` at a time as fast as they finish.
     duration: Option<Duration>,
-    rpc_events: bool,
+    rpc_events: RpcEvents,
     out: PathBuf,
 }
 
@@ -113,7 +122,7 @@ impl Default for Config {
             settle: Duration::from_secs(2),
             refresh: 0,
             duration: None,
-            rpc_events: true,
+            rpc_events: RpcEvents::Ops,
             out: PathBuf::from("experiment-out"),
         }
     }
@@ -123,14 +132,14 @@ const USAGE: &str = "\
 usage: experiment [--nodes N] [--seed S] [--loss P] [--latency-ms MS] [--alpha A]
                   [--lookups M] [--values V] [--churn PER_SEC] [--concurrency C]
                   [--threads T] [--liveness-secs S] [--republish-secs S] [--settle-secs S]
-                  [--refresh R] [--duration-secs S] [--no-rpc-events] [--out DIR]";
+                  [--refresh R] [--duration-secs S] [--rpc-events off|ops|all] [--out DIR]";
 
 fn parse_args() -> Result<Config, Box<dyn Error>> {
     let mut config = Config::default();
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         if flag == "--no-rpc-events" {
-            config.rpc_events = false;
+            config.rpc_events = RpcEvents::Off;
             continue;
         }
         if flag == "--help" || flag == "-h" {
@@ -154,6 +163,14 @@ fn parse_args() -> Result<Config, Box<dyn Error>> {
             "--liveness-secs" => config.liveness = Duration::from_secs_f64(value.parse()?),
             "--republish-secs" => config.republish = Duration::from_secs_f64(value.parse()?),
             "--settle-secs" => config.settle = Duration::from_secs_f64(value.parse()?),
+            "--rpc-events" => {
+                config.rpc_events = match value.as_str() {
+                    "off" => RpcEvents::Off,
+                    "ops" => RpcEvents::Ops,
+                    "all" => RpcEvents::All,
+                    _ => return Err(format!("--rpc-events takes off, ops or all\n{USAGE}").into()),
+                }
+            }
             "--refresh" => config.refresh = value.parse()?,
             "--duration-secs" => config.duration = Some(Duration::from_secs_f64(value.parse()?)),
             "--out" => config.out = PathBuf::from(value),
@@ -540,13 +557,13 @@ async fn run(config: Config) {
     let churn_rng = StdRng::seed_from_u64(config.seed.wrapping_add(0x5EED_0002));
 
     let network = Network::with_config(NetworkConfig {
-        latency: config.latency,
+        latency: config.latency.min(SETUP_LATENCY),
         loss: 0.0,
         seed: Some(config.seed.wrapping_add(0x5EED_0003)),
     });
 
     metric!(
-        "event=run_config nodes={} seed={} loss={} latency_ms={} alpha={} k={} lookups={} values={} churn={} concurrency={} threads={} liveness_s={} republish_s={} refresh={} duration_s={} resend_ms={} max_attempts={} stream_deadline_ms={}",
+        "event=run_config nodes={} seed={} loss={} latency_ms={} alpha={} k={} lookups={} values={} churn={} concurrency={} threads={} liveness_s={} republish_s={} refresh={} duration_s={} setup_latency_ms={} resend_ms={} max_attempts={} stream_deadline_ms={}",
         config.nodes,
         config.seed,
         config.loss,
@@ -562,6 +579,7 @@ async fn run(config: Config) {
         config.republish.as_secs_f64(),
         config.refresh,
         config.duration.map_or(0.0, |d| d.as_secs_f64()),
+        config.latency.min(SETUP_LATENCY).as_secs_f64() * 1e3,
         RESEND_INTERVAL.as_millis(),
         MAX_ATTEMPTS,
         STREAM_DEADLINE.as_millis(),
@@ -602,9 +620,10 @@ async fn run(config: Config) {
     let values = experiment.store(&mut work_rng).await;
 
     experiment.network.set_loss(config.loss);
+    experiment.network.set_latency(config.latency);
     instrumentation::set_rpc_events(config.rpc_events);
     experiment.phase("measure");
     experiment.measure(&mut work_rng, &values).await;
-    instrumentation::set_rpc_events(false);
+    instrumentation::set_rpc_events(RpcEvents::Off);
     experiment.phase("done");
 }
