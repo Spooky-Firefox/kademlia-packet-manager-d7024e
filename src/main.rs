@@ -11,6 +11,7 @@ mod logging;
 mod lookup;
 mod maintenance;
 mod node;
+mod package;
 mod pending;
 mod rpc;
 mod rpc_transport;
