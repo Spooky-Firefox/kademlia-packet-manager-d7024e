@@ -89,9 +89,12 @@ where
         }
 
         // nothing running and nothing left to start: the K closest are settled
-        let Some((replied_depth, new_contacts)) = in_flight.next().await else {
+        let Some((replied_depth, mut new_contacts)) = in_flight.next().await else {
             break;
         };
+        // removes self from contacts, we must never be our own candidate
+        // (tested by bootstrap::tests::bootstrap_never_returns_us)
+        new_contacts.retain(|c| c.id != my_id);
 
         // every contact a response teaches us about is worth offering to the
         // routing table, whether or not it ends up among the K closest here
