@@ -20,8 +20,8 @@
 //!    is the hash of its address. They join in batches, each through a random
 //!    node that has already joined. The wire is lossless during this phase,
 //!    and its latency is at most 5 ms (`SETUP_LATENCY`).
-//! 2. **refresh** (optional) — each node looks up `--refresh` random ids,
-//!    standing in for the bucket refresh that `bootstrap` does not do yet.
+//! 2. **refresh** (optional) — each node looks up `--refresh` more random
+//!    ids, on top of the bucket refresh `bootstrap` already does.
 //! 3. **settle** — waits `--settle` seconds.
 //! 4. **store** — stores `--values` random values from random nodes, still
 //!    lossless, then counts which nodes hold each one.
@@ -55,6 +55,7 @@ use kademlia_packet_manager_d7024e::{
 };
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
+use std::collections::HashSet;
 use std::error::Error;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -306,8 +307,8 @@ impl Experiment {
         }
     }
 
-    /// Have every node look up `count` random ids, to fill the far buckets a
-    /// self-lookup leaves thin.
+    /// Have every node look up `count` random ids, beyond the bucket refresh
+    /// its join already did.
     async fn refresh(&self, rng: &mut StdRng) {
         let work: Vec<(Arc<FakeNode>, NodeId)> = self
             .snapshot()
@@ -604,13 +605,23 @@ async fn run(config: Config) {
     experiment.phase("settle");
     tokio::time::sleep(config.settle).await;
 
+    // Distinct ids: `contacts_iter` yields a sibling twice, once from the
+    // sibling list and once from the bucket that also holds it.
     let tables: Vec<usize> = experiment
         .snapshot()
         .iter()
-        .map(|node| node.rpc().close_nodes().contacts_iter().count())
+        .map(|node| {
+            let ids: HashSet<NodeId> = node
+                .rpc()
+                .close_nodes()
+                .contacts_iter()
+                .map(|contact| contact.id)
+                .collect();
+            ids.len()
+        })
         .collect();
     metric!(
-        "event=routing_tables mean={:.1} min={} max={}",
+        "event=routing_tables distinct=true mean={:.1} min={} max={}",
         tables.iter().sum::<usize>() as f64 / tables.len() as f64,
         tables.iter().min().unwrap(),
         tables.iter().max().unwrap(),

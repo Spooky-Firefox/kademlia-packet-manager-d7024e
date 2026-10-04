@@ -25,6 +25,7 @@ import argparse
 import gzip
 import itertools
 import json
+import math
 import shutil
 import signal
 import subprocess
@@ -112,7 +113,9 @@ class Run:
     def seconds(self) -> float:
         """A rough guess, for ordering and for the --dry-run estimate."""
         p = self.params
-        build = 0.003 * p["nodes"] + 0.01 * p["nodes"] * p["refresh"] / max(1, p["concurrency"])
+        # Measured: each join refreshes ~log2(N) buckets, 106 s for 5000 nodes.
+        build = 0.0018 * p["nodes"] * math.log2(max(2, p["nodes"]))
+        build += 0.01 * p["nodes"] * p["refresh"] / max(1, p["concurrency"])
         if "duration-secs" in p:
             measure = p["duration-secs"] + 10
         else:
@@ -162,10 +165,9 @@ def experiments(suite: str):
         # N doubles from 16 to 16384 nodes (16384 takes ~4 GB on its own).
         Experiment("scalability", "Probes per lookup as a function of N",
                    {"nodes": [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]}, 10),
-        # The same sizes with every node refreshing its far buckets after
-        # joining, which bootstrap does not do yet.
-        Experiment("scalability_refresh", "Probes vs N with bucket refresh after join",
-                   {"nodes": [16, 64, 256, 1024, 4096, 8192, 16384]}, 5, {"refresh": 4}),
+        # (bootstrap refreshes every bucket past its closest neighbour since
+        # #45; to compare with the code before that, run analyze.py with
+        # --baseline pointing at results from before it.)
 
         # ---- Mandatory 2: lookup reliability vs packet loss ---------------
         # N = 5000 nodes.

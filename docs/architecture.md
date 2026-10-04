@@ -292,16 +292,25 @@ stdout. `src/instrumentation.rs` writes all the metric events:
 
 | Event | Fields |
 |---|---|
-| `lookup_start` | `lookup_id kind node target` |
+| `lookup_start` | `lookup_id op kind node target` |
 | `lookup_probe` | `lookup_id kind node peer`, one per RPC the lookup sends |
-| `lookup_end` with `kind=node` | `lookup_id node probes result_count exact_match` |
-| `lookup_end` with `kind=value` | `lookup_id node probes success` |
+| `lookup_end` with `kind=node` | `lookup_id op parent node probes result_count exact_match hops duration_us` |
+| `lookup_end` with `kind=value` | `lookup_id op node probes success duration_us` |
+| `rpc` (off unless turned on) | `op method peer attempts success duration_us` |
 
 `lookup_id` is a decimal counter starting at 1. `kind` is `node` or `value`.
-`node`, `target` and `peer` are hex ids.
+`node` and `target` are hex ids, `peer` an address. `parent` is the value
+lookup a node lookup ran inside of, or 0. `hops` is the length of the chain
+of replies that led to the closest contact found (0 if the routing table
+already held it). `op` is the experiment operation the lookup or RPC ran
+for, set with `instrumentation::with_op`, or 0 for everything else. `rpc`
+events are written only after `instrumentation::set_rpc_events`, which the
+experiment harness turns on; `attempts` counts the sends a datagram RPC
+needed. Durations are in microseconds.
 
 Lookups nest. A value lookup (`get`) first runs a node lookup, which logs its
 own `kind=node` events inside the value lookup's, and the value lookup's
 `probes` counts only its FIND_VALUE requests. `put` and bootstrap each run a
 node lookup too, so the node-lookup count from `analyze_metrics.py` includes
-all of these.
+all of these. `experiments/analyze.py` avoids that by counting only lookups
+with a nonzero `op`.

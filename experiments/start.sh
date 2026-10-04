@@ -18,7 +18,13 @@ if [ ! -x experiments/.venv/bin/python ]; then
 fi
 
 mkdir -p experiments/results
-cmd="python3 experiments/run_suite.py $*; experiments/.venv/bin/python experiments/analyze.py"
+# The published copy (report, plots, CSVs) lands in experiments/report, which
+# is kept in git; the raw logs stay in experiments/results, which is not.
+analyze="experiments/.venv/bin/python experiments/analyze.py --publish experiments/report"
+if [ -d experiments/results-before-refresh ]; then
+    analyze="$analyze --baseline experiments/results-before-refresh"
+fi
+cmd="python3 experiments/run_suite.py $*; $analyze"
 
 if command -v tmux >/dev/null; then
     if tmux has-session -t kademlia-experiments 2>/dev/null; then
@@ -33,4 +39,4 @@ else
     echo "started with nohup, pid $!"
 fi
 echo "  log:    tail -f experiments/results/suite.log"
-echo "  report: experiments/results/report.html once it finishes"
+echo "  report: experiments/report/report.html once it finishes (commit that directory)"

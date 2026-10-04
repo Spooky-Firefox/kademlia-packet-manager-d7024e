@@ -12,11 +12,25 @@ a time.
 | `experiments/run_suite.py` | Runs every configuration × seed, several at a time; resumable. |
 | `experiments/analyze.py` | Parses the logs into `summary.csv`, `aggregate.csv`, `plots/*.png`, `report.html`. |
 | `experiments/start.sh` | Starts the suite and then the analysis in a detached tmux session. |
+| `experiments/report/` | The published results: `report.html`, `plots/`, `aggregate.csv`, `summary.csv`. |
+
+## Results
+
+[`report/report.html`](report/report.html) has every plot, each section
+opening with the numbers in words. GitHub shows it as source, so download it
+or open it from a checkout. [`report/aggregate.csv`](report/aggregate.csv)
+has the mean, variance and standard deviation over seeds for every
+configuration, and [`report/summary.csv`](report/summary.csv) one row per
+run. The plots are also in [`report/plots/`](report/plots/) as PNGs.
+
+The scalability plots also show, as a comparison, the same experiment run
+before `bootstrap` started refreshing distant buckets on join (PR #45):
+that shows what the refresh does to probes, hops and routing-table size.
 
 ## Running it
 
 ```sh
-experiments/start.sh                     # the full suite (~16-24 h), then analysis
+experiments/start.sh                     # the full suite (~1 day), then analysis
 tmux attach -t kademlia-experiments      # watch; Ctrl-b d detaches again
 tail -f experiments/results/suite.log    # or follow the log
 ```
@@ -39,7 +53,6 @@ Each configuration is repeated with the listed number of seeds.
 | Experiment | Nodes N | Varies | Seeds |
 |---|---|---|---|
 | `scalability` | 16 … 16384, doubling | N | 10 |
-| `scalability_refresh` | 16 … 16384, ×4 steps | N, with bucket refresh after join | 5 |
 | `loss` | 5000 | loss 0 … 0.95 | 10 |
 | `latency` | 5000 | one-way latency 0 … 600 ms × loss {0, 0.3} | 5 |
 | `alpha` | 5000 | α 1 … 10 × loss {0, 0.3} | 8 |
@@ -104,9 +117,9 @@ across them.
 **Phases.** Each run goes through these phases, logged as `event=phase` lines:
 
 1. *build*: lossless wire, latency at most 5 ms; all N nodes join.
-2. *refresh* (only in `scalability_refresh`): each node looks up 4 random
-   ids. This stands in for the bucket refresh that `bootstrap` does not do
-   yet (see the TODO in `src/bootstrap.rs`).
+2. *refresh* (only with `--refresh R`): each node looks up R more random
+   ids, on top of the bucket refresh its join already did. No experiment in
+   the suite uses it any more.
 3. *settle*: 2 s.
 4. *store*: still lossless. `--values` values are stored from random nodes.
    Then the run counts how many nodes hold each value, and how many of the
@@ -201,11 +214,13 @@ every run's `event=run_config` line:
   answered, so it sends at least min(N−1, K) probes. Above that floor, the
   probe count should grow like log N. Hops should stay below log₂N: each
   reply brings up to K contacts from the bucket nearest the target, so one
-  hop typically gains more than one bit of shared prefix. Distant buckets
-  are filled only by incoming traffic, because `bootstrap` does no bucket
-  refresh. That should cost extra hops in large networks; the `refresh`
-  variant measures how much. Routing tables should hold about
-  `Σ min(K, N/2^(i+1))` contacts.
+  hop typically gains more than one bit of shared prefix. Since PR #45,
+  every join looks up a random id in each bucket farther away than its
+  closest neighbour, so distant buckets start out filled. Routing tables
+  should therefore come close to the full-table size `Σ min(K, N/2^(i+1))`,
+  and need fewer hops than before the refresh. Joins cost more in return:
+  about log₂N extra lookups each, and building 5000 nodes now takes about
+  100 s instead of 15 s.
 - **Loss.** Single RPCs follow the model above. Lookups should do much
   better than single RPCs: a lookup needs only some of its ~10–15 probes to
   get through, and only one of the K replicas to be found. FIND_VALUE is not

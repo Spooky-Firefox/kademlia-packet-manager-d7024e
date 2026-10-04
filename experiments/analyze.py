@@ -25,6 +25,7 @@ import gzip
 import html
 import json
 import math
+import shutil
 import statistics
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -36,7 +37,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
-CACHE_VERSION = 4
+CACHE_VERSION = 5
 
 # Palette: categorical slots in fixed order, and a one-hue ramp for ordered
 # series (a churn rate, a network size).
@@ -153,7 +154,9 @@ def parse_run(path):
             elif event == "stored":
                 stored.append((int(e["holders"]), int(e["closest_holders"])))
             elif event == "routing_tables":
-                tables = {"mean": float(e["mean"]), "min": int(e["min"]), "max": int(e["max"])}
+                # Before distinct=true, siblings were counted twice (up to +K).
+                tables = {"mean": float(e["mean"]), "min": int(e["min"]), "max": int(e["max"]),
+                          "distinct": e.get("distinct") == "true"}
             elif event == "churn":
                 churn_leaves += 1
             elif event == "join":
@@ -443,6 +446,25 @@ def expected_table_size(n):
 
 # ---------------------------------------------------------------- sections
 
+# Scalability runs drawn beside the main ones: the scalability experiment of
+# an older results directory (--baseline), and runs with extra refresh lookups.
+COMPARISONS = [
+    ("scalability_before", "before bucket refresh on join (--baseline)"),
+    ("scalability_refresh", "with 4 extra refresh lookups per node"),
+]
+
+
+def compare_bands(ax, runs, metric):
+    for i, (experiment, label) in enumerate(COMPARISONS):
+        x, m, s = series(runs, experiment, "nodes", metric)
+        if not len(x):
+            continue
+        if metric == "table_mean" and not all(r["tables"].get("distinct") for r in runs
+                                              if r["experiment"] == experiment):
+            label += ", siblings counted twice (≤ +K)"
+        band(ax, x, m, s, SERIES[i + 1], label, marker="s^"[i])
+
+
 def scalability(runs, report):
     if not any(r["experiment"] == "scalability" for r in runs):
         return
@@ -453,20 +475,22 @@ def scalability(runs, report):
         "min(N-1, K) probes, so the curve has a floor at K; past that, Kademlia "
         "predicts growth of O(log N), at most about log<sub>2</sub>N hops, each "
         "hop costing up to &alpha; probes. Bands are &plusmn;1 std over seeds.")
+    # Every size any series has, so a comparison series reaching further than
+    # the main one still gets axis ticks and model lines.
+    sizes = np.array(sorted({param(r, "nodes") for r in runs
+                             if r["experiment"] in ["scalability"] + [e for e, _ in COMPARISONS]}))
     x, m, s = series(runs, "scalability", "nodes", "node_probes")
-    xr, mr, sr = series(runs, "scalability_refresh", "nodes", "node_probes")
 
     fig, ax = plt.subplots(figsize=(7, 4.4))
     band(ax, x, m, s, SERIES[0], "measured")
-    if len(xr):
-        band(ax, xr, mr, sr, SERIES[1], "measured, with bucket refresh", marker="s")
+    compare_bands(ax, runs, "node_probes")
     if len(x) > 2:
         lx = np.log2(x)
         b, a = np.polyfit(lx, m, 1)
         ax.plot(x, a + b * lx, color=MUTED, linestyle="--", linewidth=1.5,
                 label=f"fit {a:.1f} + {b:.2f}·log₂N")
-    ax.plot(x, np.minimum(x - 1, K), color=INK_2, linestyle=":", linewidth=1.5, label="floor min(N−1, K)")
-    log2_axis(ax, x)
+    ax.plot(sizes, np.minimum(sizes - 1, K), color=INK_2, linestyle=":", linewidth=1.5, label="floor min(N−1, K)")
+    log2_axis(ax, sizes)
     ax.set_xlabel("network size N")
     ax.set_ylabel("probes per node lookup")
     ax.set_title("Probes per lookup grow logarithmically in N")
@@ -475,14 +499,12 @@ def scalability(runs, report):
 
     # Hops against log2 N.
     x, m, s = series(runs, "scalability", "nodes", "node_hops")
-    xr, mr, sr = series(runs, "scalability_refresh", "nodes", "node_hops")
     fig, ax = plt.subplots(figsize=(7, 4.4))
     band(ax, x, m, s, SERIES[0], "measured hops")
-    if len(xr):
-        band(ax, xr, mr, sr, SERIES[1], "with bucket refresh", marker="s")
-    ax.plot(x, np.log2(x), color=INK_2, linestyle=":", label="log₂N (paper bound)")
-    ax.plot(x, np.log2(x) / np.log2(K), color=MUTED, linestyle="--", label="log₂N / log₂K")
-    log2_axis(ax, x)
+    compare_bands(ax, runs, "node_hops")
+    ax.plot(sizes, np.log2(sizes), color=INK_2, linestyle=":", label="log₂N (paper bound)")
+    ax.plot(sizes, np.log2(sizes) / np.log2(K), color=MUTED, linestyle="--", label="log₂N / log₂K")
+    log2_axis(ax, sizes)
     ax.set_xlabel("network size N")
     ax.set_ylabel("hops to the closest node found")
     ax.set_title("Hop count stays well under log₂N")
@@ -576,14 +598,12 @@ def scalability(runs, report):
 
     # Routing tables.
     x, m, s = series(runs, "scalability", "nodes", "table_mean")
-    xr, mr, sr = series(runs, "scalability_refresh", "nodes", "table_mean")
     fig, ax = plt.subplots(figsize=(7, 4.4))
     band(ax, x, m, s, SERIES[0], "measured")
-    if len(xr):
-        band(ax, xr, mr, sr, SERIES[1], "with bucket refresh", marker="s")
-    ax.plot(x, [expected_table_size(n) for n in x], color=INK_2, linestyle=":",
+    compare_bands(ax, runs, "table_mean")
+    ax.plot(sizes, [expected_table_size(n) for n in sizes], color=INK_2, linestyle=":",
             label="full table Σ min(K, N/2ⁱ⁺¹)")
-    log2_axis(ax, x)
+    log2_axis(ax, sizes)
     ax.set_xlabel("network size N")
     ax.set_ylabel("contacts per routing table")
     ax.set_title("Routing table size vs N")
@@ -608,8 +628,9 @@ def scalability(runs, report):
 
     report.table(summary_table(runs, "scalability", ["nodes"],
                                ["node_probes", "node_hops", "node_recall", "value_success"]))
-    if any(r["experiment"] == "scalability_refresh" for r in runs):
-        report.table(summary_table(runs, "scalability_refresh", ["nodes"], ["node_probes", "node_hops"]))
+    for experiment, _ in COMPARISONS:
+        if any(r["experiment"] == experiment for r in runs):
+            report.table(summary_table(runs, experiment, ["nodes"], ["node_probes", "node_hops", "table_mean"]))
 
 
 def loss(runs, report):
@@ -1046,17 +1067,19 @@ def scalability_notes(runs, report):
                     "several bits of shared prefix, not one.")
         report.note(f"The floor: a lookup only stops once its K closest candidates have all answered, so it can "
                     f"never send fewer than min(N−1, K) probes; at N ≤ {K + 1} that is the whole network.")
-    nr = values_of(runs, "scalability_refresh", "nodes")
-    common = [n for n in nr if n in [k[0] for k in groups]]
-    if common:
+    for experiment, label in COMPARISONS:
+        common = [n for n in values_of(runs, experiment, "nodes") if n in [k[0] for k in groups]]
+        if not common:
+            continue
         n = common[-1]
-        a = metric_at(runs, "scalability", "node_probes", nodes=n)
-        b = metric_at(runs, "scalability_refresh", "node_probes", nodes=n)
-        ha = metric_at(runs, "scalability", "node_hops", nodes=n)
-        hb = metric_at(runs, "scalability_refresh", "node_hops", nodes=n)
-        report.note(f"Bucket refresh after joining (4 random lookups per node) at N = {n:g}: "
-                    f"{a:.2f} → {b:.2f} probes and {ha:.2f} → {hb:.2f} hops; that difference is what the missing "
-                    "refresh in <code>bootstrap</code> costs.")
+        a = metric_at(runs, experiment, "node_probes", nodes=n)
+        b = metric_at(runs, "scalability", "node_probes", nodes=n)
+        ha = metric_at(runs, experiment, "node_hops", nodes=n)
+        hb = metric_at(runs, "scalability", "node_hops", nodes=n)
+        ta = metric_at(runs, experiment, "table_mean", nodes=n)
+        tb = metric_at(runs, "scalability", "table_mean", nodes=n)
+        report.note(f"Against the runs {label}, at N = {n:g}: {a:.2f} → {b:.2f} probes, {ha:.2f} → {hb:.2f} hops "
+                    f"and {ta:.0f} → {tb:.0f} contacts per routing table (theirs → the main runs').")
     report.note(html_table(["N", "log₂N", "probe floor", "probes", "hops", "hops / log₂N",
                             "full table (model)", "table (measured)"], rows))
 
@@ -1513,12 +1536,23 @@ def write_csvs(runs, results):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--results", type=Path, default=ROOT / "experiments" / "results")
+    parser.add_argument("--baseline", type=Path,
+                        help="an older results directory whose scalability runs are drawn beside these, "
+                             "e.g. from before bootstrap refreshed its buckets")
+    parser.add_argument("--publish", type=Path,
+                        help="also copy report.html, plots/ and the CSVs here (a directory kept in git)")
     args = parser.parse_args()
 
     runs = load_runs(args.results)
     if not runs:
         raise SystemExit(f"no finished runs under {args.results}")
     print(f"{len(runs)} finished runs")
+    if args.baseline:
+        baseline = [r for r in load_runs(args.baseline) if r["experiment"] == "scalability"]
+        for r in baseline:
+            r["experiment"] = "scalability_before"
+        print(f"{len(baseline)} baseline scalability runs from {args.baseline}")
+        runs += baseline
 
     write_csvs(runs, args.results)
     report = Report(args.results)
@@ -1532,6 +1566,20 @@ def main():
     report.write(setup_html(runs))
     figures = sum(len(s["figures"]) for s in report.sections)
     print(f"wrote {figures} plots, {args.results / 'report.html'}, summary.csv, aggregate.csv")
+    if args.publish:
+        publish(args.results, args.publish)
+        print(f"published to {args.publish}")
+
+
+def publish(results, target):
+    """Copy the small outputs into `target`, replacing what was there: the
+    report, its plots and the CSVs, not the gigabytes of logs behind them."""
+    target.mkdir(parents=True, exist_ok=True)
+    if (target / "plots").exists():
+        shutil.rmtree(target / "plots")
+    shutil.copytree(results / "plots", target / "plots")
+    for name in ("report.html", "summary.csv", "aggregate.csv"):
+        shutil.copy2(results / name, target / name)
 
 
 if __name__ == "__main__":
