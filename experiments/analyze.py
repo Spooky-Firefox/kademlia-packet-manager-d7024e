@@ -1005,10 +1005,15 @@ def expected_sends(p, attempts=ATTEMPTS):
 
 def useful_sends(latency_ms):
     """Sends whose reply can still arrive before the call gives up: send i
-    goes out at 0.2(i-1) s and its reply lands 2L later, which must be
-    before the 1 s budget ends."""
+    goes out at 0.2(i-1) s and its reply lands 2L later, which must be no
+    later than the 1 s budget's end. A reply due at the same instant as the
+    deadline counts: each resend timer is armed just after its send, so the
+    deadline falls a little late and the reply wins that tie, as measured
+    (98-100% success at L = 500 ms and no loss)."""
     rtt = 2 * latency_ms / 1000
-    return max(0, min(ATTEMPTS, math.ceil((RESEND_S * ATTEMPTS - rtt) / RESEND_S - 1e-9)))
+    if rtt > RESEND_S * ATTEMPTS + 1e-9:
+        return 0
+    return min(ATTEMPTS, math.floor((RESEND_S * ATTEMPTS - rtt) / RESEND_S + 1e-9) + 1)
 
 
 def rpc_success_latency(p, latency_ms):
@@ -1146,11 +1151,12 @@ def latency_notes(runs, report):
     else:
         report.note(f"Measured in a network of N = {n:g} nodes, built at the same latency L, so at latencies "
                     "whose round trip outlasts the retry budget the network could not form at all.")
-    report.note("A reply takes 2L. The transport resends every 200 ms of silence, so from L = 100 ms on (2L ≥ 200 ms) "
-                "every request is sent at least twice before its reply can arrive: duplicate traffic, same answer. "
-                "A send only helps if its reply lands before the call gives up at 1 s, so only "
-                "⌈(1 s − 2L) / 200 ms⌉ of the 5 sends count; at L ≥ 500 ms none do and every datagram RPC fails, "
-                "however reliable the network.")
+    report.note("A reply takes 2L. The transport resends every 200 ms of silence, so once 2L exceeds 200 ms "
+                "(L > 100 ms) every request is sent at least twice before its reply can arrive: duplicate traffic, "
+                "same answer. A send only helps if its reply lands by the time the call gives up at 1 s, so only "
+                "⌊(1 s − 2L) / 200 ms⌋ + 1 of the 5 sends count. At L = 500 ms that is exactly one, the first, "
+                "whose reply is due at the deadline itself and usually just makes it; past 500 ms none do and every "
+                "datagram RPC fails, however reliable the network.")
     report.note(html_table(["L ms", "2L ms", "useful sends", "RPC model (p=0)", "median RTT ms", "sends measured",
                             "value lookup p=0", "value lookup p=0.3"], rows))
 
@@ -1374,8 +1380,8 @@ def heat_latency_loss(runs, report):
     report.section(
         "Heatmaps: latency × packet loss",
         f"N = {n:g} nodes; every combination of one-way latency (0 to 600 ms) and loss (0 to 0.8), 3 seeds each. "
-        "The RPC model here is 1 − (1 − (1−p)²)<sup>u</sup>, where u = ⌈(1 s − 2L) / 200 ms⌉ is how many of the "
-        "5 sends can still get a reply back before the call gives up.")
+        "The RPC model here is 1 − (1 − (1−p)²)<sup>u</sup>, where u = ⌊(1 s − 2L) / 200 ms⌋ + 1 is how many of the "
+        "5 sends can still get a reply back by the time the call gives up (0 once 2L &gt; 1 s).")
     xs, ys, Z = heat_grid(runs, E, "loss", "latency_ms", "find_node_fail_rate")
     measured = 1 - Z
     model = np.array([[rpc_success_latency(p, L) for p in xs] for L in ys])
@@ -1400,15 +1406,28 @@ def heat_latency_loss(runs, report):
                  "log₁₀ of the median node lookup time in ms.", "latency ms", "loss p", "log₁₀ ms")
     xs, ys, Z = heat_grid(runs, E, "latency_ms", "loss", "value_success")
     draw_surface(report, xs, ys, Z, "surf_lat_loss_value", "Value lookup success over latency and loss",
-                 "The cliff at L = 500 ms is the retry budget running out.", "latency ms", "loss p", "success",
+                 "The cliff past L = 500 ms is the retry budget running out.", "latency ms", "loss p", "success",
                  zlim=(0, 1))
     diff = measured - model
     if np.isfinite(diff).any():
-        report.note(f"Measured RPC success differs from the model by at most {np.nanmax(np.abs(diff)):.3f} "
-                    f"(mean absolute difference {np.nanmean(np.abs(diff)):.3f}) across the grid.")
+        # `xs`/`ys` were reused for the surfaces above; the grid's own axes:
+        losses, latencies, _ = heat_grid(runs, E, "loss", "latency_ms", "find_node_fail_rate")
+        i, j = np.unravel_index(np.nanargmax(np.abs(diff)), diff.shape)
+        report.note(f"Measured RPC success differs from the model by at most {abs(diff[i, j]):.3f}, at "
+                    f"L = {latencies[i]:g} ms and p = {losses[j]:g} (mean absolute difference "
+                    f"{np.nanmean(np.abs(diff)):.3f} over the grid).")
+        off = [L for k, L in enumerate(latencies) if np.nanmax(np.abs(diff[k])) > 0.02]
+        if off:
+            report.note(f"The gaps are at L = {', '.join(f'{L:g}' for L in off)} ms, where 2L is a multiple of "
+                        "200 ms: one send's reply falls due at the very instant the call gives up. The model "
+                        "counts such a tie as won. Which really comes first depends on the scheduling delay "
+                        "built up between that send and the deadline: none when it is the last send (a coin "
+                        "toss), more for each earlier one, so the tie at L = 400 and 500 ms, on the 2nd and 1st "
+                        "send, is reliably won, and at 100–300 ms it is lost some of the time, which is why "
+                        "measured success sits a little below the model there.")
     report.note("Two cliffs: along loss the success falls smoothly, as (1−p)² per send; along latency it "
                 "drops in steps, one per 100 ms of L, each step one fewer send whose reply can arrive in time, "
-                "down to zero at L = 500 ms.")
+                "down to zero once L passes 500 ms.")
 
 
 def heat_churn(runs, report, E, other, other_label, title, intro):
