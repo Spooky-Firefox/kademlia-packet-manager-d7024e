@@ -28,10 +28,10 @@ struct VersionRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct LatestPointer {
     tag: String,
-    domain: String,              // "rfin.ch"
-    package: String,             // "java-pair"
-    version: Version,            // 1.1.0
-    version_record_hash: Key,    // which record is the newest
+    domain: String,           // "rfin.ch"
+    package: String,          // "java-pair"
+    version: Version,         // 1.1.0
+    version_record_hash: Key, // which record is the newest
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -64,7 +64,6 @@ impl std::fmt::Display for Version {
     }
 }
 
-
 fn record_key(record: &Signed<VersionRecord>) -> Key {
     hash_bytes(&bincode::serialize(record).unwrap())
 }
@@ -93,11 +92,13 @@ impl<T: Serialize> Signed<T> {
 
 #[cfg(test)]
 mod tests {
-    use crate::package::{LatestPointer, ParseVersionError, Signed, Version, VersionRecord, latest_key, hash_bytes, sign, SigningKey};
+    use crate::package::{
+        LatestPointer, ParseVersionError, Signed, SigningKey, Version, VersionRecord, hash_bytes,
+        latest_key, sign,
+    };
     const VERSION_RECORD_TAG: &str = "version-record";
     const LATEST_POINTER_TAG: &str = "latest-pointer";
-    
-    
+
     #[test]
     fn version_ordering() {
         let a: Version = "1.9.0".parse().unwrap();
@@ -180,10 +181,22 @@ mod tests {
 
     #[test]
     fn latest_hashes_correctly() {
-        assert_eq!(latest_key("rfin.ch", "java-pair"), latest_key("rfin.ch", "java-pair"));
-        assert_ne!(latest_key("rfin.ch", "java-pair"), latest_key("rfin.ch", "other"));
-        assert_ne!(latest_key("rfin.ch", "java-pair"), latest_key("other.ch", "java-pair"));
-        assert_eq!(latest_key("rfin.ch", "java-pair"), hash_bytes(b"rfin.ch:java-pair:latest"));
+        assert_eq!(
+            latest_key("rfin.ch", "java-pair"),
+            latest_key("rfin.ch", "java-pair")
+        );
+        assert_ne!(
+            latest_key("rfin.ch", "java-pair"),
+            latest_key("rfin.ch", "other")
+        );
+        assert_ne!(
+            latest_key("rfin.ch", "java-pair"),
+            latest_key("other.ch", "java-pair")
+        );
+        assert_eq!(
+            latest_key("rfin.ch", "java-pair"),
+            hash_bytes(b"rfin.ch:java-pair:latest")
+        );
     }
 
     fn test_record() -> VersionRecord {
@@ -228,7 +241,7 @@ mod tests {
         signed.sig = vec![1, 2, 3];
         assert!(!signed.verify(&owner.verifying_key()));
     }
-    
+
     #[test]
     fn latest_pointer_can_be_signed() {
         let owner = SigningKey::from_bytes(&[7; 32]);
