@@ -1,12 +1,13 @@
 use crate::close_nodes::{CloseNodes, Contact, ID_BYTES, Key};
 use crate::lookup;
-use crate::node::RealNode;
+use crate::node::Node;
+use crate::rpc_transport::RpcTransport;
 
 use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::time::Instant;
 
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader, Lines};
 
 // vibecoded for better visual clarity
 fn short_id(id: &[u8]) -> String {
@@ -35,7 +36,7 @@ fn parse_key(input: &str) -> Result<Key, String> {
     Ok(key)
 }
 
-fn show_routing_table(node: &RealNode) {
+fn show_routing_table<T: RpcTransport, U: RpcTransport>(node: &Node<T, U>) {
     let (siblings, buckets) = node.routing_snapshot();
 
     println!("siblings:");
@@ -63,7 +64,7 @@ fn show_routing_table(node: &RealNode) {
     }
 }
 
-fn show_datastore(node: &RealNode) {
+fn show_datastore<T: RpcTransport, U: RpcTransport>(node: &Node<T, U>) {
     let values = node.datastore_snapshot();
 
     if values.is_empty() {
@@ -87,10 +88,25 @@ fn print_help() {
     println!("  exit");
 }
 
-pub async fn run(node: &RealNode) -> io::Result<()> {
-    let stdin = BufReader::new(tokio::io::stdin());
-    let mut lines = stdin.lines();
+/// Read commands from stdin and run them as `node`, until `exit` or EOF.
+///
+/// Generic over the transports, so the same prompt drives a real node or one
+/// on the in-process fake network.
+pub async fn run<T: RpcTransport, U: RpcTransport>(node: &Node<T, U>) -> io::Result<()> {
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    run_with(node, &mut lines).await
+}
 
+/// [`run`], reading commands from `lines` instead of a reader of its own.
+///
+/// For a caller that also reads stdin between sessions: two buffered readers
+/// on one stdin would each read ahead and swallow the other's lines.
+pub async fn run_with<T, U, R>(node: &Node<T, U>, lines: &mut Lines<R>) -> io::Result<()>
+where
+    T: RpcTransport,
+    U: RpcTransport,
+    R: AsyncBufRead + Unpin,
+{
     print_help();
 
     loop {

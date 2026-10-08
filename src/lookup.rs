@@ -3,10 +3,28 @@ use crate::hashing::key_for_value;
 use crate::rpc::{FindValue, Rpc};
 use crate::rpc_transport::RpcTransport;
 use futures::stream::{FuturesUnordered, StreamExt};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
+
 /// Kademlia's concurrency parameter: how many `find_node` RPCs a lookup keeps
-/// in flight at once.
-const ALPHA: usize = 3;
+/// in flight at once, unless [`set_alpha`] says otherwise.
+pub const DEFAULT_ALPHA: usize = 3;
+
+static ALPHA: AtomicUsize = AtomicUsize::new(DEFAULT_ALPHA);
+
+/// Change alpha for every lookup in the process from now on. For experiments
+/// that compare values of it; a value below 1 is taken as 1, since a lookup
+/// with nothing in flight would never start.
+pub fn set_alpha(alpha: usize) {
+    ALPHA.store(alpha.max(1), Ordering::Relaxed);
+}
+
+/// The alpha lookups currently use: [`DEFAULT_ALPHA`] unless [`set_alpha`]
+/// changed it.
+pub fn alpha() -> usize {
+    ALPHA.load(Ordering::Relaxed)
+}
 
 pub async fn lookup_node<T, U, A>(rpc: &Rpc<T, U, A>, target: NodeId) -> Vec<Contact>
 where
@@ -14,6 +32,22 @@ where
     U: RpcTransport,
     A: CloseNodes,
 {
+    lookup_node_within(rpc, target, 0).await
+}
+
+/// [`lookup_node`], logged as part of lookup `parent` (0 for none).
+async fn lookup_node_within<T, U, A>(
+    rpc: &Rpc<T, U, A>,
+    target: NodeId,
+    parent: u64,
+) -> Vec<Contact>
+where
+    T: RpcTransport,
+    U: RpcTransport,
+    A: CloseNodes,
+{
+    let started = Instant::now();
+    let alpha = alpha();
     let lookup_id = crate::instrumentation::next_lookup_id();
     let my_id = rpc.my_contact().id;
 
@@ -27,12 +61,15 @@ where
 
     // ids we have already fired a query at: in flight or answered, never re-sent
     let mut queried: HashSet<NodeId> = HashSet::new();
-    // up to ALPHA find_node calls resolving concurrently
+    // how many replies, one leading to the next, it took to hear of each
+    // contact: 0 for what the routing table already held
+    let mut depth: HashMap<NodeId, u32> = candidates.iter().map(|c| (c.id, 0)).collect();
+    // up to alpha find_node calls resolving concurrently
     let mut in_flight = FuturesUnordered::new();
 
     loop {
-        // top the pipeline back up to ALPHA with the closest un-queried nodes
-        while in_flight.len() < ALPHA {
+        // top the pipeline back up to alpha with the closest un-queried nodes
+        while in_flight.len() < alpha {
             let Some(next) = candidates
                 .iter()
                 .find(|contact| !queried.contains(&contact.id))
@@ -47,11 +84,12 @@ where
 
             probe_count += 1;
 
-            in_flight.push(async move { rpc.find_node(&next, target).await });
+            let next_depth = depth[&next.id];
+            in_flight.push(async move { (next_depth, rpc.find_node(&next, target).await) });
         }
 
         // nothing running and nothing left to start: the K closest are settled
-        let Some(mut new_contacts) = in_flight.next().await else {
+        let Some((replied_depth, mut new_contacts)) = in_flight.next().await else {
             break;
         };
         // removes self from contacts, we must never be our own candidate
@@ -62,6 +100,7 @@ where
         // routing table, whether or not it ends up among the K closest here
         for contact in &new_contacts {
             rpc.close_nodes().maybe_add_contact(*contact);
+            depth.entry(contact.id).or_insert(replied_depth + 1);
         }
 
         candidates.extend(new_contacts);
@@ -74,15 +113,20 @@ where
     }
 
     let exact_match = candidates.iter().any(|contact| contact.id == target);
+    // the hop count: how long a chain of replies led to the closest result
+    let hops = candidates.first().map_or(0, |closest| depth[&closest.id]);
 
     // log end of lookup
-    crate::instrumentation::node_lookup_end(
+    crate::instrumentation::node_lookup_end(crate::instrumentation::NodeLookupEnd {
         lookup_id,
-        my_id,
-        probe_count,
-        candidates.len(),
+        parent,
+        node: my_id,
+        probes: probe_count,
+        result_count: candidates.len(),
         exact_match,
-    );
+        hops,
+        duration: started.elapsed(),
+    });
 
     candidates
 }
@@ -93,13 +137,15 @@ where
     U: RpcTransport,
     A: CloseNodes,
 {
+    let started = Instant::now();
+    let alpha = alpha();
     let lookup_id = crate::instrumentation::next_lookup_id();
     let my_id = rpc.my_contact().id;
     let mut probe_count = 0usize;
 
     crate::instrumentation::lookup_start(lookup_id, "value", my_id, key);
 
-    let mut candidates = lookup_node(rpc, key).await;
+    let mut candidates = lookup_node_within(rpc, key, lookup_id).await;
 
     // Routing tables do not contain ourselves, but we may hold the value.
     candidates.push(rpc.my_contact());
@@ -112,7 +158,7 @@ where
     let mut candidates = candidates.into_iter();
 
     loop {
-        while in_flight.len() < ALPHA {
+        while in_flight.len() < alpha {
             let Some(next) = candidates.next() else {
                 break;
             };
@@ -133,7 +179,13 @@ where
         match reply {
             FindValue::Value(value) => {
                 if crate::hashing::key_for_value(&value) == key {
-                    crate::instrumentation::value_lookup_end(lookup_id, my_id, probe_count, true);
+                    crate::instrumentation::value_lookup_end(
+                        lookup_id,
+                        my_id,
+                        probe_count,
+                        true,
+                        started.elapsed(),
+                    );
 
                     return Some((source, value));
                 }
@@ -152,7 +204,13 @@ where
         }
     }
 
-    crate::instrumentation::value_lookup_end(lookup_id, my_id, probe_count, false);
+    crate::instrumentation::value_lookup_end(
+        lookup_id,
+        my_id,
+        probe_count,
+        false,
+        started.elapsed(),
+    );
 
     None
 }
@@ -528,6 +586,16 @@ mod tests {
 
         assert!(result.is_empty());
     }
+    /// Other tests run lookups concurrently with this one, so it only ever
+    /// sets alpha to values a lookup is correct under, and puts it back.
+    #[test]
+    fn alpha_is_clamped_to_at_least_one() {
+        set_alpha(0);
+        assert_eq!(alpha(), 1);
+        set_alpha(DEFAULT_ALPHA);
+        assert_eq!(alpha(), DEFAULT_ALPHA);
+    }
+
     #[tokio::test]
     async fn value_lookup_rejects_value_that_does_not_match_key() {
         let expected_value = b"correct value".to_vec();

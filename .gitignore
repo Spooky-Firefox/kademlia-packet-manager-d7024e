@@ -1,3 +1,9 @@
 /target
 
 metrics.log
+sim.log
+
+experiments/.venv
+experiments/results
+__pycache__
+experiments/results-*
