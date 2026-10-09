@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 mod bootstrap;
 mod cli;
 mod close_nodes;
+mod dns_data;
 mod handle_rpc;
 mod hashing;
 mod instrumentation;
