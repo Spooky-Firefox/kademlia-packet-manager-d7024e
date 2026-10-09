@@ -284,6 +284,39 @@ dead.
 Republishing is not implemented. `REPUBLISH_INTERVAL` (one hour, the paper's
 `tReplicate`) is already passed to `periodic_task` but unused.
 
+## Node keys in DNS
+
+A node's ed25519 verifying key can be published in a DNS TXT record on a
+domain its owner controls, so anyone can fetch the key that goes with that
+name. This is not wired into `Node` yet. Lookup sits behind one trait in
+`src/dns_data.rs`:
+
+```rust
+pub trait DnsData {
+    async fn get_dns_vk(&self, name: impl ToName) -> Option<VerifyingKey>;
+}
+```
+
+The record text is `d7024ePK=` followed by the 32-byte key in hex, 73
+characters in all. `format_vk` writes it and `parse_vk` reads it. The prefix
+labels the record for anyone browsing the zone, and it lets the parser skip
+the other TXT records on a name, such as SPF. `parse_vk` returns `None` for
+anything else: a missing prefix, bad hex, the wrong length, or bytes that are
+not a valid curve point. `get_dns_vk` returns the first record on the name
+that parses, or `None`.
+
+There are two implementations, in `src/dns_data/`:
+
+- `DNS` (`dns.rs`) queries a `domain::resolv::StubResolver`. It joins a
+  record's character strings before parsing, since a long TXT record may be
+  split into several.
+- `FakeDns` (`fake_dns.rs`) holds `(name, text)` pairs in memory. `new()`
+  publishes one record for each of the five `FAKE_KEYS`,
+  `node0.d7024e.test` to `node4.d7024e.test`, whose key pairs are hardcoded so
+  tests can sign with the private half. Lookups go through the same `parse_vk`
+  as `DNS`, and tests can push other records onto `records`. These private
+  keys are public in the repository, so they must never go on a real domain.
+
 ## Metrics
 
 `src/logging.rs` sends log records with the target `metrics` only to
