@@ -1,20 +1,26 @@
-use dashmap::DashMap;
+use dashmap::{DashMap, mapref::entry::Entry};
 use std::future::Future;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::sync::oneshot;
 
-/// A pool of in-flight request slots. Each outbound RPC registers its id here
-/// and gets back a future that resolves when the recv loop calls [`Pending::deliver`]
-/// with a response carrying that id.
+/// A pool of in-flight request slots. Each outbound RPC registers its id and
+/// expected peer here, and gets back a future that resolves when the recv loop
+/// calls [`Pending::deliver`] with a matching response.
 ///
 /// Sharded rather than a single `Mutex<HashMap<..>>`: ids are random, so they
 /// spread evenly across shards and concurrent senders rarely touch the same one.
+
+struct PendingSlot {
+    expected_peer: SocketAddr,
+    tx: oneshot::Sender<Vec<u8>>,
+}
+
 #[derive(Default)]
 pub struct Pending {
-    slots: DashMap<u64, oneshot::Sender<Vec<u8>>>,
-    counter: std::sync::atomic::AtomicU64,
+    slots: DashMap<u64, PendingSlot>,
 }
 
 impl Pending {
@@ -22,30 +28,38 @@ impl Pending {
         Arc::new(Self::default())
     }
 
-    /// Hand out the next request id. A counter rather than a random draw: ids
-    /// only have to be unique among this node's in-flight requests.
-    pub fn next_id(&self) -> u64 {
-        self.counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Register `id` as in-flight. Await the returned future to get the response.
-    pub fn register(self: &Arc<Self>, id: u64) -> PendingResponse {
+    /// Register `id` as an in-flight request to `expected_peer`.
+    /// Returns `None` if that id is already in use.
+    pub fn register(
+        self: &Arc<Self>,
+        id: u64,
+        expected_peer: SocketAddr,
+    ) -> Option<PendingResponse> {
         let (tx, rx) = oneshot::channel();
-        self.slots.insert(id, tx);
-        PendingResponse {
-            id,
-            pending: Arc::clone(self),
-            rx,
+
+        match self.slots.entry(id) {
+            Entry::Vacant(entry) => {
+                entry.insert(PendingSlot { expected_peer, tx });
+
+                Some(PendingResponse {
+                    id,
+                    pending: Arc::clone(self),
+                    rx,
+                })
+            }
+            Entry::Occupied(_) => None,
         }
     }
 
-    /// Hand a response to whoever is awaiting `id`. Returns false if no one was
-    /// waiting: an unsolicited, duplicate, or already-cancelled response.
-    pub fn deliver(&self, id: u64, payload: Vec<u8>) -> bool {
-        match self.slots.remove(&id) {
-            // Err means the caller gave up and dropped its PendingResponse.
-            Some((_, tx)) => tx.send(payload).is_ok(),
+    /// Hand a response to whoever is awaiting `id`, but only if it came from the
+    /// expected peer. Returns false for an unknown id, wrong peer, duplicate,
+    /// or already-cancelled response.
+    pub fn deliver(&self, id: u64, from: SocketAddr, payload: Vec<u8>) -> bool {
+        match self
+            .slots
+            .remove_if(&id, |_, slot| slot.expected_peer == from) // a la DashMap 
+        {
+            Some((_, slot)) => slot.tx.send(payload).is_ok(),
             None => false,
         }
     }
