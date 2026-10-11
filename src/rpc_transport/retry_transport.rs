@@ -114,8 +114,8 @@ impl<T: DataRxTx + Send + Sync + 'static> RetryTransport<T> {
                     continue;
                 }
 
-                if !pending_clone.deliver(request_id(id), buf[ID_LEN..len].into()) {
-                    trace!("No one waiting on id {id} from {addr}, dropping");
+                if !pending_clone.deliver(request_id(id), addr, buf[ID_LEN..len].into()) {
+                    trace!("Reply {id} from {addr} did not match a pending request, dropping");
                 }
             }
         });
@@ -132,8 +132,13 @@ impl<T: DataRxTx + Send + Sync + 'static> RpcTransport for RetryTransport<T> {
         // Masked, not just assumed clear: the tag bit is what marks the reply
         // this registers for, and an id that set it would register under one
         // number and be answered under another.
-        let id = request_id(self.pending.next_id());
-        let msg = self.pending.register(id);
+        let (id, msg) = loop {
+            let id = request_id(rand::random::<u64>());
+
+            if let Some(msg) = self.pending.register(id, address) {
+                break (id, msg);
+            }
+        };
         // Borrowed (never moved) by every select! below: a timed-out attempt
         // must not drop this, or PendingResponse::drop deregisters the id and
         // the eventual reply is delivered to no one.
@@ -170,9 +175,9 @@ mod tests {
     /// The reason requests and replies are told apart by a tag rather than by
     /// "did an id match something pending".
     ///
-    /// Request ids are minted by whoever sends the request, and every node's
-    /// counter starts at 0 — so a peer's first request carries id 0 while our
-    /// own first outgoing call is also waiting on id 0. Matching on the id
+    /// Request ids are local to each sender, so two nodes can still use the same
+    /// numeric id. An untagged datagram must therefore always be treated as a
+    /// request, even if its id happens to match one of our pending requests. Matching on the id
     /// alone would hand that peer's question to whoever is awaiting our
     /// answer: the call resolves with a stranger's request body, and the
     /// request itself is never served.
@@ -183,22 +188,31 @@ mod tests {
         let transport = RetryTransport::with_requests(network.bind_any(), requests);
         let node = transport.socket().local_addr();
 
-        // An outgoing call that nobody will ever answer: it registers the
-        // first id this node hands out, 0, and sits there resending.
-        let nothing_bound: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        // A real endpoint receives our outgoing request but deliberately never
+        // answers it. Reading the datagram lets the test learn the exact random id
+        // currently registered in Pending.
+        let silent_peer = network.bind_any();
+        let silent_peer_addr = silent_peer.local_addr();
+
         let call = tokio::spawn(async move {
             transport
-                .send_receive(b"a question of our own".to_vec(), nothing_bound)
+                .send_receive(b"a question of our own".to_vec(), silent_peer_addr)
                 .await
         });
-        // Let the call register its id before the collision arrives, or there
-        // would be nothing for it to collide with.
+
+        let (_from, outgoing) =
+            tokio::time::timeout(Duration::from_secs(1), silent_peer.recv_from())
+                .await
+                .expect("outgoing request sent within 1s")
+                .expect("silent peer received the request");
+
+        let pending_id = u64::from_be_bytes(outgoing[..ID_LEN].try_into().unwrap());
         sleep(Duration::from_millis(50)).await;
 
-        // A peer asks us something, numbering it from its own counter — which
-        // starts where ours did.
+        // A peer asks us something using the same numeric id as one of our
+        // pending requests.
         let peer = network.bind_any();
-        let mut datagram = 0u64.to_be_bytes().to_vec();
+        let mut datagram = pending_id.to_be_bytes().to_vec();
         datagram.extend_from_slice(b"a question of theirs");
         peer.send_to(&datagram, node);
 
@@ -207,7 +221,7 @@ mod tests {
             .await
             .expect("delivered within 1s")
             .expect("the channel is open");
-        assert_eq!(request.id, 0);
+        assert_eq!(request.id, pending_id);
         assert_eq!(request.payload, b"a question of theirs");
 
         // ...and our own call is still waiting, not resolved by it.
@@ -252,5 +266,42 @@ mod tests {
             inbox.try_recv().is_err(),
             "a reply must not be served as a request"
         );
+    }
+    #[tokio::test]
+    async fn a_reply_from_the_wrong_peer_is_ignored() {
+        let network = Network::new();
+
+        let transport = RetryTransport::new(network.bind_any());
+
+        let peer = network.bind_any();
+        let peer_addr = peer.local_addr();
+
+        let attacker = network.bind_any();
+
+        tokio::spawn(async move {
+            let (from, datagram) = peer.recv_from().await.expect("peer received the request");
+
+            let id = u64::from_be_bytes(datagram[..ID_LEN].try_into().unwrap());
+
+            // Correct reply id, but sent by the wrong endpoint.
+            let mut forged = reply_id(id).to_be_bytes().to_vec();
+            forged.extend_from_slice(b"forged");
+            attacker.send_to(&forged, from);
+
+            // Same id, now from the endpoint the request was actually sent to.
+            let mut legitimate = reply_id(id).to_be_bytes().to_vec();
+            legitimate.extend_from_slice(b"legitimate");
+            peer.send_to(&legitimate, from);
+        });
+
+        let answered = tokio::time::timeout(
+            Duration::from_secs(1),
+            transport.send_receive(b"request".to_vec(), peer_addr),
+        )
+        .await
+        .expect("answered within 1s")
+        .expect("the legitimate peer replied");
+
+        assert_eq!(answered, b"legitimate");
     }
 }
