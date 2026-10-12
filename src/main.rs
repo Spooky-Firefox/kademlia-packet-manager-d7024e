@@ -16,6 +16,7 @@ mod maintenance;
 mod node;
 mod package;
 mod pending;
+mod registry;
 mod rpc;
 mod rpc_transport;
 mod value;
