@@ -78,7 +78,8 @@ impl FakeDns {
 }
 
 impl DnsData for FakeDns {
-    async fn get_dns_vk(&self, name: impl ToName) -> Option<VerifyingKey> {
+    async fn get_dns_vk(&self, domain: &str) -> Option<VerifyingKey> {
+        let name: Name<Vec<u8>> = Name::from_str(domain).ok()?;
         self.records
             .iter()
             .filter(|(domain, _)| domain.name_eq(&name))
@@ -119,7 +120,7 @@ mod tests {
         let dns = FakeDns::new();
 
         for key in &FAKE_KEYS {
-            assert_eq!(dns.get_dns_vk(name(key.domain)).await, key.verifying_key());
+            assert_eq!(dns.get_dns_vk(key.domain).await, key.verifying_key());
         }
     }
 
@@ -129,17 +130,37 @@ mod tests {
         let key = &FAKE_KEYS[2];
         let signature = key.signing_key().unwrap().sign(b"hello");
 
-        let vk = dns.get_dns_vk(name(key.domain)).await.unwrap();
+        let vk = dns.get_dns_vk(key.domain).await.unwrap();
 
         assert!(vk.verify(b"hello", &signature).is_ok());
     }
 
     #[tokio::test]
     async fn unknown_domain_is_none() {
+        assert_eq!(FakeDns::new().get_dns_vk("nobody.d7024e.test").await, None);
+    }
+
+    #[tokio::test]
+    async fn domain_match_ignores_case() {
+        let key = &FAKE_KEYS[1];
+
         assert_eq!(
-            FakeDns::new().get_dns_vk(name("nobody.d7024e.test")).await,
-            None
+            FakeDns::new().get_dns_vk(&key.domain.to_uppercase()).await,
+            key.verifying_key()
         );
+    }
+
+    #[tokio::test]
+    async fn invalid_domain_is_none() {
+        assert_eq!(FakeDns::new().get_dns_vk("a..b").await, None);
+    }
+
+    #[tokio::test]
+    async fn shared_through_arc() {
+        let dns = std::sync::Arc::new(FakeDns::new());
+        let key = &FAKE_KEYS[3];
+
+        assert_eq!(dns.get_dns_vk(key.domain).await, key.verifying_key());
     }
 
     #[tokio::test]
@@ -149,6 +170,6 @@ mod tests {
         dns.records
             .insert(0, (name(key.domain), "v=spf1 -all".to_string()));
 
-        assert_eq!(dns.get_dns_vk(name(key.domain)).await, key.verifying_key());
+        assert_eq!(dns.get_dns_vk(key.domain).await, key.verifying_key());
     }
 }

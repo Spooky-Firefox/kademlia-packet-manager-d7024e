@@ -1,4 +1,7 @@
 use crate::close_nodes::{Contact, Key, NodeId, RecommendedCloseNodes, recommended};
+use crate::dns_data::DnsData;
+use crate::dns_data::dns::Dns;
+use crate::dns_data::fake_dns::FakeDns;
 use crate::handle_rpc::{self, Context};
 use crate::hashing::node_id_from_address;
 use crate::maintenance;
@@ -9,6 +12,7 @@ use crate::rpc_transport::networked_debug_transport::{
 };
 use crate::rpc_transport::tcp_transport::TcpTransport;
 use crate::rpc_transport::udp_transport::UdpTransport;
+use crate::value::Value;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -19,24 +23,26 @@ use tokio::task::JoinHandle;
 
 pub type NodeRpc<T, U> = Arc<Rpc<T, U, Arc<RecommendedCloseNodes>>>;
 
-pub struct Node<T, U>
+pub struct Node<T, U, D>
 where
     T: RpcTransport,
     U: RpcTransport,
+    D: DnsData,
 {
     id: NodeId,
     address: SocketAddr,
     rpc: NodeRpc<T, U>,
-    context: Arc<Context<Arc<RecommendedCloseNodes>>>,
+    context: Arc<Context<Arc<RecommendedCloseNodes>, Arc<D>>>,
     _server_tasks: Vec<JoinHandle<()>>,
 }
-pub type RealNode = Node<UdpTransport, TcpTransport>;
-pub type FakeNode = Node<NetworkedDebugTransport, NetworkedStreamTransport>;
+pub type RealNode = Node<UdpTransport, TcpTransport, Dns>;
+pub type FakeNode = Node<NetworkedDebugTransport, NetworkedStreamTransport, FakeDns>;
 
-impl<T, U> Node<T, U>
+impl<T, U, D> Node<T, U, D>
 where
     T: RpcTransport,
     U: RpcTransport,
+    D: DnsData,
 {
     pub fn id(&self) -> NodeId {
         self.id
@@ -55,6 +61,11 @@ where
 
     pub fn rpc(&self) -> &NodeRpc<T, U> {
         &self.rpc
+    }
+
+    /// Where this node looks up domain owners' keys; the STORE handler shares it.
+    pub fn dns(&self) -> &Arc<D> {
+        &self.context.dns
     }
 
     pub fn routing_snapshot(&self) -> (Vec<Contact>, Vec<(usize, Vec<Contact>)>) {
@@ -79,10 +90,11 @@ where
     }
 }
 
-impl<T, U> Node<T, U>
+impl<T, U, D> Node<T, U, D>
 where
     T: RpcTransport + Send + Sync + 'static,
     U: RpcTransport + Send + Sync + 'static,
+    D: DnsData + 'static,
 {
     pub fn periodic_task(
         &self,
@@ -105,7 +117,7 @@ where
             loop {
                 tokio::time::sleep(maintenance::jittered(republish_interval)).await;
 
-                let values: Vec<(Key, Vec<u8>)> = context
+                let values: Vec<(Key, Value)> = context
                     .values
                     .iter()
                     .map(|entry| (*entry.key(), entry.value().clone()))
@@ -128,7 +140,7 @@ impl RealNode {
 
         let routing = Arc::new(recommended(id));
 
-        let context = Context::new(id, Arc::clone(&routing));
+        let context = Context::new(id, Arc::clone(&routing), Arc::new(Dns::new()));
 
         let (request_tx, request_rx) = mpsc::channel(64);
 
@@ -166,7 +178,7 @@ impl FakeNode {
 
         let routing = Arc::new(recommended(id));
 
-        let context = Context::new(id, Arc::clone(&routing));
+        let context = Context::new(id, Arc::clone(&routing), Arc::new(FakeDns::new()));
 
         let (request_tx, request_rx) = mpsc::channel(64);
 
@@ -285,11 +297,15 @@ mod tests {
         let value = vec![0xAB; 5000];
         let key = crate::hashing::key_for_value(&value);
 
-        assert!(a.rpc().store(&b.contact(), key, value.clone(),).await);
+        assert!(
+            a.rpc()
+                .store(&b.contact(), key, value.clone().into(),)
+                .await
+        );
 
         let result = a.rpc().find_value(&b.contact(), key).await;
 
-        assert_eq!(result, crate::rpc::FindValue::Value(value));
+        assert_eq!(result, crate::rpc::FindValue::Value(value.into()));
     }
 
     #[tokio::test]
@@ -316,7 +332,11 @@ mod tests {
         assert_eq!(c.rpc().ping(b.address()).await, Some(b.id()));
 
         // Preload C with the value.
-        assert!(a.rpc().store(&c.contact(), key, value.clone(),).await);
+        assert!(
+            a.rpc()
+                .store(&c.contact(), key, value.clone().into(),)
+                .await
+        );
         let found: Option<(Contact, Vec<u8>)> = crate::lookup::lookup_value(a.rpc(), key).await;
 
         let c_contact = Contact {
@@ -368,11 +388,11 @@ mod tests {
         let value = vec![0xAB; 5000];
         let key = crate::hashing::key_for_value(&value);
 
-        assert!(a.rpc().store(&b.contact(), key, value.clone()).await);
+        assert!(a.rpc().store(&b.contact(), key, value.clone().into()).await);
 
         let result = a.rpc().find_value(&b.contact(), key).await;
 
-        assert_eq!(result, crate::rpc::FindValue::Value(value));
+        assert_eq!(result, crate::rpc::FindValue::Value(value.into()));
     }
     #[tokio::test]
     async fn high_level_store_replicates_value() {
@@ -391,7 +411,7 @@ mod tests {
         let value = b"hello kademlia".to_vec();
         let expected_key = crate::hashing::key_for_value(&value);
 
-        let key = crate::lookup::store_value(a.rpc(), value.clone()).await;
+        let key = crate::lookup::store_value(a.rpc(), value.clone().into()).await;
 
         assert_eq!(key, expected_key);
 
@@ -399,17 +419,49 @@ mod tests {
         // be among the k closest and receive the value.
         assert_eq!(
             a.rpc().find_value(&a.contact(), key).await,
-            crate::rpc::FindValue::Value(value.clone())
+            crate::rpc::FindValue::Value(value.clone().into())
         );
 
         assert_eq!(
             a.rpc().find_value(&b.contact(), key).await,
-            crate::rpc::FindValue::Value(value.clone())
+            crate::rpc::FindValue::Value(value.clone().into())
         );
 
         assert_eq!(
             a.rpc().find_value(&c.contact(), key).await,
-            crate::rpc::FindValue::Value(value)
+            crate::rpc::FindValue::Value(value.into())
         );
+    }
+
+    /// A package's latest pointer, end to end over the fake network: a
+    /// forged one is refused by every node, the owner's is stored, and a
+    /// reader on another node finds it through its DNS record.
+    #[tokio::test]
+    async fn latest_pointer_round_trips_and_forgery_is_refused() {
+        use crate::dns_data::fake_dns::FAKE_KEYS;
+        use crate::value::signed_latest;
+
+        let network = Network::new();
+        let a = FakeNode::new(&network);
+        let b = FakeNode::new(&network);
+        let c = FakeNode::new(&network);
+        assert_eq!(b.rpc().ping(a.address()).await, Some(a.id()));
+        assert_eq!(c.rpc().ping(b.address()).await, Some(b.id()));
+
+        let domain = FAKE_KEYS[0].domain;
+        let owner = FAKE_KEYS[0].signing_key().unwrap();
+        let imposter = FAKE_KEYS[1].signing_key().unwrap();
+
+        let forged = signed_latest(domain, "pkg", "9.0.0", &imposter);
+        let key = crate::lookup::store_value(a.rpc(), Value::Latest(forged)).await;
+        for node in [&a, &b, &c] {
+            assert!(node.context.values.get(&key).is_none(), "forgery stored");
+        }
+
+        let genuine = signed_latest(domain, "pkg", "1.0.0", &owner);
+        crate::lookup::store_value(a.rpc(), Value::Latest(genuine.clone())).await;
+
+        let found = crate::lookup::get_latest(c.rpc(), c.dns(), domain, "pkg").await;
+        assert_eq!(found, Some(genuine));
     }
 }

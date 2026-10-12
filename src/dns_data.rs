@@ -1,10 +1,22 @@
 pub mod dns;
 pub mod fake_dns;
-use domain::base::name::ToName;
 use ed25519_dalek::{PUBLIC_KEY_LENGTH, VerifyingKey};
 
-pub trait DnsData {
-    async fn get_dns_vk(&self, name: impl ToName) -> Option<VerifyingKey>;
+pub trait DnsData: Send + Sync {
+    // The domain is a plain string because that is how records carry it.
+    // A string that is not a valid domain name gives `None`, like a domain
+    // with no key.
+    //
+    // The future is `Send`, and the resolver `Send + Sync`, so a STORE
+    // handler generic over it can still run inside `tokio::spawn`; an
+    // `async fn` in the impl satisfies it.
+    fn get_dns_vk(&self, domain: &str) -> impl Future<Output = Option<VerifyingKey>> + Send;
+}
+
+impl<T: DnsData> DnsData for std::sync::Arc<T> {
+    fn get_dns_vk(&self, domain: &str) -> impl Future<Output = Option<VerifyingKey>> + Send {
+        self.as_ref().get_dns_vk(domain)
+    }
 }
 
 pub const TXT_PREFIX: &str = "d7024ePK=";

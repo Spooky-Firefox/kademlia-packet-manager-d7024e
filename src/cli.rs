@@ -152,7 +152,7 @@ pub async fn run(node: &RealNode) -> io::Result<()> {
                 };
 
                 let size = value.len();
-                let key = lookup::store_value(node.rpc(), value).await;
+                let key = lookup::store_value(node.rpc(), value.into()).await;
 
                 // PUT must print the complete key, not the abbreviated
                 // debugging representation.

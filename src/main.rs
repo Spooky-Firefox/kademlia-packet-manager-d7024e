@@ -16,6 +16,7 @@ mod package;
 mod pending;
 mod rpc;
 mod rpc_transport;
+mod value;
 
 use node::RealNode;
 

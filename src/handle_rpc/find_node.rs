@@ -13,6 +13,7 @@
 //! dispatcher learns it before this handler runs.
 
 use crate::close_nodes::{CloseNodes, Contact, NodeId};
+use crate::dns_data::DnsData;
 use crate::handle_rpc::Context;
 use std::net::SocketAddr;
 
@@ -27,8 +28,8 @@ pub fn decode_reply(reply: &[u8]) -> Option<Vec<Contact>> {
 }
 
 /// Answer a FIND_NODE for the target id in `body`.
-pub async fn handle<A: CloseNodes>(
-    context: &Context<A>,
+pub async fn handle<A: CloseNodes, D: DnsData>(
+    context: &Context<A, D>,
     _id: u64,
     _from: SocketAddr,
     body: &[u8],
@@ -46,6 +47,7 @@ pub async fn handle<A: CloseNodes>(
 mod tests {
     use super::*;
     use crate::close_nodes::recommended;
+    use crate::dns_data::fake_dns::FakeDns;
 
     fn addr() -> SocketAddr {
         "127.0.0.1:9000".parse().unwrap()
@@ -54,7 +56,7 @@ mod tests {
     #[tokio::test]
     async fn find_node_returns_the_contacts_it_knows() {
         let my_id = [0u8; 32];
-        let context = Context::new(my_id, recommended(my_id));
+        let context = Context::new(my_id, recommended(my_id), FakeDns::new());
 
         let known = Contact {
             id: [2u8; 32],
@@ -75,7 +77,7 @@ mod tests {
     #[tokio::test]
     async fn find_node_reply_carries_no_id_of_its_own() {
         let my_id = [0u8; 32];
-        let context = Context::new(my_id, recommended(my_id));
+        let context = Context::new(my_id, recommended(my_id), FakeDns::new());
 
         let body = encode_request([1u8; 32]).unwrap();
         let reply = handle(&context, 42, addr(), &body).await.unwrap();
@@ -86,7 +88,7 @@ mod tests {
     #[tokio::test]
     async fn find_node_rejects_invalid_body() {
         let my_id = [0u8; 32];
-        let context = Context::new(my_id, recommended(my_id));
+        let context = Context::new(my_id, recommended(my_id), FakeDns::new());
 
         assert!(handle(&context, 42, addr(), b"too short").await.is_none());
     }

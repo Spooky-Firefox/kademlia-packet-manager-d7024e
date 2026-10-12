@@ -16,6 +16,7 @@
 //! before any handler runs.
 
 use crate::close_nodes::{CloseNodes, NodeId};
+use crate::dns_data::DnsData;
 use crate::handle_rpc::Context;
 use log::trace;
 use std::net::SocketAddr;
@@ -30,8 +31,8 @@ pub fn decode_reply(reply: &[u8]) -> Option<NodeId> {
 /// `body` is expected to be empty; a non-empty one is a peer that knows
 /// something we do not, and is answered anyway. Refusing to reply would only
 /// make us look dead to a node that is talking to us in good faith.
-pub async fn handle<A: CloseNodes>(
-    context: &Context<A>,
+pub async fn handle<A: CloseNodes, D: DnsData>(
+    context: &Context<A, D>,
     id: u64,
     from: SocketAddr,
     body: &[u8],
@@ -49,6 +50,7 @@ pub async fn handle<A: CloseNodes>(
 mod tests {
     use super::*;
     use crate::close_nodes::recommended;
+    use crate::dns_data::fake_dns::FakeDns;
 
     fn addr() -> SocketAddr {
         "127.0.0.1:9000".parse().unwrap()
@@ -57,7 +59,7 @@ mod tests {
     #[tokio::test]
     async fn ping_answers_with_our_own_id() {
         let my_id = [7u8; 32];
-        let context = Context::new(my_id, recommended(my_id));
+        let context = Context::new(my_id, recommended(my_id), FakeDns::new());
 
         let reply = handle(&context, 1, addr(), b"").await.unwrap();
 
@@ -68,7 +70,7 @@ mod tests {
     #[tokio::test]
     async fn ping_with_an_unexpected_body_is_still_answered() {
         let my_id = [7u8; 32];
-        let context = Context::new(my_id, recommended(my_id));
+        let context = Context::new(my_id, recommended(my_id), FakeDns::new());
 
         let reply = handle(&context, 1, addr(), b"not a ping").await.unwrap();
 

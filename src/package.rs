@@ -5,43 +5,48 @@ use std::str::FromStr;
 
 /// a `major.minor.patch` version. Ord lets us do math stuff
 #[derive(PartialOrd, Ord, PartialEq, Eq, Debug, Clone, Copy, Serialize, Deserialize)]
-struct Version {
-    major: u32,
-    minor: u32,
-    patch: u32,
+pub(crate) struct Version {
+    pub(crate) major: u32,
+    pub(crate) minor: u32,
+    pub(crate) patch: u32,
 }
 
 /// a body plus the owner's ed25519 signature over `body_hash(body)`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct Signed<T> {
-    body: T,
-    sig: Vec<u8>,
+pub(crate) struct Signed<T> {
+    pub(crate) body: T,
+    pub(crate) sig: Vec<u8>,
 }
 
 /// VersionRecord points at its blob and at the previous version's record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct VersionRecord {
-    tag: String,
-    domain: String,
-    package: String,
-    version: Version,
-    blob_hash: Key,
-    prev: Key,
+pub(crate) struct VersionRecord {
+    pub(crate) tag: String,
+    pub(crate) domain: String,
+    pub(crate) package: String,
+    pub(crate) version: Version,
+    pub(crate) blob_hash: Key,
+    pub(crate) prev: Key,
 }
 
 /// names the newest `VersionRecord` of a package, stored under `latest_key`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct LatestPointer {
-    tag: String,
-    domain: String,           // "rfin.ch"
-    package: String,          // "java-pair"
-    version: Version,         // 1.1.0
-    version_record_hash: Key, // which record is the newest
+pub(crate) struct LatestPointer {
+    pub(crate) tag: String,
+    pub(crate) domain: String,           // "rfin.ch"
+    pub(crate) package: String,          // "java-pair"
+    pub(crate) version: Version,         // 1.1.0
+    pub(crate) version_record_hash: Key, // which record is the newest
 }
+
+/// `VersionRecord::tag`, telling a version record apart from other signed bodies.
+pub(crate) const VERSION_RECORD_TAG: &str = "version-record";
+/// `LatestPointer::tag`, telling a latest pointer apart from other signed bodies.
+pub(crate) const LATEST_POINTER_TAG: &str = "latest-pointer";
 
 /// returned when a string is not three dot-separated `u32`s.
 #[derive(Debug, PartialEq, Eq)]
-struct ParseVersionError;
+pub(crate) struct ParseVersionError;
 
 impl FromStr for Version {
     type Err = ParseVersionError;
@@ -71,44 +76,61 @@ impl std::fmt::Display for Version {
 }
 
 /// the DHT key a signed version record is stored under: the hash of the whole record.
-fn record_key(record: &Signed<VersionRecord>) -> Key {
-    hash_bytes(&bincode::serialize(record).unwrap())
+pub(crate) fn record_key(record: &Signed<VersionRecord>) -> Option<Key> {
+    Some(hash_bytes(&bincode::serialize(record).ok()?))
 }
 
 /// the fixed DHT key of a package's `LatestPointer`: `hash("domain:package:latest")`.
-fn latest_key(domain: &str, package: &str) -> Key {
+pub(crate) fn latest_key(domain: &str, package: &str) -> Key {
     hash_bytes(format!("{}:{}:latest", domain, package).as_bytes())
 }
 
-/// the bincode encoding of a body, without its signature.
-fn body_hash<T: Serialize>(body: &T) -> Key {
-    hash_bytes(&bincode::serialize(body).unwrap())
+/// the hash of a body's bincode encoding, without its signature. `None` only
+/// if the body cannot be encoded, which the record types here never hit.
+fn body_hash<T: Serialize>(body: &T) -> Option<Key> {
+    Some(hash_bytes(&bincode::serialize(body).ok()?))
 }
 
 /// sign `body` with the domain owner's secret key.
-fn sign<T: Serialize>(body: T, key: &SigningKey) -> Signed<T> {
-    let sig = key.sign(&body_hash(&body)).to_bytes().to_vec();
-    Signed { body, sig }
+pub(crate) fn sign<T: Serialize>(body: T, key: &SigningKey) -> Option<Signed<T>> {
+    let sig = key.sign(&body_hash(&body)?).to_bytes().to_vec();
+    Some(Signed { body, sig })
 }
 
 impl<T: Serialize> Signed<T> {
     /// True if `sig` is a valid signature of this body by `owner`.
-    fn verify(&self, owner: &VerifyingKey) -> bool {
+    pub(crate) fn verify(&self, owner: &VerifyingKey) -> bool {
         let Ok(sig) = Signature::from_slice(&self.sig) else {
             return false; // garbage bytes, not even a signature
         };
-        owner.verify(&body_hash(&self.body), &sig).is_ok()
+        let Some(hash) = body_hash(&self.body) else {
+            return false;
+        };
+        owner.verify(&hash, &sig).is_ok()
     }
+}
+
+/// True if `pointer` is a latest pointer signed by `owner`, the key the DNS
+/// record on `pointer.body.domain` names. Whether it is stored under the right
+/// key is [`Value::key`](crate::value::Value::key)'s job, and whether it is
+/// newer than what it replaces is the STORE handler's.
+///
+/// A domain with a `:` is refused. [`latest_key`] joins domain and package
+/// with `:`, so without this the owner of `a` could sign package `b:c` and
+/// land on the key of package `c` on domain `a:b`. A hostname never contains
+/// a `:`, so the split is unambiguous for every real domain.
+pub(crate) fn latest_is_valid(pointer: &Signed<LatestPointer>, owner: &VerifyingKey) -> bool {
+    pointer.body.tag == LATEST_POINTER_TAG
+        && !pointer.body.domain.contains(':')
+        && pointer.verify(owner)
 }
 
 #[cfg(test)]
 mod tests {
     use crate::package::{
-        LatestPointer, ParseVersionError, Signed, SigningKey, Version, VersionRecord, hash_bytes,
-        latest_key, sign,
+        LATEST_POINTER_TAG, LatestPointer, ParseVersionError, Signed, SigningKey,
+        VERSION_RECORD_TAG, Version, VersionRecord, hash_bytes, latest_is_valid, latest_key, sign,
     };
-    const VERSION_RECORD_TAG: &str = "version-record";
-    const LATEST_POINTER_TAG: &str = "latest-pointer";
 
     #[test]
     fn version_ordering() {
@@ -224,7 +246,7 @@ mod tests {
     #[test]
     fn owner_signature_verifies() {
         let owner = SigningKey::from_bytes(&[7; 32]);
-        let signed = sign(test_record(), &owner);
+        let signed = sign(test_record(), &owner).unwrap();
         assert!(signed.verify(&owner.verifying_key()));
     }
 
@@ -232,7 +254,7 @@ mod tests {
     fn imposter_signature_fails() {
         let owner = SigningKey::from_bytes(&[7; 32]);
         let imposter = SigningKey::from_bytes(&[8; 32]);
-        let signed = sign(test_record(), &imposter);
+        let signed = sign(test_record(), &imposter).unwrap();
         // signed by someone else, checked against the real owner's PK
         assert!(!signed.verify(&owner.verifying_key()));
     }
@@ -240,7 +262,7 @@ mod tests {
     #[test]
     fn tampered_record_fails() {
         let owner = SigningKey::from_bytes(&[7; 32]);
-        let mut signed = sign(test_record(), &owner);
+        let mut signed = sign(test_record(), &owner).unwrap();
         signed.body.blob_hash = [9; 32]; // swap in a different binary after signing
         assert!(!signed.verify(&owner.verifying_key()));
     }
@@ -248,7 +270,7 @@ mod tests {
     #[test]
     fn garbage_signature_fails() {
         let owner = SigningKey::from_bytes(&[7; 32]);
-        let mut signed = sign(test_record(), &owner);
+        let mut signed = sign(test_record(), &owner).unwrap();
         signed.sig = vec![1, 2, 3];
         assert!(!signed.verify(&owner.verifying_key()));
     }
@@ -263,6 +285,54 @@ mod tests {
             version: "1.0.0".parse().unwrap(),
             version_record_hash: [2; 32],
         };
-        assert!(sign(pointer, &owner).verify(&owner.verifying_key()));
+        assert!(
+            sign(pointer, &owner)
+                .unwrap()
+                .verify(&owner.verifying_key())
+        );
+    }
+
+    fn test_pointer(tag: &str) -> LatestPointer {
+        LatestPointer {
+            tag: tag.to_string(),
+            domain: "rfin.ch".to_string(),
+            package: "java-pair".to_string(),
+            version: "1.0.0".parse().unwrap(),
+            version_record_hash: [2; 32],
+        }
+    }
+
+    #[test]
+    fn latest_is_valid_accepts_owner_signed_pointer() {
+        let owner = SigningKey::from_bytes(&[7; 32]);
+        let signed = sign(test_pointer(LATEST_POINTER_TAG), &owner).unwrap();
+        assert!(latest_is_valid(&signed, &owner.verifying_key()));
+    }
+
+    #[test]
+    fn latest_is_valid_rejects_wrong_tag() {
+        // a correctly signed body of another kind must not pass as a pointer
+        let owner = SigningKey::from_bytes(&[7; 32]);
+        let signed = sign(test_pointer(VERSION_RECORD_TAG), &owner).unwrap();
+        assert!(!latest_is_valid(&signed, &owner.verifying_key()));
+    }
+
+    #[test]
+    fn latest_is_valid_rejects_colon_in_domain() {
+        // "a" + "b:c" would share latest_key with "a:b" + "c"
+        assert_eq!(latest_key("a", "b:c"), latest_key("a:b", "c"));
+        let owner = SigningKey::from_bytes(&[7; 32]);
+        let mut pointer = test_pointer(LATEST_POINTER_TAG);
+        pointer.domain = "a:b".to_string();
+        let signed = sign(pointer, &owner).unwrap();
+        assert!(!latest_is_valid(&signed, &owner.verifying_key()));
+    }
+
+    #[test]
+    fn latest_is_valid_rejects_other_signer() {
+        let owner = SigningKey::from_bytes(&[7; 32]);
+        let imposter = SigningKey::from_bytes(&[8; 32]);
+        let signed = sign(test_pointer(LATEST_POINTER_TAG), &imposter).unwrap();
+        assert!(!latest_is_valid(&signed, &owner.verifying_key()));
     }
 }

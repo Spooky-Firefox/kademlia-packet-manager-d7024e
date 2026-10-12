@@ -41,7 +41,7 @@ pub fn jittered(period: Duration) -> Duration {
 /// This avoids holding DashMap guards while a lookup or STORE is in progress.
 pub async fn republish_values<T, U, A>(
     rpc: &Rpc<T, U, A>,
-    values: Vec<(crate::close_nodes::Key, Vec<u8>)>,
+    values: Vec<(crate::close_nodes::Key, crate::value::Value)>,
 ) where
     T: RpcTransport,
     U: RpcTransport,
@@ -151,7 +151,7 @@ mod tests {
             assert!(
                 publisher
                     .rpc()
-                    .store(&holder.contact(), key, value.clone())
+                    .store(&holder.contact(), key, value.clone().into())
                     .await
             );
         }
@@ -176,7 +176,7 @@ mod tests {
         }
 
         // The last surviving replica performs one republishing round.
-        republish_values(publisher.rpc(), vec![(key, value.clone())]).await;
+        republish_values(publisher.rpc(), vec![(key, value.clone().into())]).await;
 
         // Copies should now exist on replacement nodes.
         let republished_to: Vec<Contact> = replacements
@@ -293,10 +293,10 @@ mod tests {
         let value = b"republished value".to_vec();
         let key = crate::hashing::key_for_value(&value);
 
-        republish_values(publisher.rpc(), vec![(key, value.clone())]).await;
+        republish_values(publisher.rpc(), vec![(key, value.clone().into())]).await;
 
         let result = publisher.rpc().find_value(&peer.contact(), key).await;
 
-        assert_eq!(result, crate::rpc::FindValue::Value(value));
+        assert_eq!(result, crate::rpc::FindValue::Value(value.into()));
     }
 }
