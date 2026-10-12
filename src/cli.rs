@@ -76,17 +76,22 @@ fn parse_install_name(input: &str) -> Result<(&str, &str, Option<Version>), &'st
     Ok((domain, package, requested_version))
 }
 
-async fn load_publisher_key(node: &RealNode, domain: &str) -> Result<SigningKey, String> {
+async fn load_publisher_key(node: &RealNode) -> Result<SigningKey, String> {
     match node.dns().as_ref() {
-        // Development only: use the test identities
-        // corresponding to the fake DNS records.
-        DnsBackend::Fake(_) => FAKE_KEYS
-            .iter()
-            .find(|key| key.domain.eq_ignore_ascii_case(domain))
-            .and_then(|key| key.signing_key())
-            .ok_or_else(|| format!("no test signing key for {domain}")),
+        DnsBackend::Fake(_) => {
+            // Each node uses one configured test publisher identity.
+            // Default to node0 if no identity was specified.
+            let identity = std::env::var("D7024E_FAKE_PUBLISHER")
+                .unwrap_or_else(|_| FAKE_KEYS[0].domain.to_string());
 
-        // Real DNS: private keys must be provided by the publisher.
+            FAKE_KEYS
+                .iter()
+                .find(|key| key.domain.eq_ignore_ascii_case(&identity))
+                .ok_or_else(|| format!("unknown fake publisher identity: {identity}"))?
+                .signing_key()
+                .ok_or_else(|| format!("invalid fake publisher key for {identity}"))
+        }
+
         DnsBackend::Real(_) => {
             let path = std::env::var("D7024E_SIGNING_KEY_FILE")
                 .map_err(|_| "set D7024E_SIGNING_KEY_FILE to your private key file".to_string())?;
@@ -573,7 +578,7 @@ pub async fn run(node: &RealNode) -> io::Result<()> {
                 let size = blob.len();
 
                 // 2. Obtain the private key for this domain.
-                let signer = match load_publisher_key(node, options.domain).await {
+                let signer = match load_publisher_key(node).await {
                     Ok(key) => key,
                     Err(error) => {
                         println!("cannot publish: {error}");
