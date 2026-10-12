@@ -73,7 +73,12 @@ pub(crate) struct InstalledPackage {
     pub(crate) blob_key: Key,
     pub(crate) blob: Vec<u8>,
 }
-
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct PublishedVersion {
+    pub(crate) version: Version,
+    pub(crate) blob_key: Key,
+    pub(crate) is_latest: bool,
+}
 pub(crate) fn prepare_publication(
     domain: &str,
     package: &str,
@@ -286,6 +291,39 @@ where
         blob_key,
         blob,
     })
+}
+
+/// List all verified versions of a package, newest first.
+///
+/// Version records are authenticated, but package blobs are not downloaded here.
+pub(crate) async fn show_package<T, U, A, D>(
+    rpc: &Rpc<T, U, A>,
+    dns: &D,
+    domain: &str,
+    package: &str,
+) -> Result<Vec<PublishedVersion>, ChainError>
+where
+    T: RpcTransport,
+    U: RpcTransport,
+    A: CloseNodes,
+    D: DnsData,
+{
+    // Retrieve and verify the complete signed version history.
+    let history = crate::version_chain::load_chain(rpc, dns, domain, package).await?;
+
+    // Convert the signed records into information
+    // suitable for displaying to a user.
+    let versions = history
+        .into_iter()
+        .enumerate()
+        .map(|(index, record)| PublishedVersion {
+            version: record.body.version,
+            blob_key: record.body.blob_hash,
+            is_latest: index == 0,
+        })
+        .collect();
+
+    Ok(versions)
 }
 
 #[cfg(test)]
@@ -1048,5 +1086,54 @@ mod tests {
             Err(InstallError::BlobUnavailable(key))
                 if key == missing_blob_key
         ));
+    }
+
+    #[tokio::test]
+    async fn show_lists_verified_versions() {
+        use crate::dns_data::fake_dns::FAKE_KEYS;
+        use crate::node::FakeNode;
+        use crate::rpc_transport::networked_debug_transport::Network;
+
+        let network = Network::new();
+        let node = FakeNode::new(&network);
+
+        let domain = FAKE_KEYS[0].domain;
+        let signer = FAKE_KEYS[0].signing_key().unwrap();
+
+        // Publish two package versions.
+        for (version, contents) in [
+            ("1.0.0", b"first".as_slice()),
+            ("2.0.0", b"second".as_slice()),
+        ] {
+            publish_package(
+                node.rpc(),
+                node.dns().as_ref(),
+                domain,
+                "calculator",
+                version.parse().unwrap(),
+                contents.to_vec(),
+                &signer,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        }
+
+        let versions = show_package(node.rpc(), node.dns().as_ref(), domain, "calculator")
+            .await
+            .unwrap();
+
+        assert_eq!(versions.len(), 2);
+
+        // Newest version appears first.
+        assert_eq!(versions[0].version, "2.0.0".parse().unwrap());
+        assert!(versions[0].is_latest);
+        assert_eq!(versions[0].blob_key, key_for_value(b"second"));
+
+        // The older version is still listed.
+        assert_eq!(versions[1].version, "1.0.0".parse().unwrap());
+        assert!(!versions[1].is_latest);
+        assert_eq!(versions[1].blob_key, key_for_value(b"first"));
     }
 }
