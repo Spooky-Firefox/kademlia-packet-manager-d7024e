@@ -48,9 +48,12 @@ pub async fn handle<A: CloseNodes, D: DnsData>(
     }
 
     match &value {
-        Value::Blob(_) => {
-            context.values.insert(key, value);
-        }
+        Value::Blob(_) => match context.values.entry(key) {
+            Entry::Occupied(slot) if matches!(slot.get(), Value::Latest(_)) => return None,
+            entry => {
+                entry.insert(value);
+            }
+        },
         Value::Latest(pointer) => {
             let owner = context.dns.get_dns_vk(&pointer.body.domain).await?;
             if !latest_is_valid(pointer, &owner) {
@@ -79,8 +82,10 @@ pub async fn handle<A: CloseNodes, D: DnsData>(
 fn replaces(stored: &Value, new: &Signed<LatestPointer>) -> bool {
     match stored {
         Value::Latest(old) => new.body.version > old.body.version || new == old,
-        // Only a SHA-256 collision puts a blob under a latest key; keep it.
-        Value::Blob(_) => false,
+        // Anyone can store the text a latest key hashes as a blob, so a blob here
+        // is a squatter. A pointer only reaches this point once the owner's
+        // signature has been checked, so it wins.
+        Value::Blob(_) => true, // prevents attacker from blocking owner
     }
 }
 
@@ -317,5 +322,56 @@ mod tests {
             store(&context, &value).await,
             "a republish must be accepted"
         );
+    }
+
+    /// A blob of the public text a latest key hashes, so it lands on that key.
+    fn squatting_blob(owner: &FakeKey) -> Value {
+        Value::Blob(format!("{}:pkg:latest", owner.domain).into_bytes())
+    }
+
+    #[tokio::test]
+    async fn blob_does_not_replace_latest() {
+        let context = context();
+        let pointer = latest(&FAKE_KEYS[0], "1.0.0", &FAKE_KEYS[0]);
+        let blob = squatting_blob(&FAKE_KEYS[0]);
+        assert_eq!(blob.key(), pointer.key());
+
+        assert!(store(&context, &pointer).await);
+        assert!(!store(&context, &blob).await);
+        assert_eq!(
+            context.values.get(&pointer.key()).as_deref(),
+            Some(&pointer)
+        );
+
+        let newer = latest(&FAKE_KEYS[0], "1.1.0", &FAKE_KEYS[0]);
+        assert!(
+            store(&context, &newer).await,
+            "the owner must still be able to publish"
+        );
+    }
+
+    #[tokio::test]
+    async fn latest_replaces_squatting_blob() {
+        let context = context();
+        let blob = squatting_blob(&FAKE_KEYS[0]);
+        let pointer = latest(&FAKE_KEYS[0], "1.0.0", &FAKE_KEYS[0]);
+
+        assert!(store(&context, &blob).await);
+        assert!(store(&context, &pointer).await);
+        assert_eq!(
+            context.values.get(&pointer.key()).as_deref(),
+            Some(&pointer)
+        );
+    }
+
+    #[tokio::test]
+    async fn forged_latest_does_not_replace_squatting_blob() {
+        let context = context();
+        let blob = squatting_blob(&FAKE_KEYS[0]);
+        let forged = latest(&FAKE_KEYS[0], "1.0.0", &FAKE_KEYS[1]);
+
+        assert!(store(&context, &blob).await);
+        assert!(!store(&context, &forged).await);
+        assert_eq!(context.values.get(&blob.key()).as_deref(), Some(&blob));
     }
 }
