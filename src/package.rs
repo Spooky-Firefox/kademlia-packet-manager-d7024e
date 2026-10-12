@@ -3,6 +3,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
+/// a `major.minor.patch` version. Ord lets us do math stuff
 #[derive(PartialOrd, Ord, PartialEq, Eq, Debug, Clone, Copy, Serialize, Deserialize)]
 struct Version {
     major: u32,
@@ -10,11 +11,14 @@ struct Version {
     patch: u32,
 }
 
+/// a body plus the owner's ed25519 signature over `body_hash(body)`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Signed<T> {
     body: T,
     sig: Vec<u8>,
 }
+
+/// VersionRecord points at its blob and at the previous version's record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct VersionRecord {
     tag: String,
@@ -25,6 +29,7 @@ struct VersionRecord {
     prev: Key,
 }
 
+/// names the newest `VersionRecord` of a package, stored under `latest_key`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct LatestPointer {
     tag: String,
@@ -34,6 +39,7 @@ struct LatestPointer {
     version_record_hash: Key, // which record is the newest
 }
 
+/// returned when a string is not three dot-separated `u32`s.
 #[derive(Debug, PartialEq, Eq)]
 struct ParseVersionError;
 
@@ -64,24 +70,29 @@ impl std::fmt::Display for Version {
     }
 }
 
+/// the DHT key a signed version record is stored under: the hash of the whole record.
 fn record_key(record: &Signed<VersionRecord>) -> Key {
     hash_bytes(&bincode::serialize(record).unwrap())
 }
 
+/// the fixed DHT key of a package's `LatestPointer`: `hash("domain:package:latest")`.
 fn latest_key(domain: &str, package: &str) -> Key {
     hash_bytes(format!("{}:{}:latest", domain, package).as_bytes())
 }
 
+/// the bincode encoding of a body, without its signature.
 fn body_hash<T: Serialize>(body: &T) -> Key {
     hash_bytes(&bincode::serialize(body).unwrap())
 }
 
+/// sign `body` with the domain owner's secret key.
 fn sign<T: Serialize>(body: T, key: &SigningKey) -> Signed<T> {
     let sig = key.sign(&body_hash(&body)).to_bytes().to_vec();
     Signed { body, sig }
 }
 
 impl<T: Serialize> Signed<T> {
+    /// True if `sig` is a valid signature of this body by `owner`.
     fn verify(&self, owner: &VerifyingKey) -> bool {
         let Ok(sig) = Signature::from_slice(&self.sig) else {
             return false; // garbage bytes, not even a signature
