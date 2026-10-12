@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 mod bootstrap;
 mod cli;
 mod close_nodes;
+mod dns_data;
 mod handle_rpc;
 mod hashing;
 mod instrumentation;
@@ -15,6 +16,7 @@ mod package;
 mod pending;
 mod rpc;
 mod rpc_transport;
+mod value;
 
 use node::RealNode;
 
