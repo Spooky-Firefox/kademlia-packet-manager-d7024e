@@ -77,12 +77,12 @@ where
         (siblings, buckets)
     }
 
-    pub fn datastore_snapshot(&self) -> Vec<(Key, usize)> {
+    pub fn datastore_snapshot(&self) -> Vec<(Key, Value)> {
         let mut values: Vec<_> = self
             .context
             .values
             .iter()
-            .map(|entry| (*entry.key(), entry.value().len()))
+            .map(|entry| (*entry.key(), entry.value().clone()))
             .collect();
 
         values.sort_by_key(|(key, _)| *key);

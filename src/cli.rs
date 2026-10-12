@@ -4,7 +4,10 @@ use crate::dns_data::{DnsBackend, fake_dns::FAKE_KEYS};
 use crate::lookup;
 use crate::node::RealNode;
 use crate::package::Version;
+use crate::package::{Signed, VERSION_RECORD_TAG, VersionRecord, record_key};
+use crate::value::Value;
 
+use bincode::Options;
 use ed25519_dalek::{SECRET_KEY_LENGTH, SigningKey};
 use std::io::{self, Write};
 use std::net::SocketAddr;
@@ -200,6 +203,65 @@ fn show_routing_table(node: &RealNode) {
     }
 }
 
+/// Format a locally stored DHT value for the datastore listing.
+///
+/// Signed version records are stored as blobs, so we attempt to
+/// decode them. This is for display, not signature verification.
+fn describe_datastore_entry(key: &Key, value: &Value) -> String {
+    let key_hex = hex::encode(key);
+
+    match value {
+        Value::Latest(pointer) => {
+            format!(
+                "{key_hex}  latest pointer ({} bytes)\n\
+                 \x20   package: {}:{}\n\
+                 \x20   version: {}\n\
+                 \x20   record: {}",
+                value.len(),
+                pointer.body.domain,
+                pointer.body.package,
+                pointer.body.version,
+                hex::encode(pointer.body.version_record_hash),
+            )
+        }
+
+        Value::Blob(bytes) => {
+            // A signed version record is serialized and stored
+            // as an ordinary content-addressed blob.
+            //
+            // Bound decoding work: arbitrary blobs are not
+            // necessarily valid bincode records.
+            let decoded = bincode::DefaultOptions::new()
+                .with_fixint_encoding()
+                .with_limit(64 * 1024)
+                .allow_trailing_bytes()
+                .deserialize::<Signed<VersionRecord>>(bytes);
+
+            if let Ok(record) = decoded {
+                // Do not mistake an arbitrary blob for a record.
+                if record.body.tag == VERSION_RECORD_TAG && record_key(&record) == Some(*key) {
+                    return format!(
+                        "{key_hex}  version record ({} bytes)\n\
+                         \x20   package: {}:{}\n\
+                         \x20   version: {}\n\
+                         \x20   blob: {}\n\
+                         \x20   prev: {}",
+                        value.len(),
+                        record.body.domain,
+                        record.body.package,
+                        record.body.version,
+                        hex::encode(record.body.blob_hash),
+                        hex::encode(record.body.prev),
+                    );
+                }
+            }
+
+            // Ordinary package files or other stored data.
+            format!("{key_hex}  blob ({} bytes)", value.len())
+        }
+    }
+}
+
 fn show_datastore(node: &RealNode) {
     let values = node.datastore_snapshot();
 
@@ -208,8 +270,8 @@ fn show_datastore(node: &RealNode) {
         return;
     }
 
-    for (key, size) in values {
-        println!("{}  {} bytes", short_id(&key), size);
+    for (key, value) in values {
+        println!("{}", describe_datastore_entry(&key, &value));
     }
 }
 
@@ -674,5 +736,73 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn datastore_displays_plain_blobs() {
+        let value = Value::Blob(b"ordinary package bytes".to_vec());
+
+        let display = describe_datastore_entry(&value.key(), &value);
+
+        assert!(display.contains("blob"));
+        assert!(display.contains("ordinary") == false);
+        assert!(!display.contains("version record"));
+    }
+
+    #[test]
+    fn datastore_displays_version_records() {
+        use crate::package::{VersionRecord, sign};
+        use ed25519_dalek::SigningKey;
+
+        let signer = SigningKey::from_bytes(&[7; 32]);
+
+        let record = sign(
+            VersionRecord {
+                tag: VERSION_RECORD_TAG.to_string(),
+                domain: "example.com".to_string(),
+                package: "calculator".to_string(),
+                version: "1.0.0".parse().unwrap(),
+                blob_hash: [7; 32],
+                prev: [0; 32],
+            },
+            &signer,
+        )
+        .unwrap();
+
+        let value = Value::Blob(bincode::serialize(&record).unwrap());
+        let display = describe_datastore_entry(&value.key(), &value);
+
+        assert!(display.contains("version record"));
+        assert!(display.contains("example.com:calculator"));
+        assert!(display.contains("1.0.0"));
+        assert!(display.contains(&hex::encode([7; 32])));
+    }
+
+    #[test]
+    fn datastore_displays_latest_pointers() {
+        use crate::package::{LATEST_POINTER_TAG, LatestPointer, sign};
+        use ed25519_dalek::SigningKey;
+
+        let signer = SigningKey::from_bytes(&[7; 32]);
+
+        let pointer = sign(
+            LatestPointer {
+                tag: LATEST_POINTER_TAG.to_string(),
+                domain: "example.com".to_string(),
+                package: "calculator".to_string(),
+                version: "2.0.0".parse().unwrap(),
+                version_record_hash: [9; 32],
+            },
+            &signer,
+        )
+        .unwrap();
+
+        let value = Value::Latest(pointer);
+        let display = describe_datastore_entry(&value.key(), &value);
+
+        assert!(display.contains("latest pointer"));
+        assert!(display.contains("example.com:calculator"));
+        assert!(display.contains("2.0.0"));
+        assert!(display.contains(&hex::encode([9; 32])));
     }
 }
