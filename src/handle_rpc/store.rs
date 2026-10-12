@@ -13,19 +13,39 @@
 use crate::close_nodes::{CloseNodes, Key};
 use crate::dns_data::DnsData;
 use crate::handle_rpc::Context;
-use crate::package::{LatestPointer, Signed, latest_is_valid};
+use crate::package::{LatestPointer, Signed, VersionRecord, latest_is_valid, record_key};
 use crate::value::Value;
+use crate::version_chain::validate_chain_proof;
 use dashmap::mapref::entry::Entry;
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
 pub const STORED: &[u8] = b"STORED";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StoreRequest {
+    key: Key,
+    value: Value,
+    proof: Vec<Signed<VersionRecord>>,
+}
 
 /// Encode a STORE body: the pair to hold.
 ///
 /// Who is asking is not in here — it travels ahead of the method tag, in the
 /// framing every request carries.
+
 pub fn encode_request(key: Key, value: Value) -> Option<Vec<u8>> {
-    bincode::serialize(&(key, value)).ok()
+    encode_request_with_proof(key, value, Vec::new())
+}
+
+pub(crate) fn encode_request_with_proof(
+    key: Key,
+    value: Value,
+    proof: Vec<Signed<VersionRecord>>,
+) -> Option<Vec<u8>> {
+    let request = StoreRequest { key, value, proof };
+
+    bincode::serialize(&request).ok()
 }
 
 /// Store the key and value in `body`, and acknowledge it.
@@ -39,7 +59,7 @@ pub async fn handle<A: CloseNodes, D: DnsData>(
     _from: SocketAddr,
     body: &[u8],
 ) -> Option<Vec<u8>> {
-    let (key, value): (Key, Value) = bincode::deserialize(body).ok()?;
+    let StoreRequest { key, value, proof } = bincode::deserialize(body).ok()?;
 
     // Each value has exactly one key it may live under: its hash for a blob,
     // `latest_key(domain, package)` for a pointer.
@@ -49,39 +69,88 @@ pub async fn handle<A: CloseNodes, D: DnsData>(
 
     match &value {
         Value::Blob(_) => {
+            // blobs don't need version proofs
+            if !proof.is_empty() {
+                return None;
+            }
+
             context.values.insert(key, value);
         }
+
         Value::Latest(pointer) => {
+            // find public key belonging to domain
             let owner = context.dns.get_dns_vk(&pointer.body.domain).await?;
+
+            // verify pointer signature
             if !latest_is_valid(pointer, &owner) {
                 return None;
             }
-            // Compare and insert under one entry lock, after the DNS await, so
-            // two concurrent stores cannot both pass the version check.
+
+            // verify supplied history
+            let verified_chain = validate_chain_proof(pointer, &owner, &proof).await.ok()?;
+
+            // update storage only if proposed history continues previously accepted history
             match context.values.entry(key) {
                 Entry::Vacant(slot) => {
+                    // first publication
                     slot.insert(value);
                 }
+
                 Entry::Occupied(mut slot) => {
-                    if !replaces(slot.get(), pointer) {
+                    let Value::Latest(old) = slot.get() else {
+                        return None;
+                    };
+
+                    if !continues_previous(old, pointer, &verified_chain) {
                         return None;
                     }
+
                     slot.insert(value);
                 }
             }
         }
     }
+
     Some(STORED.to_vec())
 }
 
 /// Whether `new` may take the place of what is stored under its latest key: a
 /// higher version, or the same pointer stored again (a republish).
-fn replaces(stored: &Value, new: &Signed<LatestPointer>) -> bool {
+/* fn replaces(stored: &Value, new: &Signed<LatestPointer>) -> bool {
     match stored {
         Value::Latest(old) => new.body.version > old.body.version || new == old,
         // Only a SHA-256 collision puts a blob under a latest key; keep it.
         Value::Blob(_) => false,
     }
+} */
+// replaces replaces() O_O meta
+/// Checks whether a proposed latest pointer extends the previously accepted history.
+///
+/// Allows identical republishing or a newer version whose verified chain
+/// contains the previously stored version record. Rejects rollbacks and forks.
+///
+/// Assumes `verified_chain` has already been validated.
+fn continues_previous(
+    old: &Signed<LatestPointer>,
+    proposed: &Signed<LatestPointer>,
+    verified_chain: &[Signed<VersionRecord>],
+) -> bool {
+    // Republishing exactly the same pointer is allowed.
+    if old == proposed {
+        return true;
+    }
+
+    // A new pointer must have a strictly higher version.
+    if proposed.body.version <= old.body.version {
+        return false;
+    }
+
+    // The new history must contain our previously accepted
+    // version record, identified by its exact content hash.
+    verified_chain.iter().any(|record| {
+        record_key(record) == Some(old.body.version_record_hash)
+            && record.body.version == old.body.version
+    })
 }
 
 #[cfg(test)]
@@ -92,6 +161,138 @@ mod tests {
 
     fn addr() -> SocketAddr {
         "127.0.0.1:9000".parse().unwrap()
+    }
+
+    #[test]
+    fn new_latest_must_continue_previous_history() {
+        use crate::package::{LATEST_POINTER_TAG, VERSION_RECORD_TAG, sign};
+        use ed25519_dalek::SigningKey;
+
+        let signer = SigningKey::from_bytes(&[1; 32]);
+
+        // Create version 1.0.0.
+        let first = sign(
+            VersionRecord {
+                tag: VERSION_RECORD_TAG.to_string(),
+                domain: "node0.d7024e.test".to_string(),
+                package: "pkg".to_string(),
+                version: "1.0.0".parse().unwrap(),
+                blob_hash: [7; 32],
+                prev: [0; 32],
+            },
+            &signer,
+        )
+        .unwrap();
+
+        let first_hash = record_key(&first).unwrap();
+
+        let old = sign(
+            LatestPointer {
+                tag: LATEST_POINTER_TAG.to_string(),
+                domain: first.body.domain.clone(),
+                package: first.body.package.clone(),
+                version: first.body.version,
+                version_record_hash: first_hash,
+            },
+            &signer,
+        )
+        .unwrap();
+
+        // Version 2.0.0 correctly points to 1.0.0.
+        let second = sign(
+            VersionRecord {
+                version: "2.0.0".parse().unwrap(),
+                prev: first_hash,
+                ..first.body.clone()
+            },
+            &signer,
+        )
+        .unwrap();
+
+        let newer = sign(
+            LatestPointer {
+                version: "2.0.0".parse().unwrap(),
+                version_record_hash: record_key(&second).unwrap(),
+                ..old.body.clone()
+            },
+            &signer,
+        )
+        .unwrap();
+
+        let valid_chain = vec![second, first.clone()];
+
+        assert!(continues_previous(&old, &newer, &valid_chain));
+
+        // Repeating the exact same pointer is allowed.
+        assert!(continues_previous(&old, &old, &valid_chain));
+
+        // Rollback: 2.0.0 -> 1.0.0 is not allowed.
+        assert!(!continues_previous(&newer, &old, &valid_chain));
+
+        // A different branch starting at 3.0.0.
+        let fork = sign(
+            VersionRecord {
+                version: "3.0.0".parse().unwrap(),
+                blob_hash: [9; 32],
+                prev: [0; 32],
+                ..first.body.clone()
+            },
+            &signer,
+        )
+        .unwrap();
+
+        let fork_pointer = sign(
+            LatestPointer {
+                version: "3.0.0".parse().unwrap(),
+                version_record_hash: record_key(&fork).unwrap(),
+                ..old.body.clone()
+            },
+            &signer,
+        )
+        .unwrap();
+
+        assert!(!continues_previous(&old, &fork_pointer, &[fork],));
+    }
+
+    #[test]
+    fn store_request_can_carry_version_proof() {
+        use crate::package::{VERSION_RECORD_TAG, VersionRecord, sign};
+        use ed25519_dalek::SigningKey;
+
+        let signer = SigningKey::from_bytes(&[1; 32]);
+
+        let record = sign(
+            VersionRecord {
+                tag: VERSION_RECORD_TAG.to_string(),
+                domain: "node0.d7024e.test".to_string(),
+                package: "calculator".to_string(),
+                version: "1.0.0".parse().unwrap(),
+                blob_hash: [7; 32],
+                prev: [0; 32],
+            },
+            &signer,
+        )
+        .unwrap();
+
+        let value = Value::Blob(b"hello".to_vec());
+        let key = value.key();
+
+        // Encode a STORE request with one version record.
+        let encoded = encode_request_with_proof(key, value.clone(), vec![record.clone()]).unwrap();
+
+        // Decode it, just like the receiving node would.
+        let decoded: StoreRequest = bincode::deserialize(&encoded).unwrap();
+
+        assert_eq!(decoded.key, key);
+        assert_eq!(decoded.value, value);
+        assert_eq!(decoded.proof, vec![record]);
+
+        // Ordinary STORE requests carry no proof.
+        let encoded = encode_request(key, value).unwrap();
+
+        let decoded: StoreRequest = bincode::deserialize(&encoded).unwrap();
+
+        assert!(decoded.proof.is_empty());
     }
 
     #[tokio::test]
@@ -192,8 +393,11 @@ mod tests {
     }
 
     use crate::dns_data::fake_dns::{FAKE_KEYS, FakeKey};
+    use crate::package::{
+        LATEST_POINTER_TAG, LatestPointer, Signed, VERSION_RECORD_TAG, VersionRecord, record_key,
+        sign,
+    };
     use crate::value::signed_latest;
-
     fn context() -> std::sync::Arc<Context<crate::close_nodes::RecommendedCloseNodes, FakeDns>> {
         Context::new([0u8; 32], recommended([0u8; 32]), FakeDns::new())
     }
@@ -208,6 +412,51 @@ mod tests {
         ))
     }
 
+    fn publication(
+        owner: &FakeKey,
+        version: &str,
+        signer: &FakeKey,
+        older: &[Signed<VersionRecord>],
+        blob_hash: Key,
+    ) -> (Value, Vec<Signed<VersionRecord>>) {
+        let signing_key = signer.signing_key().unwrap();
+
+        // Point to the most recent older record,
+        // or all zeroes for the very first version.
+        let prev = older.first().and_then(record_key).unwrap_or([0; 32]);
+
+        let record = sign(
+            VersionRecord {
+                tag: VERSION_RECORD_TAG.to_string(),
+                domain: owner.domain.to_string(),
+                package: "pkg".to_string(),
+                version: version.parse().unwrap(),
+                blob_hash,
+                prev,
+            },
+            &signing_key,
+        )
+        .unwrap();
+
+        let pointer = sign(
+            LatestPointer {
+                tag: LATEST_POINTER_TAG.to_string(),
+                domain: owner.domain.to_string(),
+                package: "pkg".to_string(),
+                version: version.parse().unwrap(),
+                version_record_hash: record_key(&record).unwrap(),
+            },
+            &signing_key,
+        )
+        .unwrap();
+
+        // Full history, newest first.
+        let mut proof = vec![record];
+        proof.extend_from_slice(older);
+
+        (Value::Latest(pointer), proof)
+    }
+
     async fn store(
         context: &Context<crate::close_nodes::RecommendedCloseNodes, FakeDns>,
         value: &Value,
@@ -216,12 +465,23 @@ mod tests {
         handle(context, 1, addr(), &body).await.as_deref() == Some(STORED)
     }
 
+    async fn store_proven(
+        context: &Context<crate::close_nodes::RecommendedCloseNodes, FakeDns>,
+        value: &Value,
+        proof: &[Signed<VersionRecord>],
+    ) -> bool {
+        let body = encode_request_with_proof(value.key(), value.clone(), proof.to_vec()).unwrap();
+
+        handle(context, 1, addr(), &body).await.as_deref() == Some(STORED)
+    }
+
     #[tokio::test]
     async fn latest_signed_by_domain_owner_is_stored() {
         let context = context();
-        let value = latest(&FAKE_KEYS[0], "1.0.0", &FAKE_KEYS[0]);
 
-        assert!(store(&context, &value).await);
+        let (value, proof) = publication(&FAKE_KEYS[0], "1.0.0", &FAKE_KEYS[0], &[], [7; 32]);
+
+        assert!(store_proven(&context, &value, &proof).await);
         assert_eq!(context.values.get(&value.key()).as_deref(), Some(&value));
     }
 
@@ -271,50 +531,58 @@ mod tests {
     #[tokio::test]
     async fn newer_latest_replaces_older() {
         let context = context();
-        let old = latest(&FAKE_KEYS[0], "1.0.0", &FAKE_KEYS[0]);
-        let new = latest(&FAKE_KEYS[0], "1.1.0", &FAKE_KEYS[0]);
 
-        assert!(store(&context, &old).await);
-        assert!(store(&context, &new).await);
+        let (old, old_proof) = publication(&FAKE_KEYS[0], "1.0.0", &FAKE_KEYS[0], &[], [7; 32]);
+
+        let (new, new_proof) =
+            publication(&FAKE_KEYS[0], "1.1.0", &FAKE_KEYS[0], &old_proof, [8; 32]);
+
+        assert!(store_proven(&context, &old, &old_proof).await);
+        assert!(store_proven(&context, &new, &new_proof).await);
         assert_eq!(context.values.get(&new.key()).as_deref(), Some(&new));
     }
 
     #[tokio::test]
     async fn older_latest_does_not_replace_newer() {
         let context = context();
-        let new = latest(&FAKE_KEYS[0], "1.10.0", &FAKE_KEYS[0]);
-        let old = latest(&FAKE_KEYS[0], "1.9.0", &FAKE_KEYS[0]);
 
-        assert!(store(&context, &new).await);
-        assert!(!store(&context, &old).await, "a rollback must be refused");
+        let (old, old_proof) = publication(&FAKE_KEYS[0], "1.9.0", &FAKE_KEYS[0], &[], [7; 32]);
+
+        let (new, new_proof) =
+            publication(&FAKE_KEYS[0], "1.10.0", &FAKE_KEYS[0], &old_proof, [8; 32]);
+
+        assert!(store_proven(&context, &new, &new_proof).await);
+        assert!(
+            !store_proven(&context, &old, &old_proof).await,
+            "a rollback must be refused"
+        );
         assert_eq!(context.values.get(&new.key()).as_deref(), Some(&new));
     }
 
     #[tokio::test]
     async fn same_version_with_other_contents_is_rejected() {
         let context = context();
-        let first = latest(&FAKE_KEYS[0], "1.0.0", &FAKE_KEYS[0]);
-        let Value::Latest(mut other) = first.clone() else {
-            unreachable!()
-        };
-        other.body.version_record_hash = [7; 32];
-        let other = Value::Latest(
-            crate::package::sign(other.body, &FAKE_KEYS[0].signing_key().unwrap()).unwrap(),
-        );
 
-        assert!(store(&context, &first).await);
-        assert!(!store(&context, &other).await);
+        let (first, first_proof) = publication(&FAKE_KEYS[0], "1.0.0", &FAKE_KEYS[0], &[], [7; 32]);
+
+        // Same version number, but different package content.
+        let (other, other_proof) = publication(&FAKE_KEYS[0], "1.0.0", &FAKE_KEYS[0], &[], [9; 32]);
+
+        assert_ne!(first, other);
+        assert!(store_proven(&context, &first, &first_proof).await);
+        assert!(!store_proven(&context, &other, &other_proof).await);
         assert_eq!(context.values.get(&first.key()).as_deref(), Some(&first));
     }
 
     #[tokio::test]
     async fn same_latest_twice_is_allowed() {
         let context = context();
-        let value = latest(&FAKE_KEYS[0], "1.0.0", &FAKE_KEYS[0]);
 
-        assert!(store(&context, &value).await);
+        let (value, proof) = publication(&FAKE_KEYS[0], "1.0.0", &FAKE_KEYS[0], &[], [7; 32]);
+
+        assert!(store_proven(&context, &value, &proof).await);
         assert!(
-            store(&context, &value).await,
+            store_proven(&context, &value, &proof).await,
             "a republish must be accepted"
         );
     }

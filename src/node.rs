@@ -123,7 +123,7 @@ where
                     .map(|entry| (*entry.key(), entry.value().clone()))
                     .collect();
 
-                maintenance::republish_values(&rpc, values).await;
+                maintenance::republish_values(&rpc, context.dns.as_ref(), values).await;
             }
         });
     }
@@ -442,15 +442,21 @@ mod tests {
     /// A package's latest pointer, end to end over the fake network: a
     /// forged one is refused by every node, the owner's is stored, and a
     /// reader on another node finds it through its DNS record.
+
     #[tokio::test]
     async fn latest_pointer_round_trips_and_forgery_is_refused() {
         use crate::dns_data::fake_dns::FAKE_KEYS;
-        use crate::value::signed_latest;
+        use crate::package::{
+            LATEST_POINTER_TAG, LatestPointer, VERSION_RECORD_TAG, VersionRecord, record_key, sign,
+        };
 
         let network = Network::new();
+
         let a = FakeNode::new(&network);
         let b = FakeNode::new(&network);
         let c = FakeNode::new(&network);
+
+        // Let the nodes discover each other.
         assert_eq!(b.rpc().ping(a.address()).await, Some(a.id()));
         assert_eq!(c.rpc().ping(b.address()).await, Some(b.id()));
 
@@ -458,16 +464,69 @@ mod tests {
         let owner = FAKE_KEYS[0].signing_key().unwrap();
         let imposter = FAKE_KEYS[1].signing_key().unwrap();
 
-        let forged = signed_latest(domain, "pkg", "9.0.0", &imposter);
-        let key = crate::lookup::store_value(a.rpc(), Value::Latest(forged)).await;
+        // Helper: create a signed first publication.
+        let publication = |signer: &ed25519_dalek::SigningKey, version: &str| {
+            let record = sign(
+                VersionRecord {
+                    tag: VERSION_RECORD_TAG.to_string(),
+                    domain: domain.to_string(),
+                    package: "pkg".to_string(),
+                    version: version.parse().unwrap(),
+                    blob_hash: [7; 32],
+                    prev: [0; 32],
+                },
+                signer,
+            )
+            .unwrap();
+
+            let pointer = sign(
+                LatestPointer {
+                    tag: LATEST_POINTER_TAG.to_string(),
+                    domain: domain.to_string(),
+                    package: "pkg".to_string(),
+                    version: record.body.version,
+                    version_record_hash: record_key(&record).unwrap(),
+                },
+                signer,
+            )
+            .unwrap();
+
+            (pointer, vec![record])
+        };
+
+        // Attempt 1: a forged publication.
+        let (forged, forged_proof) = publication(&imposter, "9.0.0");
+
+        let (key, accepted) =
+            crate::lookup::store_value_with_proof(a.rpc(), Value::Latest(forged), &forged_proof)
+                .await;
+
+        // Nobody should accept the impostor's publication.
+        assert_eq!(accepted, 0);
+
         for node in [&a, &b, &c] {
             assert!(node.context.values.get(&key).is_none(), "forgery stored");
         }
 
-        let genuine = signed_latest(domain, "pkg", "1.0.0", &owner);
-        crate::lookup::store_value(a.rpc(), Value::Latest(genuine.clone())).await;
+        // Attempt 2: a real publication by the domain owner.
+        let (genuine, genuine_proof) = publication(&owner, "1.0.0");
 
+        let (genuine_key, accepted) = crate::lookup::store_value_with_proof(
+            a.rpc(),
+            Value::Latest(genuine.clone()),
+            &genuine_proof,
+        )
+        .await;
+
+        // The key is based on domain + package, not version.
+        assert_eq!(genuine_key, key);
+
+        // At least one node must acknowledge the publication.
+        assert!(accepted > 0, "no node accepted the publication");
+
+        // Node C should now find the genuine latest pointer.
         let found = crate::lookup::get_latest(c.rpc(), c.dns(), domain, "pkg").await;
+
         assert_eq!(found, Some(genuine));
     }
 }
