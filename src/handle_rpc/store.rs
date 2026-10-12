@@ -106,12 +106,10 @@ pub async fn handle<A: CloseNodes, D: DnsData>(
                 }
 
                 Entry::Occupied(mut slot) => {
-                    let Value::Latest(old) = slot.get() else {
-                        return None;
-                    };
-
-                    if !continues_previous(old, pointer, &verified_chain) {
-                        return None;
+                    if let Value::Latest(old) = slot.get() {
+                        if !continues_previous(old, pointer, &verified_chain) {
+                            return None;
+                        }
                     }
 
                     slot.insert(value);
@@ -606,36 +604,45 @@ mod tests {
     #[tokio::test]
     async fn blob_does_not_replace_latest() {
         let context = context();
-        let pointer = latest(&FAKE_KEYS[0], "1.0.0", &FAKE_KEYS[0]);
-        let blob = squatting_blob(&FAKE_KEYS[0]);
-        assert_eq!(blob.key(), pointer.key());
+        let owner = &FAKE_KEYS[0];
 
-        assert!(store(&context, &pointer).await);
-        assert!(!store(&context, &blob).await);
-        assert_eq!(
-            context.values.get(&pointer.key()).as_deref(),
-            Some(&pointer)
-        );
+        // Create a genuine signed latest pointer and its proof.
+        let (latest, proof) = publication(owner, "1.0.0", owner, &[], [7; 32]);
 
-        let newer = latest(&FAKE_KEYS[0], "1.1.0", &FAKE_KEYS[0]);
-        assert!(
-            store(&context, &newer).await,
-            "the owner must still be able to publish"
-        );
+        // A blob whose hash equals the latest pointer's key.
+        let squatter = squatting_blob(owner);
+
+        assert_eq!(latest.key(), squatter.key());
+
+        // Legitimate publication succeeds.
+        assert!(store_proven(&context, &latest, &proof).await);
+
+        // The attacker must not overwrite it with a blob.
+        assert!(!store(&context, &squatter).await);
+
+        // The original latest pointer remains unchanged.
+        assert_eq!(context.values.get(&latest.key()).as_deref(), Some(&latest));
     }
 
     #[tokio::test]
     async fn latest_replaces_squatting_blob() {
         let context = context();
-        let blob = squatting_blob(&FAKE_KEYS[0]);
-        let pointer = latest(&FAKE_KEYS[0], "1.0.0", &FAKE_KEYS[0]);
+        let owner = &FAKE_KEYS[0];
 
-        assert!(store(&context, &blob).await);
-        assert!(store(&context, &pointer).await);
-        assert_eq!(
-            context.values.get(&pointer.key()).as_deref(),
-            Some(&pointer)
-        );
+        let squatter = squatting_blob(owner);
+
+        let (latest, proof) = publication(owner, "1.0.0", owner, &[], [7; 32]);
+
+        assert_eq!(latest.key(), squatter.key());
+
+        // Attacker occupies the latest pointer's key first.
+        assert!(store(&context, &squatter).await);
+
+        // Legitimate publication must still be accepted.
+        assert!(store_proven(&context, &latest, &proof).await);
+
+        // The legitimate pointer replaces the squatting blob.
+        assert_eq!(context.values.get(&latest.key()).as_deref(), Some(&latest));
     }
 
     #[tokio::test]
