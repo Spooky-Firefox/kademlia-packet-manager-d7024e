@@ -1,4 +1,5 @@
 use crate::close_nodes::{CloseNodes, Contact, ID_BYTES, Key};
+use crate::dns_data::DnsData;
 use crate::lookup;
 use crate::node::RealNode;
 
@@ -83,6 +84,7 @@ fn print_help() {
     println!("  get KEY [FILENAME]");
     println!("  show rt");
     println!("  show ds");
+    println!("  show dns DOMAIN");
     println!("  help");
     println!("  exit");
 }
@@ -229,6 +231,16 @@ pub async fn run(node: &RealNode) -> io::Result<()> {
             ["show", "ds"] => {
                 show_datastore(node);
             }
+
+            ["show", "dns", domain] => match node.dns().get_dns_vk(domain).await {
+                Some(key) => {
+                    println!("{}: {}", domain, hex::encode(key.to_bytes()));
+                }
+
+                None => {
+                    println!("no public key found for {domain}");
+                }
+            },
 
             ["help"] => {
                 print_help();

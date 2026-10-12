@@ -1,7 +1,7 @@
 use crate::close_nodes::{Contact, Key, NodeId, RecommendedCloseNodes, recommended};
-use crate::dns_data::DnsData;
 use crate::dns_data::dns::Dns;
 use crate::dns_data::fake_dns::FakeDns;
+use crate::dns_data::{DnsBackend, DnsData};
 use crate::handle_rpc::{self, Context};
 use crate::hashing::node_id_from_address;
 use crate::maintenance;
@@ -35,7 +35,7 @@ where
     context: Arc<Context<Arc<RecommendedCloseNodes>, Arc<D>>>,
     _server_tasks: Vec<JoinHandle<()>>,
 }
-pub type RealNode = Node<UdpTransport, TcpTransport, Dns>;
+pub type RealNode = Node<UdpTransport, TcpTransport, DnsBackend>;
 pub type FakeNode = Node<NetworkedDebugTransport, NetworkedStreamTransport, FakeDns>;
 
 impl<T, U, D> Node<T, U, D>
@@ -131,6 +131,11 @@ where
 
 impl RealNode {
     pub async fn bind(bind_address: SocketAddr) -> io::Result<Self> {
+        Self::bind_with_dns(bind_address, DnsBackend::Real(Dns::new())).await // create node using real DNS by default
+    }
+
+    pub async fn bind_with_dns(bind_address: SocketAddr, dns: DnsBackend) -> io::Result<Self> {
+        // create node using passed DNS
         let udp_socket = UdpSocket::bind(bind_address).await?;
         let address = udp_socket.local_addr()?;
 
@@ -140,7 +145,7 @@ impl RealNode {
 
         let routing = Arc::new(recommended(id));
 
-        let context = Context::new(id, Arc::clone(&routing), Arc::new(Dns::new()));
+        let context = Context::new(id, Arc::clone(&routing), Arc::new(dns));
 
         let (request_tx, request_rx) = mpsc::channel(64);
 
@@ -169,6 +174,7 @@ impl RealNode {
         })
     }
 }
+
 impl FakeNode {
     pub fn new(network: &Network) -> Self {
         let endpoint = network.bind_any();
