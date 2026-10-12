@@ -284,6 +284,49 @@ dead.
 Republishing is not implemented. `REPUBLISH_INTERVAL` (one hour, the paper's
 `tReplicate`) is already passed to `periodic_task` but unused.
 
+## Packages
+
+`src/package.rs` holds the data types for the package registry described in
+`d7024e/labs/PART2-DESIGN.md`. It defines the records and how they are signed
+and keyed. Nothing outside the module's tests uses it yet: no RPC, CLI command
+or lookup stores or fetches these records.
+
+A package is named by a domain and a package name, such as `rfin.ch` and
+`java-pair`. The domain's owner holds an ed25519 key pair, and every record
+about the package is signed with it. Publishing a version puts three kinds of
+value in the DHT:
+
+- The package blob, under its hash, as in part 1.
+- A `VersionRecord` for each version: `tag`, `domain`, `package`, `version`,
+  `blob_hash` (the blob's key) and `prev` (the key of the previous version's
+  record, all zeroes for the first). It is stored under `record_key`, the hash
+  of the signed record, so like the blob it is immutable and checks itself.
+  Following `prev` walks back through every older version.
+- One `LatestPointer` per package: `tag`, `domain`, `package`, `version` and
+  `version_record_hash`, the key of the newest `VersionRecord`. It is stored
+  under `latest_key(domain, package)`, which is `hash("domain:package:latest")`.
+  This is the only value that is not stored under its own hash and the only
+  one that changes, since publishing a new version replaces it.
+
+`Version` is `major.minor.patch`. It parses from and prints as that string,
+and its fields are in that order, so the derived `Ord` compares numerically
+(`1.9.0 < 1.11.0`).
+
+Both record types are wrapped in `Signed<T>`, a `body` plus `sig`. `sign`
+signs `body_hash(body)`, the SHA-256 of the body's bincode encoding, so the
+signature covers every field except itself. `Signed::verify(owner)` checks it
+against the owner's public key and returns `false` for a wrong key, a changed
+body or bytes that are not a signature at all.
+
+Not implemented yet:
+
+- Finding the owner's public key. The design reads it from a DNS TXT record
+  on the domain; `verify` takes the key as an argument.
+- Checking that a record is valid beyond its signature, for example that
+  `tag` is the right string for the type, that versions only increase along
+  the chain, or that a new `LatestPointer` names a newer version than the one
+  it replaces.
+
 ## Metrics
 
 `src/logging.rs` sends log records with the target `metrics` only to
