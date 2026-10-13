@@ -13,6 +13,8 @@ a time.
 | `experiments/analyze.py` | Parses the logs into `summary.csv`, `aggregate.csv`, `plots/*.png`, `report.html`. |
 | `experiments/start.sh` | Starts the suite and then the analysis in a detached tmux session. |
 | `experiments/report/` | The published results: `report.html`, `plots/`, `aggregate.csv`, `summary.csv`. |
+| `experiments/analyze_packages.py` | The same for the package experiments (part 2), below. |
+| `experiments/report-packages/` | Their published results. |
 
 ## Results
 
@@ -265,6 +267,54 @@ event=join node=10.5.5.5:6666 seed=10.1.2.3:4000 success=true contacts=10
 
 The older `analyze_metrics.py` at the repository root still reads these
 files, since it only needs `lookup_end` lines.
+
+## Package experiments (part 2)
+
+`--workload packages` turns a run into a package-manager run. It builds the
+network the same way. Then, instead of storing blobs, it publishes
+`--packages` packages of `--versions` versions each through
+`registry::publish_package`, the function behind the CLI's `publish`. Each
+package is published from one random node, its versions in order. The
+measured ops are `--lookups` installs through `registry::install_package`,
+from random nodes: half ask for the latest version, half for a random
+published one. Publishing runs on a clean wire unless `--lossy-publish true`
+applies the measure phase's loss and latency to it as well.
+
+```sh
+python3 experiments/run_suite.py --suite packages --results experiments/results-packages
+experiments/.venv/bin/python experiments/analyze_packages.py --publish experiments/report-packages
+```
+
+`--suite packages` has 480 runs, about 13 h at 6 jobs. `--suite
+packages-quick` has 10 runs, about a minute. The sweeps:
+
+| Experiment | Varies | Fixed |
+|---|---|---|
+| `pkg_scalability` | N = 64 … 8192 | 20 packages × 5 versions, 500 installs |
+| `pkg_chain` | versions V = 1 … 64 | N = 1000, 10 packages |
+| `pkg_loss` | loss 0 … 0.9 on installs | N = 1000 |
+| `pkg_publish_loss` | loss 0 … 0.9 on publishing too | N = 1000, 40 packages × 3 versions |
+| `pkg_latency` | latency 0 … 600 ms × loss {0, 0.3} | N = 1000 |
+| `pkg_churn` | churn 0 … 20 nodes/s × republish {1 h, 60 s, 15 s} | N = 1000, 5 min, liveness 10 s |
+| `pkg_size` | blob 256 B … 256 KiB | N = 1000, 10 packages × 3 versions |
+| `heat_pkg_chain_loss` | V × loss | N = 1000 |
+| `heat_pkg_churn_chain` | churn × V | N = 1000, 5 min, republish 60 s |
+
+An install is **correct** only if it returned the version asked for (for
+"latest", the newest that was published) with exactly the bytes published
+for it. It is **stale** if it asked for the latest and got an older version.
+A failure is classified by the error it ended in. The extra log lines:
+
+```text
+event=publish op=10000003 package=node3.d7024e.test:pkg3 version=1.0.0 index=0 t_ms=12 origin=10.1.2.3:4000 success=true error=none blob_acks=10 record_acks=10 latest_acks=10 duration_us=91000
+event=package_stored package=node3.d7024e.test:pkg3 versions=5 of=5 latest_holders=10 closest_holders=10
+event=op op=7 kind=install t_ms=0 origin=10.1.2.3:4000 package=node3.d7024e.test:pkg3 chain=5 requested=latest expected=5.0.0 got=5.0.0 success=true correct=true stale=false error=none latest_holders=10 duration_us=430000
+```
+
+Publishes use op ids from 10 000 000, so their RPCs and lookups can be told
+apart from the installs'. The `error` field is the error's variant names
+without their payload, such as `InvalidHistory.MissingRecord` or
+`BlobUnavailable`.
 
 ## Not covered
 

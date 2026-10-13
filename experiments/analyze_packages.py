@@ -47,7 +47,7 @@ import numpy as np  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 CACHE = "pkg_summary.json"
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 PUBLISH_OP_BASE = 10_000_000
 K = 10
 # Part 1's measured value-lookup success under loss, for the install model.
@@ -85,7 +85,7 @@ def parse_run(path):
     publishes, installs, stored = [], [], []
     rpcs = Counter()        # op -> RPCs sent (all attempts)
     rpc_calls = Counter()   # op -> RPC calls
-    lookups = Counter()     # op -> lookups
+    lookups = Counter()     # op -> value lookups (each also runs a node lookup, not counted)
     churn_leaves = 0
     opener = gzip.open if path.suffix == ".gz" else open
     with opener(path, "rt") as f:
@@ -122,7 +122,7 @@ def parse_run(path):
                 if op:
                     rpc_calls[op] += 1
                     rpcs[op] += int(e.get("attempts", 1))
-            elif kind == "lookup_end":
+            elif kind == "lookup_end" and e.get("kind") == "value":
                 op = int(e.get("op", 0))
                 if op:
                     lookups[op] += 1
@@ -345,7 +345,7 @@ def sec_scalability(runs, report):
     band(axes[2], x, m, s, SERIES[0], "install")
     x, m, s = series(runs, E, "nodes", "publish_lookups")
     band(axes[2], x, m, s, SERIES[1], "publish")
-    axes[2].set_title("Kademlia lookups per operation")
+    axes[2].set_title("Value lookups per operation")
     for ax in axes:
         log2_axis(ax, values_of(runs, E, "nodes"))
         ax.set_xlabel("nodes N")
@@ -382,7 +382,7 @@ def sec_chain(runs, report):
         axes[0].plot(x, a * x + b, color=MUTED, linestyle=":", label=f"fit {a:.2f}·V + {b:.1f}")
         report.note(f"An install makes {a:.2f} lookups per version in the chain plus {b:.1f} fixed "
                     f"(latest pointer and blob): linear, as the chain walk predicts.")
-    axes[0].set_title("Lookups per install")
+    axes[0].set_title("Value lookups per install")
     x, m, s = series(runs, E, "versions", "install_ms_median")
     band(axes[1], x, m, s, SERIES[0], "install, median")
     x, m, s = series(runs, E, "versions", "install_ms_p90")
@@ -413,7 +413,7 @@ def sec_chain(runs, report):
         axes[0].set_title(f"Time to publish version j (V = {longest:g})")
         axes[0].set_ylabel("ms")
         axes[1].plot(idx, [mean([lk for _, lk in by_index[i]]) for i in idx], color=SERIES[1], marker=".")
-        axes[1].set_title("Lookups to publish version j")
+        axes[1].set_title("Value lookups to publish version j")
         for ax in axes:
             ax.set_xlabel("version index j")
         report.save(fig, "pkg_chain_publish", "Each publish first loads and verifies the whole existing "
@@ -733,6 +733,9 @@ def main():
                     sec_heatmaps):
         section(runs, report)
     report.write(setup_html(runs))
+    # Which plots exist, for the Typst report: it cannot test for a file, and
+    # a figure whose experiment has not run yet should not stop it compiling.
+    (report.plots / "index.json").write_text(json.dumps(sorted(p.stem for p in report.plots.glob("*.png"))))
     page = args.results / "report.html"
     page.write_text(page.read_text().replace("Kademlia Experiments", "Package Manager Experiments"))
     figures = sum(len(s["figures"]) for s in report.sections)
