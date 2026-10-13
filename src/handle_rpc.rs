@@ -50,9 +50,11 @@ pub mod ping;
 pub mod store;
 
 use crate::close_nodes::{CloseNodes, Contact, Key, NodeId};
+use crate::dns_data::DnsData;
 use crate::rpc_transport::data_rx_tx::DataRxTx;
 use crate::rpc_transport::reply_id;
 use crate::rpc_transport::stream_listener::StreamListener;
+use crate::value::Value;
 use dashmap::DashMap;
 use log::trace;
 use std::net::SocketAddr;
@@ -154,28 +156,32 @@ impl Method {
 /// today: STORE and FIND_VALUE want a value store that does not exist yet, and
 /// growing one struct is cheaper than re-threading four signatures.
 #[non_exhaustive]
-pub struct Context<A>
+pub struct Context<A, D>
 where
     A: CloseNodes,
+    D: DnsData,
 {
     /// Who we are. A [`CloseNodes`] knows this already, but does not expose
     /// it, and [`ping`] has to put it on the wire: an address alone does not
     /// tell a joining node whose address it is.
     pub my_id: NodeId,
     pub close_nodes: A,
-    pub values: DashMap<Key, Vec<u8>>,
+    pub values: DashMap<Key, Value>,
+    /// Where STORE looks up the key a [`Value::Latest`] must be signed with.
+    pub dns: D,
 }
 
-impl<A: CloseNodes> Context<A> {
+impl<A: CloseNodes, D: DnsData> Context<A, D> {
     /// Shared by every spawned handler, so it is handed out behind an `Arc`.
     ///
     /// `my_id` must be the same id the routing table was built around, or we
     /// answer PINGs with a name our own siblings do not know us by.
-    pub fn new(my_id: NodeId, close_nodes: A) -> Arc<Self> {
+    pub fn new(my_id: NodeId, close_nodes: A, dns: D) -> Arc<Self> {
         Arc::new(Self {
             my_id,
             close_nodes,
             values: DashMap::new(),
+            dns,
         })
     }
 }
@@ -258,7 +264,10 @@ fn parse_framed(payload: &[u8]) -> Option<(NodeId, Method, &[u8])> {
 ///
 /// Teaching the server a new method means adding an arm below and a tag in
 /// [`Method::tag`], and nothing else.
-async fn dispatch<A: CloseNodes>(context: &Context<A>, request: &Request) -> Option<Vec<u8>> {
+async fn dispatch<A: CloseNodes, D: DnsData>(
+    context: &Context<A, D>,
+    request: &Request,
+) -> Option<Vec<u8>> {
     let id = request.id;
     let from = request.from;
 
@@ -302,12 +311,13 @@ async fn dispatch<A: CloseNodes>(context: &Context<A>, request: &Request) -> Opt
 /// [`RetryTransport::with_requests`](crate::rpc_transport::retry_transport::RetryTransport::with_requests)),
 /// and `socket` is that same socket, so a reply leaves from the address the
 /// request was sent to.
-async fn serve_datagrams<A, T>(
-    context: Arc<Context<A>>,
+async fn serve_datagrams<A, D, T>(
+    context: Arc<Context<A, D>>,
     mut requests: mpsc::Receiver<Request>,
     socket: Arc<T>,
 ) where
     A: CloseNodes + Send + Sync + 'static,
+    D: DnsData + 'static,
     T: DataRxTx + Send + Sync + 'static,
 {
     while let Some(request) = requests.recv().await {
@@ -338,13 +348,14 @@ async fn serve_datagrams<A, T>(
 /// `UdpSocket`/`TcpListener`, so a node can be served entirely in-process
 /// against [`networked_debug_transport`](crate::rpc_transport::networked_debug_transport)
 /// — which is the same code path, not a parallel one.
-pub async fn serve<A, T, L>(
-    context: Arc<Context<A>>,
+pub async fn serve<A, D, T, L>(
+    context: Arc<Context<A, D>>,
     requests: mpsc::Receiver<Request>,
     socket: Arc<T>,
     listener: L,
 ) where
     A: CloseNodes + Send + Sync + 'static,
+    D: DnsData + 'static,
     T: DataRxTx + Send + Sync + 'static,
     L: StreamListener + Send + Sync + 'static,
 {
@@ -360,9 +371,10 @@ pub async fn serve<A, T, L>(
 /// write side — so a connection here is read to EOF for the request, and
 /// closed once the reply has been written, mirroring that framing from the
 /// other end.
-async fn serve_streams<A, L>(context: Arc<Context<A>>, listener: L)
+async fn serve_streams<A, D, L>(context: Arc<Context<A, D>>, listener: L)
 where
     A: CloseNodes + Send + Sync + 'static,
+    D: DnsData + 'static,
     L: StreamListener + Send + Sync + 'static,
 {
     loop {
@@ -417,6 +429,7 @@ where
 mod tests {
     use super::*;
     use crate::close_nodes::recommended;
+    use crate::dns_data::fake_dns::FakeDns;
     use crate::rpc_transport::RpcTransport;
     use crate::rpc_transport::networked_debug_transport::{Network, NetworkedStreamTransport};
     use crate::rpc_transport::udp_transport::UdpTransport;
@@ -451,8 +464,8 @@ mod tests {
     /// The id every context in these tests answers under.
     const TEST_ID: NodeId = [0u8; 32];
 
-    fn test_context() -> Arc<Context<crate::close_nodes::RecommendedCloseNodes>> {
-        Context::new(TEST_ID, recommended(TEST_ID))
+    fn test_context() -> Arc<Context<crate::close_nodes::RecommendedCloseNodes, FakeDns>> {
+        Context::new(TEST_ID, recommended(TEST_ID), FakeDns::new())
     }
 
     /// What a PING is answered with: the responder's own id, which is how a
@@ -631,7 +644,7 @@ mod tests {
     async fn spawn_serve() -> (
         SocketAddr,
         SocketAddr,
-        Arc<Context<crate::close_nodes::RecommendedCloseNodes>>,
+        Arc<Context<crate::close_nodes::RecommendedCloseNodes, FakeDns>>,
         UdpTransport,
     ) {
         let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -643,7 +656,7 @@ mod tests {
         let (requests, rx) = mpsc::channel(8);
         let transport = UdpTransport::with_requests(udp_socket, requests);
 
-        let context = Context::new([0u8; 32], recommended([0u8; 32]));
+        let context = Context::new([0u8; 32], recommended([0u8; 32]), FakeDns::new());
         tokio::spawn(serve(
             Arc::clone(&context),
             rx,
@@ -762,7 +775,7 @@ mod tests {
 
         let mut datagram = id.to_be_bytes().to_vec();
         datagram.extend(framed(Method::Store.tag()));
-        datagram.extend(bincode::serialize(&(key, value.clone())).unwrap());
+        datagram.extend(store::encode_request(key, Value::Blob(value.clone())).unwrap());
 
         let reply = tokio::time::timeout(Duration::from_secs(1), async {
             let mut stream = TcpStream::connect(tcp_addr).await.unwrap();
@@ -776,7 +789,10 @@ mod tests {
         .expect("answered within 1s");
 
         assert_eq!(reply, frame_reply(id, store::STORED));
-        assert_eq!(context.values.get(&key).as_deref(), Some(&value));
+        assert_eq!(
+            context.values.get(&key).as_deref(),
+            Some(&Value::Blob(value))
+        );
     }
 
     /// The same STORE as [`tcp_store_is_written_and_acked`], served entirely
@@ -796,7 +812,7 @@ mod tests {
         let endpoint = network.bind_any();
         let addr = endpoint.local_addr();
 
-        let context = Context::new(TEST_ID, recommended(TEST_ID));
+        let context = Context::new(TEST_ID, recommended(TEST_ID), FakeDns::new());
         // TODO deal with spawn handle
         tokio::spawn(serve_streams(Arc::clone(&context), endpoint));
 
@@ -805,7 +821,7 @@ mod tests {
         let transport = NetworkedStreamTransport::new(network);
 
         let mut request = framed(Method::Store.tag());
-        request.extend(bincode::serialize(&(key, value.clone())).unwrap());
+        request.extend(store::encode_request(key, Value::Blob(value.clone())).unwrap());
 
         let reply = tokio::time::timeout(
             Duration::from_secs(1),
@@ -816,7 +832,10 @@ mod tests {
         .expect("the node acked the store");
 
         assert_eq!(reply, store::STORED);
-        assert_eq!(context.values.get(&key).as_deref(), Some(&value));
+        assert_eq!(
+            context.values.get(&key).as_deref(),
+            Some(&Value::Blob(value))
+        );
     }
 
     /// The rule [`Request::from_is_reachable`] exists for, end to end on the
@@ -835,7 +854,7 @@ mod tests {
         let endpoint = network.bind_any();
         let addr = endpoint.local_addr();
 
-        let context = Context::new(TEST_ID, recommended(TEST_ID));
+        let context = Context::new(TEST_ID, recommended(TEST_ID), FakeDns::new());
         // TODO deal with spawn handle
         tokio::spawn(serve_streams(Arc::clone(&context), endpoint));
 

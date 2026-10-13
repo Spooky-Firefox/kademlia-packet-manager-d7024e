@@ -187,11 +187,13 @@ honest about the rule in the next section.
 sender's `NodeId`, a method tag (`PING`, `STORE`, `FIND_NODE` or
 `FIND_VALUE`), then the body. `parse_framed` strips the first two and
 `dispatch` passes the body to the handler in `src/handle_rpc/`. A handler that
-returns `None` (a malformed body, an unknown method, a STORE whose key is not
-the hash of its value) sends no reply, and the sender times out.
+returns `None` (a malformed body, an unknown method, a STORE of a value that
+does not belong under its key) sends no reply, and the sender times out.
 
-STORE saves the value in an in-memory map. FIND_VALUE answers from that map,
-or with the closest contacts it knows. Neither contacts other nodes.
+STORE checks the value (see [checking values](#checking-values)) and saves it
+in an in-memory map. FIND_VALUE answers from that map, or with the closest
+contacts it knows. A STORE of a package pointer looks up the domain's key in
+DNS; otherwise neither contacts anything.
 
 ### Learning contacts from requests
 
@@ -283,6 +285,149 @@ dead.
 
 Republishing is not implemented. `REPUBLISH_INTERVAL` (one hour, the paper's
 `tReplicate`) is already passed to `periodic_task` but unused.
+
+## Node keys in DNS
+
+A node's ed25519 verifying key can be published in a DNS TXT record on a
+domain its owner controls, so anyone can fetch the key that goes with that
+name. Lookup sits behind one trait in `src/dns_data.rs`:
+
+```rust
+pub trait DnsData: Send + Sync {
+    fn get_dns_vk(&self, domain: &str)
+        -> impl Future<Output = Option<VerifyingKey>> + Send;
+}
+```
+
+The future is `Send` for the same reason as `RpcTransport`'s: the STORE
+handler that awaits it runs in a spawned task. A string that is not a valid
+domain name gives `None`. There is a blanket implementation for `Arc<T>`, so
+one resolver can be shared: each `Node` holds an `Arc<D>`, shares it with its
+`Context` for the STORE handler, and hands it out through `Node::dns()` for
+[`get_latest`](#checking-values).
+
+The record text is `d7024ePK=` followed by the 32-byte key in hex, 73
+characters in all. `format_vk` writes it and `parse_vk` reads it. The prefix
+labels the record for anyone browsing the zone, and it lets the parser skip
+the other TXT records on a name, such as SPF. `parse_vk` returns `None` for
+anything else: a missing prefix, bad hex, the wrong length, or bytes that are
+not a valid curve point. `get_dns_vk` returns the first record on the name
+that parses, or `None`.
+
+There are two implementations, in `src/dns_data/`:
+
+- `Dns` (`dns.rs`) queries a `domain::resolv::StubResolver` using the
+  system's resolver configuration. `RealNode` uses it. It joins a
+  record's character strings before parsing, since a long TXT record may be
+  split into several.
+- `FakeDns` (`fake_dns.rs`) holds `(name, text)` pairs in memory. `new()`
+  publishes one record for each of the five `FAKE_KEYS`,
+  `node0.d7024e.test` to `node4.d7024e.test`, whose key pairs are hardcoded so
+  tests can sign with the private half. Lookups go through the same `parse_vk`
+  as `Dns`, and tests can push other records onto `records`. `FakeNode` uses
+  it, so every fake node knows the five test domains. These private
+  keys are public in the repository, so they must never go on a real domain.
+
+## Packages
+
+`src/package.rs` holds the data types for the package registry described in
+`d7024e/labs/PART2-DESIGN.md`. It defines the records and how they are signed
+and keyed. STORE, FIND_VALUE and `lookup.rs` know about latest pointers (see
+[checking values](#checking-values)); no CLI command publishes or fetches a
+package yet.
+
+A package is named by a domain and a package name, such as `rfin.ch` and
+`java-pair`. The domain's owner holds an ed25519 key pair, and every record
+about the package is signed with it. Publishing a version puts three kinds of
+value in the DHT:
+
+- The package blob, under its hash, as in part 1.
+- A `VersionRecord` for each version: `tag`, `domain`, `package`, `version`,
+  `blob_hash` (the blob's key) and `prev` (the key of the previous version's
+  record, all zeroes for the first). It is stored under `record_key`, the hash
+  of the signed record, so like the blob it is immutable and checks itself.
+  Following `prev` walks back through every older version.
+- One `LatestPointer` per package: `tag`, `domain`, `package`, `version` and
+  `version_record_hash`, the key of the newest `VersionRecord`. It is stored
+  under `latest_key(domain, package)`, which is `hash("domain:package:latest")`.
+  This is the only value that is not stored under its own hash and the only
+  one that changes, since publishing a new version replaces it.
+
+`Version` is `major.minor.patch`. It parses from and prints as that string,
+and its fields are in that order, so the derived `Ord` compares numerically
+(`1.9.0 < 1.11.0`).
+
+Both record types are wrapped in `Signed<T>`, a `body` plus `sig`. `sign`
+signs `body_hash(body)`, the SHA-256 of the body's bincode encoding, so the
+signature covers every field except itself. `Signed::verify(owner)` checks it
+against the owner's public key and returns `false` for a wrong key, a changed
+body or bytes that are not a signature at all. `sign` and `record_key` return
+`None` instead of panicking if a body cannot be encoded.
+
+`latest_is_valid(pointer, owner)` is the one check for a latest pointer that
+both ends share: the tag is `latest-pointer`, the domain has no `:`, and the
+signature verifies. The `:` rule is there because `latest_key` joins domain
+and package with `:`. Without it, the owner of `a` could sign package `b:c`
+and land on the key of package `c` on domain `a:b`, then pin it with a huge
+version. A hostname never contains a `:`, so no real domain is refused.
+
+### Checking values
+
+The DHT stores a `Value` (`src/value.rs`), which is one of:
+
+- `Blob(bytes)`: anything content-addressed, stored under its hash. Package
+  blobs and signed `VersionRecord`s are both blobs, since `record_key` is the
+  hash of the record.
+- `Latest(Signed<LatestPointer>)`: stored under `latest_key(domain,
+  package)`, and replaced on each publish.
+
+`Value::key()` is the only key a value may be stored under. STORE, FIND_VALUE
+and the datastore all carry `Value`, and `lookup::store_value` takes one and
+stores it under its `key()`.
+
+Both ends check, for different reasons:
+
+- **STORE** protects the node's own storage. It refuses any value whose key
+  is not `value.key()`. For a `Latest` it also looks up the domain's key in
+  DNS and refuses the pointer if there is none or `latest_is_valid` fails.
+  It then compares with what is stored, under the map entry's lock, so two
+  concurrent stores cannot both pass the check: a higher version replaces the
+  old pointer, the identical pointer is accepted again (a republish), and
+  anything else, a rollback or a different pointer at the same version, is
+  refused.
+- **The reader** (`lookup.rs`) cannot trust any node, so it checks every
+  reply inside the probe loop of `lookup_values`. A reply that fails is
+  logged and skipped, and the next candidate is asked. Checked later, in the
+  CLI say, the first reply would end the lookup, and a node that answered
+  fast with garbage would win every race. `lookup_value` accepts only a blob
+  that hashes to the key and stops at the first one. `get_latest(rpc, dns,
+  domain, package)` fetches the owner's key once, accepts only a valid
+  pointer for that domain and package, asks all `K` closest nodes, and
+  returns the highest version: a replica that missed the last publish still
+  holds an older, validly signed pointer and must not hide the newer one.
+
+FIND_VALUE itself checks nothing, since it only returns what STORE accepted
+and the reader checks it again anyway.
+
+Not implemented yet:
+
+- CLI commands to publish or fetch a package.
+- Walking a package: from a pointer to its `VersionRecord` (checking that
+  record's signature and that versions decrease along `prev`), and on to the
+  blob.
+- Caching DNS answers. Each STORE of a pointer costs one query, and the
+  domain comes from the request, so any peer can make a node look up a name
+  of its choosing.
+
+Not addressed on purpose: the network is free storage. A blob STORE needs no
+domain and no signature, only `key == hash(value)`, so anyone can keep their
+own list of hashes (plus whatever naming scheme they like on top) and use the
+DHT to hold arbitrary data. Requiring blobs to be referenced by a signed
+`VersionRecord` would not stop this, only move it: anyone who owns a domain,
+which is cheap, can sign records for whatever blobs they want and get the
+same free storage as a "package". Since owning a domain is the only bar, and
+it is a low one, closing the unsigned path would add checks without removing
+the abuse.
 
 ## Metrics
 

@@ -1,6 +1,8 @@
 use crate::close_nodes::{CloseNodes, Contact, K, Key, NodeId};
 use crate::handle_rpc::Method;
+use crate::package::{Signed, VersionRecord};
 use crate::rpc_transport::RpcTransport;
+use crate::value::Value;
 use log::trace;
 use std::collections::HashSet;
 use std::io::ErrorKind;
@@ -10,7 +12,7 @@ use std::net::SocketAddr;
 /// the peer knows about if it does not hold the key.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FindValue {
-    Value(Vec<u8>),
+    Value(Value),
     Closest(Vec<Contact>),
 }
 
@@ -167,11 +169,23 @@ impl<T: RpcTransport, U: RpcTransport, A: CloseNodes> Rpc<T, U, A> {
     }
 
     /// Ask `peer` to store `value` under `key`.
-    pub async fn store(&self, peer: &Contact, key: Key, value: Vec<u8>) -> bool {
-        // NOTE lab spec allows for tcp transport of values, not forcing udp only
-        let Some(body) = crate::handle_rpc::store::encode_request(key, value) else {
+
+    pub async fn store(&self, peer: &Contact, key: Key, value: Value) -> bool {
+        self.store_with_proof(peer, key, value, Vec::new()).await
+    }
+
+    pub(crate) async fn store_with_proof(
+        &self,
+        peer: &Contact,
+        key: Key,
+        value: Value,
+        proof: Vec<Signed<VersionRecord>>,
+    ) -> bool {
+        let Some(body) = crate::handle_rpc::store::encode_request_with_proof(key, value, proof)
+        else {
             return false;
         };
+
         let reply = self
             .call(
                 &self.robust_transport,
@@ -182,7 +196,11 @@ impl<T: RpcTransport, U: RpcTransport, A: CloseNodes> Rpc<T, U, A> {
             )
             .await;
 
-        matches!(reply, Some(bytes) if bytes == crate::handle_rpc::store::STORED)
+        matches!(
+            reply,
+            Some(bytes)
+                if bytes == crate::handle_rpc::store::STORED
+        )
     }
 
     /// Ask `peer` for the contacts it knows closest to `target`.
@@ -347,7 +365,7 @@ mod tests {
         let key = [1u8; 32];
         let peer: SocketAddr = "127.0.0.1:8000".parse().unwrap();
 
-        let expected_reply = FindValue::Value(b"hello".to_vec());
+        let expected_reply = FindValue::Value(b"hello".to_vec().into());
 
         let mut expected_payload = my_id.to_vec();
         expected_payload.extend_from_slice(crate::handle_rpc::Method::FindValue.tag());
@@ -466,7 +484,7 @@ mod tests {
         let peer = peer_contact("127.0.0.1:8000".parse().unwrap());
 
         let rpc = failing_rpc(ErrorKind::TimedOut, peer, K);
-        assert!(!rpc.store(&peer, [0u8; 32], b"v".to_vec()).await);
+        assert!(!rpc.store(&peer, [0u8; 32], b"v".to_vec().into()).await);
         assert!(!holds(&rpc, &peer));
 
         let rpc = failing_rpc(ErrorKind::TimedOut, peer, K);

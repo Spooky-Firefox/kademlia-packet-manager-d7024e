@@ -1,7 +1,10 @@
 use crate::close_nodes::{CloseNodes, Contact, K, Key, NodeId, xor_distance_cmp};
+use crate::dns_data::DnsData;
 use crate::hashing::key_for_value;
+use crate::package::{LatestPointer, Signed, VersionRecord, latest_is_valid, latest_key};
 use crate::rpc::{FindValue, Rpc};
 use crate::rpc_transport::RpcTransport;
+use crate::value::Value;
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -131,7 +134,20 @@ where
     candidates
 }
 
-pub async fn lookup_value<T, U, A>(rpc: &Rpc<T, U, A>, key: Key) -> Option<(Contact, Vec<u8>)>
+/// Ask the `K` nodes closest to `key` for it, `ALPHA` at a time, and collect
+/// the replies `accept` passes. With `stop_at_first`, return as soon as one
+/// does.
+///
+/// Checking here, inside the probe loop, is what makes a bad reply cost only
+/// one probe: it is skipped and the next candidate is asked. Checked any later
+/// (by the caller, or the CLI) the first reply would end the lookup, and a
+/// node that answers fast with garbage would win every race.
+async fn lookup_values<T, U, A>(
+    rpc: &Rpc<T, U, A>,
+    key: Key,
+    accept: impl Fn(&Value) -> bool,
+    stop_at_first: bool,
+) -> Vec<(Contact, Value)>
 where
     T: RpcTransport,
     U: RpcTransport,
@@ -142,6 +158,7 @@ where
     let lookup_id = crate::instrumentation::next_lookup_id();
     let my_id = rpc.my_contact().id;
     let mut probe_count = 0usize;
+    let mut found = Vec::new();
 
     crate::instrumentation::lookup_start(lookup_id, "value", my_id, key);
 
@@ -178,22 +195,17 @@ where
 
         match reply {
             FindValue::Value(value) => {
-                if crate::hashing::key_for_value(&value) == key {
-                    crate::instrumentation::value_lookup_end(
-                        lookup_id,
-                        my_id,
-                        probe_count,
-                        true,
-                        started.elapsed(),
+                if accept(&value) {
+                    found.push((source, value));
+                    if stop_at_first {
+                        break;
+                    }
+                } else {
+                    log::warn!(
+                        "node {} returned a value that is not valid for the requested key",
+                        source.address
                     );
-
-                    return Some((source, value));
                 }
-
-                log::warn!(
-                    "node {} returned a value that does not match the requested key",
-                    source.address
-                );
             }
 
             FindValue::Closest(contacts) => {
@@ -208,40 +220,122 @@ where
         lookup_id,
         my_id,
         probe_count,
-        false,
+        !found.is_empty(),
         started.elapsed(),
     );
 
-    None
+    found
 }
-pub async fn store_value<T, U, A>(rpc: &Rpc<T, U, A>, value: Vec<u8>) -> Key
+
+/// Find the blob stored under `key`, and who answered with it. Only a blob
+/// that hashes to `key` is accepted.
+pub async fn lookup_value<T, U, A>(rpc: &Rpc<T, U, A>, key: Key) -> Option<(Contact, Vec<u8>)>
 where
     T: RpcTransport,
     U: RpcTransport,
     A: CloseNodes,
 {
-    // K = SHA256(V).
-    let key = key_for_value(&value);
+    let accept = |value: &Value| matches!(value, Value::Blob(bytes) if key_for_value(bytes) == key);
+    let (source, value) = lookup_values(rpc, key, accept, true)
+        .await
+        .into_iter()
+        .next()?;
+    match value {
+        Value::Blob(bytes) => Some((source, bytes)),
+        Value::Latest(_) => None,
+    }
+}
 
-    // Find the nodes closest to the key.
+/// The newest valid latest pointer for `package` on `domain`.
+///
+/// Every one of the `K` closest nodes is asked rather than stopping at the
+/// first answer: a replica that missed the last publish still holds an older
+/// pointer, validly signed, and must not hide the newer one.
+///
+/// `None` if the domain has no key in DNS, or no node holds a pointer signed
+/// with it.
+pub async fn get_latest<T, U, A, D>(
+    rpc: &Rpc<T, U, A>,
+    dns: &D,
+    domain: &str,
+    package: &str,
+) -> Option<Signed<LatestPointer>>
+where
+    T: RpcTransport,
+    U: RpcTransport,
+    A: CloseNodes,
+    D: DnsData,
+{
+    // One DNS query up front, so the per-reply check stays synchronous.
+    let owner = dns.get_dns_vk(domain).await?;
+    let accept = |value: &Value| {
+        matches!(value, Value::Latest(pointer)
+            if pointer.body.domain == domain
+                && pointer.body.package == package
+                && latest_is_valid(pointer, &owner))
+    };
+
+    lookup_values(rpc, latest_key(domain, package), accept, false)
+        .await
+        .into_iter()
+        .filter_map(|(_, value)| match value {
+            Value::Latest(pointer) => Some(pointer),
+            Value::Blob(_) => None,
+        })
+        .max_by_key(|pointer| pointer.body.version)
+}
+
+/// Store `value` on the `K` nodes closest to its key, and return the key.
+pub async fn store_value<T, U, A>(rpc: &Rpc<T, U, A>, value: Value) -> Key
+where
+    T: RpcTransport,
+    U: RpcTransport,
+    A: CloseNodes,
+{
+    store_value_with_proof(rpc, value, &[]).await.0
+}
+
+/// Replicate a value to the K closest nodes, optionally including
+/// a signed version history required for latest pointers.
+///
+/// Returns the value's key and how many nodes acknowledged STORE.
+pub(crate) async fn store_value_with_proof<T, U, A>(
+    rpc: &Rpc<T, U, A>,
+    value: Value,
+    proof: &[Signed<VersionRecord>],
+) -> (Key, usize)
+where
+    T: RpcTransport,
+    U: RpcTransport,
+    A: CloseNodes,
+{
+    let key = value.key();
+
+    // Find the K closest nodes to this key.
     let mut targets = lookup_node(rpc, key).await;
 
-    // Our routing table does not contain ourselves, but we may still
-    // be one of the K closest nodes to this key.
+    // Include ourselves as a possible storage target.
     targets.push(rpc.my_contact());
 
-    // Select the actual K closest nodes, including ourselves.
     targets.sort_by(|a, b| xor_distance_cmp(a.id, b.id, key));
     targets.dedup_by_key(|contact| contact.id);
     targets.truncate(K);
 
-    // Replicate the value to each of the K closest nodes.
+    // Count how many nodes actually accepted the value.
+    let mut accepted = 0;
+
     for target in targets {
-        rpc.store(&target, key, value.clone()).await;
+        if rpc
+            .store_with_proof(&target, key, value.clone(), proof.to_vec())
+            .await
+        {
+            accepted += 1;
+        }
     }
 
-    key
+    (key, accepted)
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,7 +413,7 @@ mod tests {
             } else if address == self.b.address {
                 FindValue::Closest(vec![self.c])
             } else if address == self.c.address {
-                FindValue::Value(self.value.clone())
+                FindValue::Value(self.value.clone().into())
             } else {
                 FindValue::Closest(Vec::new())
             };
@@ -631,6 +725,126 @@ mod tests {
         let rpc = Rpc::new(me(), transport, robust_transport, close_nodes);
 
         let result = lookup_value(&rpc, key).await;
+
+        assert_eq!(result, None);
+    }
+
+    /// Answers FIND_VALUE from a fixed table, and with no contacts for any
+    /// address not in it.
+    struct FakeRepliesTransport {
+        replies: Vec<(std::net::SocketAddr, FindValue)>,
+    }
+
+    impl RpcTransport for FakeRepliesTransport {
+        async fn send_receive(
+            &self,
+            _payload: Vec<u8>,
+            address: std::net::SocketAddr,
+        ) -> std::io::Result<Vec<u8>> {
+            let reply = self
+                .replies
+                .iter()
+                .find(|(at, _)| *at == address)
+                .map(|(_, reply)| reply.clone())
+                .unwrap_or(FindValue::Closest(Vec::new()));
+            Ok(bincode::serialize(&reply).unwrap())
+        }
+    }
+
+    /// Three contacts a lookup reaches through `FakeTransport` (a -> b -> c),
+    /// answering FIND_VALUE for `package` on node0's domain with `pointers`.
+    async fn get_latest_with(
+        pointers: [Option<Signed<LatestPointer>>; 3],
+        domain: &str,
+    ) -> Option<Signed<LatestPointer>> {
+        let a = Contact {
+            id: [8u8; 32],
+            address: "127.0.0.1:8001".parse().unwrap(),
+        };
+        let b = Contact {
+            id: [4u8; 32],
+            address: "127.0.0.1:8002".parse().unwrap(),
+        };
+        let c = Contact {
+            id: [2u8; 32],
+            address: "127.0.0.1:8003".parse().unwrap(),
+        };
+        let replies = [a, b, c]
+            .into_iter()
+            .zip(pointers)
+            .filter_map(|(contact, pointer)| {
+                Some((contact.address, FindValue::Value(Value::Latest(pointer?))))
+            })
+            .collect();
+        let rpc = Rpc::new(
+            me(),
+            FakeTransport { a, b, c },
+            FakeRepliesTransport { replies },
+            FakeCloseNodes { initial: vec![a] },
+        );
+
+        get_latest(
+            &rpc,
+            &crate::dns_data::fake_dns::FakeDns::new(),
+            domain,
+            "pkg",
+        )
+        .await
+    }
+
+    fn pointer(version: &str, signer: usize) -> Option<Signed<LatestPointer>> {
+        use crate::dns_data::fake_dns::FAKE_KEYS;
+        let signer = FAKE_KEYS[signer].signing_key().unwrap();
+        Some(crate::value::signed_latest(
+            FAKE_KEYS[0].domain,
+            "pkg",
+            version,
+            &signer,
+        ))
+    }
+
+    #[tokio::test]
+    async fn get_latest_skips_forged_pointer() {
+        let domain = crate::dns_data::fake_dns::FAKE_KEYS[0].domain;
+        // a answers first with a high version signed by the wrong key
+        let result =
+            get_latest_with([pointer("9.0.0", 1), pointer("1.0.0", 0), None], domain).await;
+
+        assert_eq!(result, pointer("1.0.0", 0));
+    }
+
+    #[tokio::test]
+    async fn get_latest_returns_highest_version_when_replicas_disagree() {
+        let domain = crate::dns_data::fake_dns::FAKE_KEYS[0].domain;
+        let result = get_latest_with(
+            [
+                pointer("1.0.0", 0),
+                pointer("1.10.0", 0),
+                pointer("1.9.0", 0),
+            ],
+            domain,
+        )
+        .await;
+
+        assert_eq!(result, pointer("1.10.0", 0));
+    }
+
+    #[tokio::test]
+    async fn get_latest_is_none_without_dns_key() {
+        let result = get_latest_with([pointer("1.0.0", 0), None, None], "nobody.d7024e.test").await;
+
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn get_latest_ignores_pointer_for_another_package() {
+        // validly signed by the owner, but not the package asked for
+        let domain = crate::dns_data::fake_dns::FAKE_KEYS[0].domain;
+        let signer = crate::dns_data::fake_dns::FAKE_KEYS[0]
+            .signing_key()
+            .unwrap();
+        let other = crate::value::signed_latest(domain, "other", "1.0.0", &signer);
+        let result = get_latest_with([Some(other), None, None], domain).await;
 
         assert_eq!(result, None);
     }

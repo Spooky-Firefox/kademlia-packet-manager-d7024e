@@ -178,7 +178,7 @@ async fn workload(nodes: Nodes, stats: Arc<Stats>, stored: Arc<Mutex<Vec<Vec<u8>
 
     let value: Vec<u8> = (0..32).map(|_| rand::random::<u8>()).collect();
     let key = writer
-        .scoped(lookup::store_value(writer.rpc(), value.clone()))
+        .scoped(lookup::store_value(writer.rpc(), value.clone().into()))
         .await;
     let found = reader.scoped(lookup::lookup_value(reader.rpc(), key)).await;
     stats.fresh_lookups.fetch_add(1, Ordering::Relaxed);

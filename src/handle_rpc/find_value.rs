@@ -7,13 +7,14 @@
 //! [`FindValue`](crate::rpc::FindValue) is on the other end.
 
 use crate::close_nodes::{CloseNodes, Key};
+use crate::dns_data::DnsData;
 use crate::handle_rpc::Context;
 use crate::rpc::FindValue;
 use std::net::SocketAddr;
 
 /// Answer a FIND_VALUE for the key in `body`.
-pub async fn handle<A: CloseNodes>(
-    context: &Context<A>,
+pub async fn handle<A: CloseNodes, D: DnsData>(
+    context: &Context<A, D>,
     _id: u64,
     _from: SocketAddr,
     body: &[u8],
@@ -32,7 +33,9 @@ pub async fn handle<A: CloseNodes>(
 mod tests {
     use super::*;
     use crate::close_nodes::{Contact, NodeId};
+    use crate::dns_data::fake_dns::FakeDns;
     use crate::rpc::FindValue;
+    use crate::value::Value;
 
     struct FakeCloseNodes {
         contacts: Vec<Contact>,
@@ -60,13 +63,14 @@ mod tests {
     #[tokio::test]
     async fn find_value_returns_stored_value() {
         let key = [1u8; 32];
-        let value = b"hello".to_vec();
+        let value: Value = b"hello".to_vec().into();
 
         let context = Context::new(
             [0u8; 32],
             FakeCloseNodes {
                 contacts: Vec::new(),
             },
+            FakeDns::new(),
         );
 
         context.values.insert(key, value.clone());
@@ -100,6 +104,7 @@ mod tests {
             FakeCloseNodes {
                 contacts: contacts.clone(),
             },
+            FakeDns::new(),
         );
 
         let body = bincode::serialize(&key).unwrap();

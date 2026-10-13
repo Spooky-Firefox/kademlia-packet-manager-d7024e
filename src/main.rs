@@ -1,16 +1,23 @@
 use std::error::Error;
 use std::net::SocketAddr;
 
+use kademlia_packet_manager_d7024e::dns_data::{DnsBackend, dns::Dns, fake_dns::FakeDns};
 use kademlia_packet_manager_d7024e::node::RealNode;
 use kademlia_packet_manager_d7024e::{bootstrap, cli, logging, maintenance};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     logging::setup()?;
-    let mut args = std::env::args().skip(1);
+    let mut args = std::env::args().skip(1).peekable();
+
+    let use_fake_dns = args.peek().is_some_and(|arg| arg == "--fake-dns");
+
+    if use_fake_dns {
+        args.next();
+    }
 
     let Some(bind) = args.next() else {
-        eprintln!("usage: cargo run -- IP:PORT [BOOTSTRAP_IP:PORT]");
+        eprintln!("usage: cargo run -- [--fake-dns] IP:PORT [BOOTSTRAP_IP:PORT]");
         return Ok(());
     };
 
@@ -22,11 +29,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
 
     if args.next().is_some() {
-        eprintln!("usage: cargo run -- IP:PORT [BOOTSTRAP_IP:PORT]");
+        eprintln!("usage: cargo run -- [--fake-dns] IP:PORT [BOOTSTRAP_IP:PORT]");
         return Ok(());
     }
 
-    let node = RealNode::bind(bind_address).await?;
+    let dns = if use_fake_dns {
+        DnsBackend::Fake(FakeDns::new())
+    } else {
+        DnsBackend::Real(Dns::new())
+    };
+
+    let node = RealNode::bind_with_dns(bind_address, dns).await?;
 
     println!("node address: {}", node.address());
     println!("node id:      {}", hex::encode(node.id()));

@@ -5,9 +5,11 @@
 //! round and look at the result. [`Node::periodic_task`](crate::node::Node::periodic_task)
 //! is what repeats them.
 
-use crate::close_nodes::CloseNodes;
+use crate::close_nodes::{CloseNodes, Key};
+use crate::dns_data::DnsData;
 use crate::rpc::Rpc;
 use crate::rpc_transport::RpcTransport;
+use crate::value::Value;
 use log::trace;
 use std::collections::HashSet;
 use std::time::Duration;
@@ -34,30 +36,60 @@ pub fn jittered(period: Duration) -> Duration {
     period.mul_f64(rand::random_range(1.0 - JITTER..1.0 + JITTER))
 }
 
-/// Republish every value this node currently holds to the current K closest
-/// nodes.
+/// Republish locally stored values to the current K closest nodes.
 ///
-/// The datastore is snapshotted before any network operations are awaited.
-/// This avoids holding DashMap guards while a lookup or STORE is in progress.
-pub async fn republish_values<T, U, A>(
+/// Blobs need no proof. Latest pointers require a verified version
+/// history, which is reconstructed from the DHT before republishing.
+pub async fn republish_values<T, U, A, D>(
     rpc: &Rpc<T, U, A>,
-    values: Vec<(crate::close_nodes::Key, Vec<u8>)>,
+    dns: &D,
+    mut values: Vec<(Key, Value)>,
 ) where
     T: RpcTransport,
     U: RpcTransport,
     A: CloseNodes,
+    D: DnsData,
 {
+    // Republish blobs before latest pointers, so any locally
+    // stored version records are replicated first.
+    values.sort_by_key(|(_, value)| matches!(value, Value::Latest(_)));
+
     for (key, value) in values {
+        // Latest pointers require a validated version history.
+        let proof = match &value {
+            Value::Blob(_) => Vec::new(),
+
+            Value::Latest(pointer) => {
+                match crate::version_chain::load_chain_from_pointer(rpc, dns, pointer).await {
+                    Ok(chain) => chain,
+
+                    Err(error) => {
+                        log::warn!(
+                            "Skipping republish of {}:{}: {}",
+                            pointer.body.domain,
+                            pointer.body.package,
+                            error
+                        );
+                        continue;
+                    }
+                }
+            }
+        };
+
+        // Find the K closest nodes to the value's key.
         let mut targets = crate::lookup::lookup_node(rpc, key).await;
 
         targets.push(rpc.my_contact());
 
         targets.sort_by(|a, b| crate::close_nodes::xor_distance_cmp(a.id, b.id, key));
+
         targets.dedup_by_key(|contact| contact.id);
         targets.truncate(crate::close_nodes::K);
 
+        // Republish with the required proof.
         for target in targets {
-            rpc.store(&target, key, value.clone()).await;
+            rpc.store_with_proof(&target, key, value.clone(), proof.clone())
+                .await;
         }
     }
 }
@@ -151,7 +183,7 @@ mod tests {
             assert!(
                 publisher
                     .rpc()
-                    .store(&holder.contact(), key, value.clone())
+                    .store(&holder.contact(), key, value.clone().into())
                     .await
             );
         }
@@ -176,7 +208,12 @@ mod tests {
         }
 
         // The last surviving replica performs one republishing round.
-        republish_values(publisher.rpc(), vec![(key, value.clone())]).await;
+        republish_values(
+            publisher.rpc(),
+            publisher.dns().as_ref(),
+            vec![(key, value.clone().into())],
+        )
+        .await;
 
         // Copies should now exist on replacement nodes.
         let republished_to: Vec<Contact> = replacements
@@ -293,10 +330,103 @@ mod tests {
         let value = b"republished value".to_vec();
         let key = crate::hashing::key_for_value(&value);
 
-        republish_values(publisher.rpc(), vec![(key, value.clone())]).await;
+        republish_values(
+            publisher.rpc(),
+            publisher.dns().as_ref(),
+            vec![(key, value.clone().into())],
+        )
+        .await;
 
         let result = publisher.rpc().find_value(&peer.contact(), key).await;
 
-        assert_eq!(result, crate::rpc::FindValue::Value(value));
+        assert_eq!(result, crate::rpc::FindValue::Value(value.into()));
+    }
+
+    #[tokio::test]
+    async fn republish_latest_with_valid_proof() {
+        use crate::dns_data::fake_dns::FAKE_KEYS;
+        use crate::package::{
+            LATEST_POINTER_TAG, LatestPointer, VERSION_RECORD_TAG, VersionRecord, record_key, sign,
+        };
+
+        let network = Network::new();
+
+        let a = FakeNode::new(&network);
+        let b = FakeNode::new(&network);
+
+        // A must know B in order to republish to it.
+        a.rpc().close_nodes().maybe_add_contact(b.contact());
+
+        let domain = FAKE_KEYS[0].domain;
+        let signer = FAKE_KEYS[0].signing_key().unwrap();
+
+        // Create a signed first version record.
+        let record = sign(
+            VersionRecord {
+                tag: VERSION_RECORD_TAG.to_string(),
+                domain: domain.to_string(),
+                package: "pkg".to_string(),
+                version: "1.0.0".parse().unwrap(),
+                blob_hash: [7; 32],
+                prev: [0; 32],
+            },
+            &signer,
+        )
+        .unwrap();
+
+        let version_key = record_key(&record).unwrap();
+        let record_bytes = bincode::serialize(&record).unwrap();
+
+        // Store the version record on Node A.
+        assert!(
+            a.rpc()
+                .store(&a.contact(), version_key, Value::Blob(record_bytes.clone()),)
+                .await
+        );
+
+        // Create a latest pointer to that record.
+        let pointer = sign(
+            LatestPointer {
+                tag: LATEST_POINTER_TAG.to_string(),
+                domain: domain.to_string(),
+                package: "pkg".to_string(),
+                version: "1.0.0".parse().unwrap(),
+                version_record_hash: version_key,
+            },
+            &signer,
+        )
+        .unwrap();
+
+        let latest_value = Value::Latest(pointer.clone());
+        let latest_key = latest_value.key();
+
+        // Store the pointer on A with its valid proof.
+        assert!(
+            a.rpc()
+                .store_with_proof(&a.contact(), latest_key, latest_value.clone(), vec![record],)
+                .await
+        );
+
+        // B does not have the pointer yet.
+        assert!(!holds(&b, latest_key));
+
+        // Republish A's stored records.
+        republish_values(
+            a.rpc(),
+            a.dns().as_ref(),
+            vec![
+                (version_key, Value::Blob(record_bytes)),
+                (latest_key, latest_value),
+            ],
+        )
+        .await;
+
+        // B should now have accepted the latest pointer.
+        assert!(holds(&b, latest_key));
+
+        // The pointer should be retrievable and valid.
+        let found = crate::lookup::get_latest(b.rpc(), b.dns().as_ref(), domain, "pkg").await;
+
+        assert_eq!(found, Some(pointer));
     }
 }

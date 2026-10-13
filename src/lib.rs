@@ -1,6 +1,7 @@
 pub mod bootstrap;
 pub mod cli;
 pub mod close_nodes;
+pub mod dns_data;
 pub mod handle_rpc;
 pub mod hashing;
 pub mod instrumentation;
@@ -9,6 +10,11 @@ pub mod lookup;
 pub mod maintenance;
 pub mod node;
 pub mod node_scope;
+pub mod package;
 pub mod pending;
+pub mod registry;
 pub mod rpc;
 pub mod rpc_transport;
+pub mod value;
+#[allow(dead_code)]
+mod version_chain;

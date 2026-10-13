@@ -339,7 +339,7 @@ impl Experiment {
             work,
             |(origin, value)| async move {
                 origin
-                    .scoped(lookup::store_value(origin.rpc(), value))
+                    .scoped(lookup::store_value(origin.rpc(), value.into()))
                     .await;
             },
         )
