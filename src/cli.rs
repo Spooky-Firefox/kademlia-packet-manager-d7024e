@@ -1,10 +1,12 @@
 use crate::close_nodes::{CloseNodes, Contact, ID_BYTES, Key};
 use crate::dns_data::DnsData;
+use crate::dns_data::fake_dns::FakeDns;
 use crate::dns_data::{DnsBackend, fake_dns::FAKE_KEYS};
 use crate::lookup;
-use crate::node::RealNode;
+use crate::node::Node;
 use crate::package::Version;
 use crate::package::{Signed, VERSION_RECORD_TAG, VersionRecord, record_key};
+use crate::rpc_transport::RpcTransport;
 use crate::value::Value;
 
 use bincode::Options;
@@ -13,7 +15,7 @@ use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::time::Instant;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 
 // vibecoded for better visual clarity
 fn short_id(id: &[u8]) -> String {
@@ -76,9 +78,32 @@ fn parse_install_name(input: &str) -> Result<(&str, &str, Option<Version>), &'st
     Ok((domain, package, requested_version))
 }
 
-async fn load_publisher_key(node: &RealNode) -> Result<SigningKey, String> {
-    match node.dns().as_ref() {
-        DnsBackend::Fake(_) => {
+/// Where a node's resolver says publishing keys come from: the fake
+/// resolver's built-in test identities, or a key file for real DNS.
+pub trait KeySource {
+    fn uses_fake_keys(&self) -> bool;
+}
+
+impl KeySource for DnsBackend {
+    fn uses_fake_keys(&self) -> bool {
+        matches!(self, DnsBackend::Fake(_))
+    }
+}
+
+impl KeySource for FakeDns {
+    fn uses_fake_keys(&self) -> bool {
+        true
+    }
+}
+
+async fn load_publisher_key<T, U, D>(node: &Node<T, U, D>) -> Result<SigningKey, String>
+where
+    T: RpcTransport,
+    U: RpcTransport,
+    D: DnsData + KeySource,
+{
+    match node.dns().uses_fake_keys() {
+        true => {
             // Each node uses one configured test publisher identity.
             // Default to node0 if no identity was specified.
             let identity = std::env::var("D7024E_FAKE_PUBLISHER")
@@ -92,7 +117,7 @@ async fn load_publisher_key(node: &RealNode) -> Result<SigningKey, String> {
                 .ok_or_else(|| format!("invalid fake publisher key for {identity}"))
         }
 
-        DnsBackend::Real(_) => {
+        false => {
             let path = std::env::var("D7024E_SIGNING_KEY_FILE")
                 .map_err(|_| "set D7024E_SIGNING_KEY_FILE to your private key file".to_string())?;
 
@@ -180,7 +205,7 @@ fn default_install_filename(domain: &str, package: &str, version: Version) -> St
         })
         .collect()
 }
-fn show_routing_table(node: &RealNode) {
+fn show_routing_table<T: RpcTransport, U: RpcTransport, D: DnsData>(node: &Node<T, U, D>) {
     let (siblings, buckets) = node.routing_snapshot();
 
     println!("siblings:");
@@ -267,7 +292,7 @@ fn describe_datastore_entry(key: &Key, value: &Value) -> String {
     }
 }
 
-fn show_datastore(node: &RealNode) {
+fn show_datastore<T: RpcTransport, U: RpcTransport, D: DnsData>(node: &Node<T, U, D>) {
     let values = node.datastore_snapshot();
 
     if values.is_empty() {
@@ -295,10 +320,31 @@ fn print_help() {
     println!("  exit");
 }
 
-pub async fn run(node: &RealNode) -> io::Result<()> {
-    let stdin = BufReader::new(tokio::io::stdin());
-    let mut lines = stdin.lines();
+/// Read commands from stdin and run them as `node`, until `exit` or EOF.
+///
+/// Generic over the transports and resolver, so the same prompt drives a real
+/// node or one on the in-process fake network.
+pub async fn run<T, U, D>(node: &Node<T, U, D>) -> io::Result<()>
+where
+    T: RpcTransport,
+    U: RpcTransport,
+    D: DnsData + KeySource,
+{
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    run_with(node, &mut lines).await
+}
 
+/// [`run`], reading commands from `lines` instead of a reader of its own.
+///
+/// For a caller that also reads stdin between sessions: two buffered readers
+/// on one stdin would each read ahead and swallow the other's lines.
+pub async fn run_with<T, U, D, R>(node: &Node<T, U, D>, lines: &mut Lines<R>) -> io::Result<()>
+where
+    T: RpcTransport,
+    U: RpcTransport,
+    D: DnsData + KeySource,
+    R: AsyncBufRead + Unpin,
+{
     print_help();
 
     loop {

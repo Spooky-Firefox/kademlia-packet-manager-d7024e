@@ -1,27 +1,9 @@
 use std::error::Error;
 use std::net::SocketAddr;
-#[allow(dead_code)]
-mod version_chain;
 
-mod bootstrap;
-mod cli;
-mod close_nodes;
-mod dns_data;
-mod handle_rpc;
-mod hashing;
-mod instrumentation;
-mod logging;
-mod lookup;
-mod maintenance;
-mod node;
-mod package;
-mod pending;
-mod registry;
-mod rpc;
-mod rpc_transport;
-mod value;
-use dns_data::{DnsBackend, dns::Dns, fake_dns::FakeDns};
-use node::RealNode;
+use kademlia_packet_manager_d7024e::dns_data::{DnsBackend, dns::Dns, fake_dns::FakeDns};
+use kademlia_packet_manager_d7024e::node::RealNode;
+use kademlia_packet_manager_d7024e::{bootstrap, cli, logging, maintenance};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {

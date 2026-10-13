@@ -126,11 +126,16 @@ impl Method {
     /// match a given payload and the matching order is not load-bearing. Keep
     /// it that way when adding a tag, or the scan below has to start caring.
     pub fn tag(self) -> &'static [u8] {
+        self.tag_str().as_bytes()
+    }
+
+    /// [`tag`](Self::tag) as text, for log lines.
+    pub fn tag_str(self) -> &'static str {
         match self {
-            Method::Ping => b"PING",
-            Method::Store => b"STORE",
-            Method::FindNode => b"FIND_NODE",
-            Method::FindValue => b"FIND_VALUE",
+            Method::Ping => "PING",
+            Method::Store => "STORE",
+            Method::FindNode => "FIND_NODE",
+            Method::FindValue => "FIND_VALUE",
         }
     }
 
@@ -319,7 +324,7 @@ async fn serve_datagrams<A, D, T>(
         let context = Arc::clone(&context);
         let socket = Arc::clone(&socket);
         // TODO deal with spawn handle
-        tokio::spawn(async move {
+        crate::node_scope::spawn(async move {
             let Some(datagram) = dispatch(&context, &request).await else {
                 return;
             };
@@ -355,7 +360,7 @@ pub async fn serve<A, D, T, L>(
     L: StreamListener + Send + Sync + 'static,
 {
     // TODO deal with spawn handle
-    tokio::spawn(serve_datagrams(Arc::clone(&context), requests, socket));
+    crate::node_scope::spawn(serve_datagrams(Arc::clone(&context), requests, socket));
     serve_streams(context, listener).await;
 }
 
@@ -375,6 +380,12 @@ where
     loop {
         let (mut stream, from) = match listener.accept().await {
             Ok(accepted) => accepted,
+            // The listener is gone for good: a fake endpoint that was unbound
+            // (see `Network::unbind`). Nothing more will arrive.
+            Err(e) if e.kind() == std::io::ErrorKind::NotConnected => {
+                trace!("listener unbound, stopping the stream serve loop");
+                break;
+            }
             // Transient on a real listener — a momentary fd exhaustion should
             // not take the server down — so the loop carries on.
             Err(e) => {
@@ -384,7 +395,7 @@ where
         };
         let context = Arc::clone(&context);
         // TODO deal with spawn handle
-        tokio::spawn(async move {
+        crate::node_scope::spawn(async move {
             let mut datagram = Vec::new();
             if let Err(e) = stream.read_to_end(&mut datagram).await {
                 trace!("reading the request from {from} failed: {e}");

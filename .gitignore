@@ -2,3 +2,9 @@
 /d7024e
 
 metrics.log
+sim.log
+
+experiments/.venv
+experiments/results
+__pycache__
+experiments/results-*

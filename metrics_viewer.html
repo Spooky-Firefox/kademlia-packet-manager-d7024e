@@ -1,0 +1,772 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Metrics Viewer</title>
+<!--
+  Sift through metrics.log from the kademlia node or the churn_sim example.
+
+  Open this file in a browser and drop metrics.log on it (or use the picker).
+  Everything runs locally; nothing is uploaded.
+
+  metrics.log is appended to by every run and lookup ids restart at 1 in each
+  process, so the log is split into runs at every `lookup_start lookup_id=1`.
+  Node lookups come in three kinds, and only one of them can report
+  exact_match, so they are kept apart:
+    - bootstrap: the target is the looking node's own id. A routing table does
+      not hold its own id, so it is never an exact match.
+    - value-key: lookup::lookup_value starts by running lookup_node for the
+      key, which is logged as a lookup of its own. It is paired with its value
+      lookup (same node and target, the next id up) and its probes are counted
+      as part of that value lookup's cost.
+    - store: any other lookup of a target that is not the id of any node seen
+      in the run, so a value's key, looked up by lookup::store_value to find
+      where to store. A key is not a node id, so it never matches exactly
+      either. (Inferred: a node that never appears in the log looks like a key.)
+    - node: a lookup of another node's id.
+-->
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7;
+  --surface: #fcfcfb;
+  --ink: #0b0b0b;
+  --ink-2: #52514e;
+  --muted: #898781;
+  --grid: #e1e0d9;
+  --axis: #c3c2b7;
+  --border: rgba(11,11,11,0.10);
+  --hover: rgba(11,11,11,0.05);
+  --series-1: #2a78d6;
+  --series-2: #eb6834;
+  --good: #006300;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --page: #0d0d0d;
+    --surface: #1a1a19;
+    --ink: #ffffff;
+    --ink-2: #c3c2b7;
+    --muted: #898781;
+    --grid: #2c2c2a;
+    --axis: #383835;
+    --border: rgba(255,255,255,0.10);
+    --hover: rgba(255,255,255,0.06);
+    --series-1: #3987e5;
+    --series-2: #d95926;
+    --good: #0ca30c;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d;
+  --surface: #1a1a19;
+  --ink: #ffffff;
+  --ink-2: #c3c2b7;
+  --muted: #898781;
+  --grid: #2c2c2a;
+  --axis: #383835;
+  --border: rgba(255,255,255,0.10);
+  --hover: rgba(255,255,255,0.06);
+  --series-1: #3987e5;
+  --series-2: #d95926;
+  --good: #0ca30c;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--page); color: var(--ink);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+main { max-width: 1200px; margin: 0 auto; padding: 24px 16px 64px; }
+h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; }
+h2 { font-size: 15px; font-weight: 600; margin: 0 0 2px; }
+.sub { color: var(--ink-2); margin: 0 0 16px; }
+.note { color: var(--muted); font-size: 12px; margin: 0 0 12px; }
+.card {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 10px; padding: 16px; margin-bottom: 16px; min-width: 0;
+}
+#drop {
+  border: 1.5px dashed var(--axis); border-radius: 10px; padding: 28px 16px;
+  text-align: center; color: var(--ink-2); background: var(--surface);
+  margin-bottom: 16px; cursor: pointer;
+}
+#drop.over { border-color: var(--series-1); background: var(--hover); }
+#drop strong { color: var(--ink); }
+#progress { height: 3px; background: var(--grid); border-radius: 2px; margin-top: 12px; overflow: hidden; display: none; }
+#progress div { height: 100%; width: 0; background: var(--series-1); }
+.filters { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: end; margin-bottom: 16px; }
+.filters label { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--ink-2); max-width: 100%; }
+select { max-width: 100%; }
+select, input {
+  font: inherit; color: var(--ink); background: var(--surface);
+  border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; min-width: 0;
+}
+input[type=number] { width: 80px; }
+input[type=text] { width: 150px; }
+button {
+  font: inherit; color: var(--ink); background: var(--surface);
+  border: 1px solid var(--border); border-radius: 6px; padding: 5px 10px; cursor: pointer;
+}
+button:hover { background: var(--hover); }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 16px; }
+.tile { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
+.tile .label { color: var(--ink-2); font-size: 12px; }
+.tile .value { font-size: 24px; font-weight: 600; margin-top: 2px; }
+.tile .detail { color: var(--muted); font-size: 12px; margin-top: 2px; }
+.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr)); gap: 16px; }
+.charts { grid-template-columns: repeat(auto-fit, minmax(min(100%, 440px), 1fr)); }
+.grid2 > .card { margin-bottom: 0; }
+.charts { margin-bottom: 16px; }
+.legend { display: flex; gap: 14px; font-size: 12px; color: var(--ink-2); margin: 6px 0 4px; }
+.legend span::before {
+  content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 2px;
+  margin-right: 5px; vertical-align: -1px; background: var(--c);
+}
+svg { display: block; width: 100%; overflow: visible; }
+svg text { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.bar { cursor: default; }
+.bar:hover, .bar:focus { opacity: 0.8; outline: none; }
+.empty { color: var(--muted); padding: 24px 0; text-align: center; }
+details { margin-top: 8px; font-size: 12px; color: var(--ink-2); }
+details summary { cursor: pointer; }
+table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+th { color: var(--ink-2); font-weight: 600; font-size: 12px; }
+th.sort { cursor: pointer; user-select: none; }
+th.sort:hover { color: var(--ink); }
+td.num, th.num { text-align: right; }
+tbody tr.row { cursor: pointer; }
+tbody tr.row:hover { background: var(--hover); }
+tr.probes td { white-space: normal; color: var(--ink-2); font-size: 12px; background: var(--hover); }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+.scroll { overflow-x: auto; }
+.pager { display: flex; gap: 8px; align-items: center; margin-top: 10px; color: var(--ink-2); font-size: 12px; }
+.hbar { display: grid; grid-template-columns: minmax(120px, 160px) 1fr 56px; gap: 8px; align-items: center; font-size: 12px; margin: 3px 0; }
+.hbar .track { height: 12px; }
+.hbar .fill { height: 12px; background: var(--series-1); border-radius: 0 4px 4px 0; }
+.hbar .n { text-align: right; font-variant-numeric: tabular-nums; color: var(--ink-2); }
+.ok { color: var(--good); }
+.miss { color: var(--ink); font-weight: 600; }
+#tip {
+  position: fixed; pointer-events: none; z-index: 10; display: none;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+  padding: 6px 9px; font-size: 12px; box-shadow: 0 4px 14px rgba(0,0,0,0.15);
+}
+#tip .v { font-weight: 600; color: var(--ink); }
+#tip .k { color: var(--ink-2); }
+#tip .row::before { content: ""; display: inline-block; width: 10px; height: 2px; margin-right: 6px; vertical-align: 3px; background: var(--c); }
+#content { display: none; }
+.theme { float: right; }
+</style>
+</head>
+<body>
+<main>
+  <button class="theme" id="theme" type="button" title="Toggle light/dark">Theme</button>
+  <h1>Metrics viewer</h1>
+  <p class="sub">Lookup metrics from <span class="mono">metrics.log</span>, split into runs. The file is read locally in your browser.</p>
+
+  <div id="drop" tabindex="0" role="button">
+    <strong>Drop metrics.log here</strong> or click to choose a file
+    <input id="file" type="file" hidden>
+    <div id="progress"><div></div></div>
+  </div>
+
+  <div id="content">
+    <div class="filters">
+      <label>Run <select id="run"></select></label>
+      <label>Kind
+        <select id="kind">
+          <option value="">All</option>
+          <option value="node">Node lookup</option>
+          <option value="value">Value lookup</option>
+          <option value="store">Store (key lookup)</option>
+          <option value="value-key">Key lookup inside a value lookup</option>
+          <option value="bootstrap">Bootstrap (self-lookup)</option>
+        </select>
+      </label>
+      <label>Outcome
+        <select id="outcome">
+          <option value="">All</option>
+          <option value="ok">Found</option>
+          <option value="miss">Not found</option>
+          <option value="open">Never finished</option>
+        </select>
+      </label>
+      <label>Node id prefix <input id="node" type="text" placeholder="hex" spellcheck="false"></label>
+      <label>Probed peer <input id="peer" type="text" placeholder="127.0.0.1:49160" spellcheck="false"></label>
+      <label>Min probes <input id="minProbes" type="number" min="0" placeholder="0"></label>
+      <button id="reset" type="button">Reset</button>
+    </div>
+
+    <div class="tiles" id="tiles"></div>
+
+    <div class="grid2 charts" id="charts"></div>
+
+    <div class="grid2" style="margin-bottom:16px">
+      <div class="card">
+        <h2>Most probed peers</h2>
+        <p class="note">How often each address was asked during a lookup. A hot spot is a node everyone routes through.</p>
+        <div id="peers"></div>
+      </div>
+      <div class="card">
+        <h2>Lookups by node</h2>
+        <p class="note">The nodes that started the most lookups. Click an id to filter by it.</p>
+        <div class="scroll"><table id="byNode"></table></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Lookups</h2>
+      <p class="note">Click a row to see which peers it probed, in order.</p>
+      <div class="scroll"><table id="lookups"></table></div>
+      <div class="pager" id="pager"></div>
+    </div>
+  </div>
+</main>
+<div id="tip"></div>
+
+<script>
+"use strict";
+
+// ---- parsing -------------------------------------------------------------
+
+/** runs[i] = { index, lookups: Map<id, Lookup> } */
+let runs = [];
+
+function newRun() {
+  const run = { index: runs.length, lookups: new Map() };
+  runs.push(run);
+  return run;
+}
+
+function lookupIn(run, id) {
+  let l = run.lookups.get(id);
+  if (!l) {
+    l = { id, kind: null, node: "", target: "", probes: null, peers: [],
+          results: null, ok: null, ended: false, keyLookup: null };
+    run.lookups.set(id, l);
+  }
+  return l;
+}
+
+function parseLine(line, state) {
+  if (!line.startsWith("event=")) return;
+  const f = {};
+  for (const tok of line.split(" ")) {
+    const i = tok.indexOf("=");
+    if (i > 0) f[tok.slice(0, i)] = tok.slice(i + 1);
+  }
+  const id = Number(f.lookup_id);
+  if (!Number.isFinite(id)) return;
+  // Every process numbers its lookups from 1, so an id-1 start opens a run.
+  if (f.event === "lookup_start" && id === 1) state.run = newRun();
+  if (!state.run) state.run = newRun();
+  const l = lookupIn(state.run, id);
+  switch (f.event) {
+    case "lookup_start":
+      l.node = f.node || l.node;
+      l.target = f.target || "";
+      l.kind = f.kind === "node" && f.target === f.node ? "bootstrap" : f.kind;
+      break;
+    case "lookup_probe":
+      l.peers.push(f.peer);
+      if (!l.node) l.node = f.node || "";
+      break;
+    case "lookup_end":
+      l.ended = true;
+      l.probes = Number(f.probes);
+      if (!l.node) l.node = f.node || "";
+      if (!l.kind) l.kind = f.kind;
+      if (f.kind === "node") {
+        l.results = Number(f.result_count);
+        l.ok = f.exact_match === "true";
+      } else {
+        l.ok = f.success === "true";
+      }
+      break;
+  }
+}
+
+async function load(file) {
+  runs = [];
+  const bar = document.querySelector("#progress");
+  const fill = bar.firstElementChild;
+  bar.style.display = "block";
+  fill.style.width = "0";
+  const state = { run: null };
+  const reader = file.stream().pipeThrough(new TextDecoderStream()).getReader();
+  let rest = "", read = 0, lastPaint = 0;
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    read += value.length;
+    const text = rest + value;
+    const lines = text.split("\n");
+    rest = lines.pop();
+    for (const line of lines) parseLine(line.trimEnd(), state);
+    const now = performance.now();
+    if (now - lastPaint > 100) {
+      fill.style.width = Math.min(100, 100 * read / file.size) + "%";
+      lastPaint = now;
+      await new Promise(r => setTimeout(r));
+    }
+  }
+  if (rest) parseLine(rest.trimEnd(), state);
+  bar.style.display = "none";
+
+  for (const run of runs) {
+    run.all = [...run.lookups.values()];
+    // Every node that looked anything up, so every node that bootstrapped.
+    const nodeIds = new Set(run.all.map(l => l.node));
+    for (const l of run.all) {
+      if (!l.kind) l.kind = "node";
+      if (l.kind === "node" && l.target && !nodeIds.has(l.target)) l.kind = "store";
+      if (l.probes === null) l.probes = l.peers.length;
+    }
+    // A value lookup's own key lookup takes the next id it hands out; allow a
+    // little slack in case a concurrent lookup took an id in between.
+    for (const v of run.all) {
+      if (v.kind !== "value") continue;
+      for (let id = v.id + 1; id <= v.id + 8; id++) {
+        const k = run.lookups.get(id);
+        if (k && k.kind === "store" && k.node === v.node && k.target === v.target && !k.parent) {
+          k.kind = "value-key";
+          k.parent = v;
+          v.keyLookup = k;
+          break;
+        }
+      }
+    }
+  }
+
+  const select = $("#run");
+  select.replaceChildren();
+  runs.forEach((run, i) => {
+    const count = k => run.all.filter(l => l.kind === k).length;
+    const o = document.createElement("option");
+    o.value = i;
+    o.textContent = `Run ${i + 1}: ${fmt(run.all.length)} lookups ` +
+      `(${fmt(count("node"))} node, ${fmt(count("value"))} value (+${fmt(count("value-key"))} inner), ` +
+      `${fmt(count("store"))} store, ${fmt(count("bootstrap"))} bootstrap)`;
+    select.append(o);
+  });
+  select.value = String(runs.length - 1);
+  $("#content").style.display = runs.length ? "block" : "none";
+  if (!runs.length) {
+    $("#drop").firstElementChild.textContent = "No lookup events found in that file";
+    return;
+  }
+  $("#drop").firstElementChild.textContent = `${file.name}: ${runs.length} run${runs.length > 1 ? "s" : ""}. Drop another to replace it.`;
+  page = 0;
+  render();
+}
+
+// ---- helpers -------------------------------------------------------------
+
+const $ = s => document.querySelector(s);
+const nf = new Intl.NumberFormat();
+const fmt = n => nf.format(n);
+const pct = (a, b) => b ? (100 * a / b).toFixed(1) + "%" : "–";
+const short = id => id ? id.slice(0, 8) : "?";
+function el(tag, props = {}, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(props)) {
+    if (k === "class") e.className = v;
+    else if (k === "style") e.style.cssText = v;
+    else if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
+    else e.setAttribute(k, v);
+  }
+  for (const kid of kids) e.append(kid instanceof Node ? kid : document.createTextNode(String(kid)));
+  return e;
+}
+function quantile(sorted, q) {
+  if (!sorted.length) return 0;
+  return sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))];
+}
+/** Probes a lookup cost, a value lookup's key lookup included. */
+function totalProbes(l) {
+  return l.probes + (l.keyLookup ? l.keyLookup.probes : 0);
+}
+function outcomeOf(l) {
+  if (!l.ended) return "open";
+  if (l.kind === "bootstrap" || l.kind === "store" || l.kind === "value-key") return "n/a";
+  return l.ok ? "ok" : "miss";
+}
+
+// ---- filtering -----------------------------------------------------------
+
+function filtered() {
+  const run = runs[Number($("#run").value)];
+  if (!run) return [];
+  const kind = $("#kind").value;
+  const outcome = $("#outcome").value;
+  const node = $("#node").value.trim().toLowerCase();
+  const peer = $("#peer").value.trim();
+  const minProbes = Number($("#minProbes").value) || 0;
+  return run.all.filter(l =>
+    (!kind || l.kind === kind) &&
+    (!outcome || outcomeOf(l) === outcome) &&
+    (!node || l.node.startsWith(node)) &&
+    (!peer || l.peers.some(p => p.includes(peer))) &&
+    l.probes >= minProbes);
+}
+
+// ---- tooltip -------------------------------------------------------------
+
+const tip = $("#tip");
+function showTip(evt, title, rows) {
+  tip.replaceChildren(el("div", { class: "k" }, title));
+  for (const [label, value, color] of rows) {
+    const r = el("div", { class: "row", style: color ? `--c:${color}` : "" },
+      el("span", { class: "v" }, value), " ", el("span", { class: "k" }, label));
+    tip.append(r);
+  }
+  tip.style.display = "block";
+  const r = evt.target.getBoundingClientRect?.();
+  const x = evt.clientX ?? (r.left + r.width / 2);
+  const y = evt.clientY ?? r.top;
+  const w = tip.offsetWidth, h = tip.offsetHeight;
+  tip.style.left = Math.min(window.innerWidth - w - 8, Math.max(8, x + 12)) + "px";
+  tip.style.top = Math.max(8, y - h - 10) + "px";
+}
+const hideTip = () => { tip.style.display = "none"; };
+
+// ---- tiles ---------------------------------------------------------------
+
+function tile(label, value, detail) {
+  return el("div", { class: "tile" },
+    el("div", { class: "label" }, label),
+    el("div", { class: "value" }, value),
+    el("div", { class: "detail" }, detail));
+}
+
+function renderTiles(ls) {
+  const done = ls.filter(l => l.ended);
+  const of = k => done.filter(l => l.kind === k);
+  const node = of("node"), value = of("value"), store = of("store"), boot = of("bootstrap"), inner = of("value-key");
+  const probes = done.map(l => l.probes).sort((a, b) => a - b);
+  const mean = probes.length ? probes.reduce((a, b) => a + b, 0) / probes.length : 0;
+  const open = ls.length - done.length;
+  $("#tiles").replaceChildren(
+    tile("Lookups", fmt(ls.length),
+      `${fmt(node.length)} node · ${fmt(value.length)} value (+${fmt(inner.length)} inner) · ${fmt(store.length)} store · ${fmt(boot.length)} bootstrap`),
+    tile("Probes per lookup", probes.length ? mean.toFixed(2) : "–",
+      probes.length ? `median ${quantile(probes, 0.5)} · p95 ${quantile(probes, 0.95)} · max ${probes[probes.length - 1]}` : "no finished lookups"),
+    tile("Node lookups found target", pct(node.filter(l => l.ok).length, node.length),
+      `${fmt(node.filter(l => !l.ok).length)} missed (exact_match=false)`),
+    tile("Value lookups found value", pct(value.filter(l => l.ok).length, value.length),
+      `${fmt(value.filter(l => !l.ok).length)} missed`),
+    tile("Probes per value lookup", value.length ? (value.reduce((a, l) => a + totalProbes(l), 0) / value.length).toFixed(2) : "–",
+      value.length ? `incl. its key lookup; ${(value.reduce((a, l) => a + l.probes, 0) / value.length).toFixed(2)} after it` : "no finished value lookups"),
+    tile("Never finished", fmt(open),
+      open ? "started, but no lookup_end (killed mid-lookup?)" : "every lookup ended"),
+  );
+}
+
+// ---- histograms ----------------------------------------------------------
+
+const H = 180, PAD = { l: 36, r: 8, t: 10, b: 26 };
+
+function niceMax(v) {
+  if (v <= 5) return Math.max(1, v);
+  const p = 10 ** Math.floor(Math.log10(v));
+  for (const m of [1, 2, 2.5, 5, 10]) if (m * p >= v) return m * p;
+  return v;
+}
+
+/** Stacked histogram of probe counts. series: [{label, color, test(l)}] */
+function histogram(title, note, ls, series, maxProbes) {
+  const card = el("div", { class: "card" }, el("h2", {}, title), el("p", { class: "note" }, note));
+  if (!ls.length) {
+    card.append(el("div", { class: "empty" }, "No lookups match the filters"));
+    return card;
+  }
+  if (series.length > 1) {
+    const legend = el("div", { class: "legend" });
+    for (const s of series) legend.append(el("span", { style: `--c:${s.color}` }, s.label));
+    card.append(legend);
+  }
+  const counts = Array.from({ length: maxProbes + 1 }, () => series.map(() => 0));
+  for (const l of ls) {
+    const i = series.findIndex(s => s.test(l));
+    if (i >= 0) counts[l.probes][i]++;
+  }
+  const top = niceMax(Math.max(...counts.map(c => c.reduce((a, b) => a + b, 0))));
+
+  const W = Math.max(300, card.clientWidth || 520);
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  const holder = el("div");
+  card.append(holder);
+  const draw = () => {
+    const width = holder.clientWidth || W;
+    svg.setAttribute("viewBox", `0 0 ${width} ${H}`);
+    svg.setAttribute("height", H);
+    svg.replaceChildren();
+    const plotW = width - PAD.l - PAD.r, plotH = H - PAD.t - PAD.b;
+    const band = plotW / counts.length;
+    const barW = Math.max(1, Math.min(24, band - 2));
+    const y = v => PAD.t + plotH - (v / top) * plotH;
+    const ns = "http://www.w3.org/2000/svg";
+    const mk = (tag, attrs) => {
+      const e = document.createElementNS(ns, tag);
+      for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+      return e;
+    };
+    for (let i = 0; i <= 4; i++) {
+      const v = top * i / 4;
+      if (!Number.isInteger(v)) continue;
+      const yy = y(v);
+      svg.append(mk("line", { x1: PAD.l, x2: width - PAD.r, y1: yy, y2: yy,
+        stroke: i ? "var(--grid)" : "var(--axis)", "stroke-width": 1 }));
+      const t = mk("text", { x: PAD.l - 6, y: yy + 3.5, "text-anchor": "end" });
+      t.textContent = fmt(v);
+      svg.append(t);
+    }
+    const every = Math.ceil(counts.length / Math.max(1, Math.floor(plotW / 28)));
+    counts.forEach((stack, probes) => {
+      const cx = PAD.l + band * probes + band / 2;
+      if (probes % every === 0) {
+        const t = mk("text", { x: cx, y: H - PAD.b + 15, "text-anchor": "middle" });
+        t.textContent = probes;
+        svg.append(t);
+      }
+      const total = stack.reduce((a, b) => a + b, 0);
+      if (!total) return;
+      let base = 0;
+      const lastIdx = stack.reduce((last, v, i) => v ? i : last, -1);
+      stack.forEach((v, i) => {
+        if (!v) return;
+        const y0 = y(base), y1 = y(base + v);
+        // 2px surface gap between stacked segments.
+        const gap = base ? 2 : 0;
+        const h = Math.max(0, y0 - y1 - gap);
+        const x = cx - barW / 2;
+        const r = i === lastIdx ? Math.min(4, h, barW / 2) : 0;
+        const top_ = y0 - gap - h;
+        const d = `M${x},${y0 - gap}V${top_ + r}Q${x},${top_} ${x + r},${top_}` +
+          `H${x + barW - r}Q${x + barW},${top_} ${x + barW},${top_ + r}V${y0 - gap}Z`;
+        svg.append(mk("path", { d, fill: series[i].color }));
+        base += v;
+      });
+      // Hit target: the whole column band, taller than the marks.
+      const hit = mk("rect", { x: cx - band / 2, y: PAD.t, width: band, height: plotH,
+        fill: "transparent", class: "bar", tabindex: 0 });
+      const show = e => showTip(e, `${probes} probe${probes === 1 ? "" : "s"}`,
+        series.map((s, i) => [s.label, fmt(stack[i]), s.color])
+          .concat(series.length > 1 ? [["total", fmt(total), ""]] : []));
+      hit.addEventListener("pointermove", show);
+      hit.addEventListener("focus", show);
+      hit.addEventListener("pointerleave", hideTip);
+      hit.addEventListener("blur", hideTip);
+      hit.addEventListener("click", () => { $("#minProbes").value = probes; page = 0; render(); });
+      svg.append(hit);
+    });
+    const xl = mk("text", { x: PAD.l + plotW / 2, y: H - 1, "text-anchor": "middle" });
+    xl.textContent = "probes per lookup";
+    svg.append(xl);
+  };
+  holder.append(svg);
+  requestAnimationFrame(draw);
+  resizers.push(draw);
+
+  // Table view: every value reachable without hovering.
+  const table = el("table", {},
+    el("thead", {}, el("tr", {}, el("th", { class: "num" }, "probes"),
+      ...series.map(s => el("th", { class: "num" }, s.label)))));
+  const body = el("tbody");
+  counts.forEach((stack, probes) => {
+    if (stack.some(Boolean)) body.append(el("tr", {}, el("td", { class: "num" }, probes),
+      ...stack.map(v => el("td", { class: "num" }, fmt(v)))));
+  });
+  table.append(body);
+  card.append(el("details", {}, el("summary", {}, "Show as table"), table));
+  return card;
+}
+
+let resizers = [];
+function renderCharts(ls) {
+  resizers = [];
+  const done = ls.filter(l => l.ended);
+  const maxProbes = done.reduce((m, l) => Math.max(m, l.probes), 0);
+  const found = { label: "found", color: "var(--series-1)", test: l => l.ok };
+  const missed = { label: "not found", color: "var(--series-2)", test: l => !l.ok };
+  const kind = k => done.filter(l => l.kind === k);
+  $("#charts").replaceChildren(
+    histogram("Node lookups", "Probes needed to look up another node's id. Click a column to filter by it.",
+      kind("node"), [found, missed], maxProbes),
+    histogram("Value lookups", "Probes after the key lookup that starts every value lookup; it stops at the first holder. The table has the full cost.",
+      kind("value"), [found, missed], maxProbes),
+    histogram("Store lookups", "Finding the k nodes closest to a value's key before storing it there.",
+      kind("store"), [{ label: "lookups", color: "var(--series-1)", test: () => true }], maxProbes),
+    histogram("Bootstrap self-lookups", "A joining node looking up its own id to fill its routing table.",
+      kind("bootstrap"), [{ label: "lookups", color: "var(--series-1)", test: () => true }], maxProbes),
+  );
+}
+window.addEventListener("resize", () => resizers.forEach(f => f()));
+
+// ---- peers & nodes -------------------------------------------------------
+
+function renderPeers(ls) {
+  const counts = new Map();
+  for (const l of ls) for (const p of l.peers) counts.set(p, (counts.get(p) || 0) + 1);
+  const top = [...counts].sort((a, b) => b[1] - a[1]).slice(0, 15);
+  const box = $("#peers");
+  if (!top.length) { box.replaceChildren(el("div", { class: "empty" }, "No probes match the filters")); return; }
+  const max = top[0][1];
+  box.replaceChildren(...top.map(([peer, n]) => {
+    const row = el("div", { class: "hbar" },
+      el("span", { class: "mono" }, peer),
+      el("div", { class: "track" }, el("div", { class: "fill", style: `width:${(100 * n / max).toFixed(1)}%` })),
+      el("span", { class: "n" }, fmt(n)));
+    row.style.cursor = "pointer";
+    row.title = "Filter lookups that probed this peer";
+    row.addEventListener("click", () => { $("#peer").value = peer; page = 0; render(); });
+    return row;
+  }));
+}
+
+function renderByNode(ls) {
+  const by = new Map();
+  for (const l of ls) {
+    let s = by.get(l.node);
+    if (!s) by.set(l.node, s = { n: 0, probes: 0, ended: 0, misses: 0 });
+    s.n++;
+    if (l.ended) { s.ended++; s.probes += l.probes; if (outcomeOf(l) === "miss") s.misses++; }
+  }
+  const top = [...by].sort((a, b) => b[1].n - a[1].n).slice(0, 12);
+  const table = $("#byNode");
+  table.replaceChildren(el("thead", {}, el("tr", {},
+    el("th", {}, "node"), el("th", { class: "num" }, "lookups"),
+    el("th", { class: "num" }, "avg probes"), el("th", { class: "num" }, "misses"))));
+  const body = el("tbody");
+  for (const [node, s] of top) {
+    const link = el("a", { href: "#", class: "mono" }, short(node));
+    link.addEventListener("click", e => { e.preventDefault(); $("#node").value = node; page = 0; render(); });
+    body.append(el("tr", {}, el("td", {}, link), el("td", { class: "num" }, fmt(s.n)),
+      el("td", { class: "num" }, s.ended ? (s.probes / s.ended).toFixed(1) : "–"),
+      el("td", { class: "num" }, fmt(s.misses))));
+  }
+  table.append(body);
+}
+
+// ---- lookup table --------------------------------------------------------
+
+const PAGE = 100;
+let page = 0, sortKey = "id", sortDir = 1;
+const columns = [
+  ["id", "id", l => l.id, true],
+  ["kind", "kind", l => l.kind],
+  ["node", "node", l => l.node],
+  ["target", "target", l => l.target],
+  ["probes", "probes", l => l.probes, true],
+  ["key", "+key lookup", l => l.keyLookup ? l.keyLookup.probes : -1, true],
+  ["results", "results", l => l.results ?? -1, true],
+  ["outcome", "outcome", l => outcomeOf(l)],
+];
+
+function renderTable(ls) {
+  const col = columns.find(c => c[0] === sortKey);
+  const rows = [...ls].sort((a, b) => {
+    const x = col[2](a), y = col[2](b);
+    return (x < y ? -1 : x > y ? 1 : 0) * sortDir;
+  });
+  const pages = Math.max(1, Math.ceil(rows.length / PAGE));
+  page = Math.min(page, pages - 1);
+
+  const table = $("#lookups");
+  const head = el("tr");
+  for (const [key, label, , num] of columns) {
+    const arrow = key === sortKey ? (sortDir > 0 ? " ▲" : " ▼") : "";
+    const th = el("th", { class: "sort" + (num ? " num" : "") }, label + arrow);
+    th.addEventListener("click", () => {
+      if (sortKey === key) sortDir = -sortDir; else { sortKey = key; sortDir = num ? -1 : 1; }
+      renderTable(ls);
+    });
+    head.append(th);
+  }
+  const body = el("tbody");
+  for (const l of rows.slice(page * PAGE, (page + 1) * PAGE)) {
+    const o = outcomeOf(l);
+    const label = { ok: "found", miss: "not found", open: "never finished", "n/a": "–" }[o];
+    const tr = el("tr", { class: "row" },
+      el("td", { class: "num" }, l.id),
+      el("td", {}, l.kind),
+      el("td", { class: "mono" }, short(l.node)),
+      el("td", { class: "mono" }, l.kind === "bootstrap" ? "(self)" : l.kind === "node" ? short(l.target) : `key ${short(l.target)}`),
+      el("td", { class: "num" }, l.probes),
+      el("td", { class: "num" }, l.keyLookup ? l.keyLookup.probes : l.parent ? `of #${l.parent.id}` : "–"),
+      el("td", { class: "num" }, l.results ?? "–"),
+      el("td", { class: o === "ok" ? "ok" : o === "miss" ? "miss" : "" }, label));
+    tr.addEventListener("click", () => {
+      const next = tr.nextElementSibling;
+      if (next && next.classList.contains("probes")) { next.remove(); return; }
+      const detail = el("td", { colspan: columns.length });
+      detail.append(el("div", {}, `node ${l.node || "?"}`),
+        el("div", {}, `target ${l.target || "?"}`),
+        el("div", { class: "mono", style: "margin-top:4px" },
+          l.peers.length ? l.peers.map((p, i) => `${i + 1}. ${p}`).join("   ") : "no probes logged"));
+      tr.after(el("tr", { class: "probes" }, detail));
+    });
+    body.append(tr);
+  }
+  table.replaceChildren(el("thead", {}, head), body);
+
+  const pager = $("#pager");
+  const prev = el("button", { type: "button" }, "Previous");
+  const next = el("button", { type: "button" }, "Next");
+  prev.disabled = page === 0;
+  next.disabled = page >= pages - 1;
+  prev.addEventListener("click", () => { page--; renderTable(ls); });
+  next.addEventListener("click", () => { page++; renderTable(ls); });
+  pager.replaceChildren(prev, next,
+    el("span", {}, `page ${page + 1} of ${pages} · ${fmt(rows.length)} lookups`));
+}
+
+// ---- wiring --------------------------------------------------------------
+
+function render() {
+  const ls = filtered();
+  renderTiles(ls);
+  renderCharts(ls);
+  renderPeers(ls);
+  renderByNode(ls);
+  renderTable(ls);
+}
+
+for (const id of ["run", "kind", "outcome"]) $("#" + id).addEventListener("change", () => { page = 0; render(); });
+let debounce;
+for (const id of ["node", "peer", "minProbes"]) $("#" + id).addEventListener("input", () => {
+  clearTimeout(debounce);
+  debounce = setTimeout(() => { page = 0; render(); }, 200);
+});
+$("#reset").addEventListener("click", () => {
+  for (const id of ["kind", "outcome", "node", "peer", "minProbes"]) $("#" + id).value = "";
+  page = 0;
+  render();
+});
+
+const drop = $("#drop"), input = $("#file");
+drop.addEventListener("click", () => input.click());
+drop.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") input.click(); });
+input.addEventListener("change", () => input.files[0] && load(input.files[0]));
+drop.addEventListener("dragover", e => { e.preventDefault(); drop.classList.add("over"); });
+drop.addEventListener("dragleave", () => drop.classList.remove("over"));
+drop.addEventListener("drop", e => {
+  e.preventDefault();
+  drop.classList.remove("over");
+  if (e.dataTransfer.files[0]) load(e.dataTransfer.files[0]);
+});
+
+$("#theme").addEventListener("click", () => {
+  const root = document.documentElement;
+  const dark = root.dataset.theme
+    ? root.dataset.theme === "dark"
+    : matchMedia("(prefers-color-scheme: dark)").matches;
+  root.dataset.theme = dark ? "light" : "dark";
+});
+</script>
+</body>
+</html>

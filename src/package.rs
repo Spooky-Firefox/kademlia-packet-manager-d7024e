@@ -5,48 +5,48 @@ use std::str::FromStr;
 
 /// a `major.minor.patch` version. Ord lets us do math stuff
 #[derive(PartialOrd, Ord, PartialEq, Eq, Debug, Clone, Copy, Serialize, Deserialize)]
-pub(crate) struct Version {
-    pub(crate) major: u32,
-    pub(crate) minor: u32,
-    pub(crate) patch: u32,
+pub struct Version {
+    pub major: u32,
+    pub minor: u32,
+    pub patch: u32,
 }
 
 /// a body plus the owner's ed25519 signature over `body_hash(body)`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct Signed<T> {
-    pub(crate) body: T,
-    pub(crate) sig: Vec<u8>,
+pub struct Signed<T> {
+    pub body: T,
+    pub sig: Vec<u8>,
 }
 
 /// VersionRecord points at its blob and at the previous version's record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct VersionRecord {
-    pub(crate) tag: String,
-    pub(crate) domain: String,
-    pub(crate) package: String,
-    pub(crate) version: Version,
-    pub(crate) blob_hash: Key,
-    pub(crate) prev: Key,
+pub struct VersionRecord {
+    pub tag: String,
+    pub domain: String,
+    pub package: String,
+    pub version: Version,
+    pub blob_hash: Key,
+    pub prev: Key,
 }
 
 /// names the newest `VersionRecord` of a package, stored under `latest_key`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct LatestPointer {
-    pub(crate) tag: String,
-    pub(crate) domain: String,           // "rfin.ch"
-    pub(crate) package: String,          // "java-pair"
-    pub(crate) version: Version,         // 1.1.0
-    pub(crate) version_record_hash: Key, // which record is the newest
+pub struct LatestPointer {
+    pub tag: String,
+    pub domain: String,           // "rfin.ch"
+    pub package: String,          // "java-pair"
+    pub version: Version,         // 1.1.0
+    pub version_record_hash: Key, // which record is the newest
 }
 
 /// `VersionRecord::tag`, telling a version record apart from other signed bodies.
-pub(crate) const VERSION_RECORD_TAG: &str = "version-record";
+pub const VERSION_RECORD_TAG: &str = "version-record";
 /// `LatestPointer::tag`, telling a latest pointer apart from other signed bodies.
-pub(crate) const LATEST_POINTER_TAG: &str = "latest-pointer";
+pub const LATEST_POINTER_TAG: &str = "latest-pointer";
 
 /// returned when a string is not three dot-separated `u32`s.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct ParseVersionError;
+pub struct ParseVersionError;
 
 impl FromStr for Version {
     type Err = ParseVersionError;
@@ -76,12 +76,12 @@ impl std::fmt::Display for Version {
 }
 
 /// the DHT key a signed version record is stored under: the hash of the whole record.
-pub(crate) fn record_key(record: &Signed<VersionRecord>) -> Option<Key> {
+pub fn record_key(record: &Signed<VersionRecord>) -> Option<Key> {
     Some(hash_bytes(&bincode::serialize(record).ok()?))
 }
 
 /// the fixed DHT key of a package's `LatestPointer`: `hash("domain:package:latest")`.
-pub(crate) fn latest_key(domain: &str, package: &str) -> Key {
+pub fn latest_key(domain: &str, package: &str) -> Key {
     hash_bytes(format!("{}:{}:latest", domain, package).as_bytes())
 }
 
@@ -92,14 +92,14 @@ fn body_hash<T: Serialize>(body: &T) -> Option<Key> {
 }
 
 /// sign `body` with the domain owner's secret key.
-pub(crate) fn sign<T: Serialize>(body: T, key: &SigningKey) -> Option<Signed<T>> {
+pub fn sign<T: Serialize>(body: T, key: &SigningKey) -> Option<Signed<T>> {
     let sig = key.sign(&body_hash(&body)?).to_bytes().to_vec();
     Some(Signed { body, sig })
 }
 
 impl<T: Serialize> Signed<T> {
     /// True if `sig` is a valid signature of this body by `owner`.
-    pub(crate) fn verify(&self, owner: &VerifyingKey) -> bool {
+    pub fn verify(&self, owner: &VerifyingKey) -> bool {
         let Ok(sig) = Signature::from_slice(&self.sig) else {
             return false; // garbage bytes, not even a signature
         };
@@ -119,7 +119,7 @@ impl<T: Serialize> Signed<T> {
 /// with `:`, so without this the owner of `a` could sign package `b:c` and
 /// land on the key of package `c` on domain `a:b`. A hostname never contains
 /// a `:`, so the split is unambiguous for every real domain.
-pub(crate) fn latest_is_valid(pointer: &Signed<LatestPointer>, owner: &VerifyingKey) -> bool {
+pub fn latest_is_valid(pointer: &Signed<LatestPointer>, owner: &VerifyingKey) -> bool {
     pointer.body.tag == LATEST_POINTER_TAG
         && !pointer.body.domain.contains(':')
         && pointer.verify(owner)

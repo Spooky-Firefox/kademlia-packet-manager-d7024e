@@ -16,7 +16,7 @@ const END_OF_CHAIN: Key = [0; 32];
 const MAX_CHAIN_LENGTH: usize = 10_000;
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum ChainError {
+pub enum ChainError {
     NoDnsKey,
     NoLatestPointer,
     InvalidLatestPointer,
@@ -41,14 +41,14 @@ impl std::fmt::Display for ChainError {
 
 impl std::error::Error for ChainError {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ChainRelation {
+pub enum ChainRelation {
     Same,
     Extends,
     Rollback,
     Fork,
 }
 
-pub(crate) fn compare_chains(
+pub fn compare_chains(
     stored: &[Signed<VersionRecord>],
     proposed: &[Signed<VersionRecord>],
 ) -> Result<ChainRelation, ChainError> {
@@ -86,7 +86,7 @@ pub(crate) fn compare_chains(
     Ok(ChainRelation::Fork)
 }
 
-pub(crate) async fn load_chain<T, U, A, D>(
+pub async fn load_chain<T, U, A, D>(
     rpc: &Rpc<T, U, A>,
     dns: &D,
     domain: &str,
@@ -117,7 +117,7 @@ where
 ///
 /// Unlike load_chain(), this does not search for a newer pointer.
 /// It verifies the exact pointer supplied by the caller.
-pub(crate) async fn load_chain_from_pointer<T, U, A, D>(
+pub async fn load_chain_from_pointer<T, U, A, D>(
     rpc: &Rpc<T, U, A>,
     dns: &D,
     pointer: &Signed<LatestPointer>,
@@ -243,7 +243,7 @@ where
 ///
 /// Returns the verified history, newest first.
 /// The caller must obtain `owner` from the pointer's domain DNS record.
-pub(crate) async fn validate_chain_proof(
+pub async fn validate_chain_proof(
     latest: &Signed<LatestPointer>,
     owner: &VerifyingKey,
     proof: &[Signed<VersionRecord>],

@@ -100,6 +100,22 @@ second also appends the run to `results.csv` (`--results` picks another file).
 The third averages all saved runs by network size and by packet loss. The
 event format is in [docs/architecture.md](docs/architecture.md#metrics).
 
+## Experiments
+
+The experimental evaluation simulates networks of up to 16384 nodes in one
+process, with seeded topologies and values, and measures lookups against
+network size, packet loss, latency, α and churn.
+[experiments/README.md](experiments/README.md) describes the setup, how each
+quantity is measured, the RPC timeout and retry policy, and what results to
+expect. The results are in [experiments/report/](experiments/report/): open
+`report.html` for all the plots with their explanations, or use
+`aggregate.csv` (mean, variance and std over seeds for each configuration)
+and `summary.csv` (one row per run).
+
+```sh
+experiments/start.sh    # run everything (about a day) and publish to experiments/report/
+```
+
 ## Project layout
 
 | Path | Contents |
@@ -114,10 +130,12 @@ event format is in [docs/architecture.md](docs/architecture.md#metrics).
 | `src/close_nodes.rs`, `src/close_nodes/` | The routing table |
 | `src/rpc_transport.rs`, `src/rpc_transport/` | UDP, TCP and simulated transports |
 | `src/pending.rs` | Matching UDP replies to the requests waiting for them |
-| `src/maintenance.rs` | Periodic liveness checks |
+| `src/maintenance.rs` | Periodic liveness checks and republishing |
 | `src/hashing.rs` | Node ids and value keys |
 | `src/logging.rs`, `src/instrumentation.rs` | Logging and lookup metrics |
-| `analyze_metrics.py` | Metrics analysis |
+| `analyze_metrics.py` | Metrics analysis for a single node's log |
+| `examples/churn_sim.rs` | A large simulated network under churn, with a CLI on any node |
+| `examples/experiment.rs`, `experiments/` | The experiment harness, suite, analysis and results |
 | `Dockerfile`, `compose.yaml` | The 50-node Docker network |
 
 [docs/architecture.md](docs/architecture.md) explains how these parts fit
@@ -127,6 +145,4 @@ together.
 
 - Values are kept in memory only. They are lost when the node stops, and they
   never expire.
-- Nodes do not republish values, so a value is gone once every node that
-  stored it has stopped.
 - `put` prints `stored ...` even when no node accepted the value.
