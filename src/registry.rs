@@ -1137,3 +1137,290 @@ mod tests {
         assert_eq!(versions[1].blob_key, key_for_value(b"first"));
     }
 }
+
+/// Publishing and installing across a network of many nodes, and the
+/// publisher's own refusals.
+#[cfg(test)]
+mod network_tests {
+    use super::*;
+    use crate::dns_data::fake_dns::FAKE_KEYS;
+    use crate::node::FakeNode;
+    use crate::rpc_transport::networked_debug_transport::{Network, NetworkConfig};
+
+    const PACKAGE: &str = "calculator";
+
+    fn v(version: &str) -> Version {
+        version.parse().unwrap()
+    }
+
+    /// `n` nodes, each joined through the first. A join that the network's
+    /// loss defeats is tried again, as a user would.
+    async fn network(n: usize, config: NetworkConfig) -> (Network, Vec<FakeNode>) {
+        let network = Network::with_config(config);
+        let nodes: Vec<FakeNode> = (0..n).map(|_| FakeNode::new(&network)).collect();
+        for node in &nodes[1..] {
+            let mut tries = 0;
+            while crate::bootstrap::bootstrap(node.rpc(), nodes[0].address())
+                .await
+                .is_err()
+            {
+                tries += 1;
+                assert!(tries < 5, "join failed {tries} times");
+            }
+        }
+        (network, nodes)
+    }
+
+    async fn publish(
+        node: &FakeNode,
+        version: &str,
+        blob: &[u8],
+    ) -> Result<PublishReceipt, PublishError> {
+        publish_package(
+            node.rpc(),
+            node.dns().as_ref(),
+            FAKE_KEYS[0].domain,
+            PACKAGE,
+            v(version),
+            blob.to_vec(),
+            &FAKE_KEYS[0].signing_key().unwrap(),
+            None,
+            false,
+        )
+        .await
+    }
+
+    async fn install(
+        node: &FakeNode,
+        version: Option<&str>,
+    ) -> Result<InstalledPackage, InstallError> {
+        install_package(
+            node.rpc(),
+            node.dns().as_ref(),
+            FAKE_KEYS[0].domain,
+            PACKAGE,
+            version.map(v),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn every_node_of_a_network_installs_every_version() {
+        let (_network, nodes) = network(25, NetworkConfig::default()).await;
+        let blobs: Vec<Vec<u8>> = (1..=4).map(|i| vec![i as u8; 3000 * i]).collect();
+        for (i, blob) in blobs.iter().enumerate() {
+            let receipt = publish(&nodes[7], &format!("{}.0.0", i + 1), blob)
+                .await
+                .unwrap();
+            assert_eq!(receipt.latest_accepted, crate::close_nodes::K);
+        }
+
+        for node in &nodes {
+            let latest = install(node, None).await.unwrap();
+            assert_eq!(latest.version, v("4.0.0"));
+            assert_eq!(latest.blob, blobs[3]);
+            for (i, blob) in blobs.iter().enumerate() {
+                let pinned = install(node, Some(&format!("{}.0.0", i + 1)))
+                    .await
+                    .unwrap();
+                assert_eq!(&pinned.blob, blob);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn updates_from_different_nodes_continue_one_history() {
+        // The owner publishes each version from a different machine; every
+        // publish must find the history the last one left.
+        let (_network, nodes) = network(25, NetworkConfig::default()).await;
+        for (i, node) in nodes.iter().take(5).enumerate() {
+            publish(node, &format!("{}.0.0", i + 1), format!("v{i}").as_bytes())
+                .await
+                .unwrap();
+        }
+        let versions: Vec<Version> = show_package(
+            nodes[20].rpc(),
+            nodes[20].dns().as_ref(),
+            FAKE_KEYS[0].domain,
+            PACKAGE,
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|published| published.version)
+        .collect();
+
+        assert_eq!(
+            versions,
+            ["5.0.0", "4.0.0", "3.0.0", "2.0.0", "1.0.0"]
+                .map(v)
+                .to_vec()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "about a minute of retries; run with cargo test -- --ignored"]
+    async fn publish_and_install_survive_moderate_packet_loss() {
+        // Every datagram is dropped with probability 0.3, publishing
+        // included; retries have to carry each lookup through.
+        let (_network, nodes) = network(
+            12,
+            NetworkConfig {
+                loss: 0.3,
+                ..NetworkConfig::default()
+            },
+        )
+        .await;
+        publish(&nodes[0], "1.0.0", b"one").await.unwrap();
+        publish(&nodes[0], "2.0.0", b"two").await.unwrap();
+
+        for node in nodes.iter().skip(1).step_by(3) {
+            let installed = install(node, None).await.unwrap();
+            assert_eq!(installed.version, v("2.0.0"));
+            assert_eq!(installed.blob, b"two");
+        }
+    }
+
+    #[tokio::test]
+    async fn install_fails_cleanly_once_every_holder_is_gone() {
+        let (network, nodes) = network(30, NetworkConfig::default()).await;
+        publish(&nodes[0], "1.0.0", b"one").await.unwrap();
+
+        let (holders, others): (Vec<&FakeNode>, Vec<&FakeNode>) = nodes
+            .iter()
+            .partition(|node| !node.datastore_snapshot().is_empty());
+        assert!(!holders.is_empty() && !others.is_empty());
+        for holder in &holders {
+            network.unbind(holder.address());
+        }
+
+        // Nobody left has it: the install must say so, not return something.
+        assert!(matches!(
+            install(others[0], None).await,
+            Err(InstallError::InvalidHistory(ChainError::NoLatestPointer))
+        ));
+    }
+
+    #[tokio::test]
+    async fn publishing_for_a_domain_without_a_dns_key_is_refused() {
+        let (_network, nodes) = network(3, NetworkConfig::default()).await;
+        let result = publish_package(
+            nodes[0].rpc(),
+            nodes[0].dns().as_ref(),
+            "nobody.d7024e.test",
+            PACKAGE,
+            v("1.0.0"),
+            b"x".to_vec(),
+            &FAKE_KEYS[0].signing_key().unwrap(),
+            None,
+            false,
+        )
+        .await;
+
+        assert!(matches!(result, Err(PublishError::NoDnsKey)));
+        assert!(
+            nodes
+                .iter()
+                .all(|node| node.datastore_snapshot().is_empty())
+        );
+    }
+
+    #[test]
+    fn publishing_on_top_of_another_packages_history_is_refused() {
+        let signer = FAKE_KEYS[0].signing_key().unwrap();
+        let other = prepare_publication(
+            FAKE_KEYS[0].domain,
+            "other",
+            v("1.0.0"),
+            b"o".to_vec(),
+            &signer,
+            &[],
+            None,
+            false,
+        )
+        .unwrap();
+
+        let result = prepare_publication(
+            FAKE_KEYS[0].domain,
+            PACKAGE,
+            v("2.0.0"),
+            b"c".to_vec(),
+            &signer,
+            &other.proof,
+            None,
+            false,
+        );
+
+        assert!(matches!(result, Err(PublishError::WrongPackageHistory)));
+    }
+
+    #[test]
+    fn naming_a_previous_version_that_does_not_exist_is_refused() {
+        let signer = FAKE_KEYS[0].signing_key().unwrap();
+        let first = prepare_publication(
+            FAKE_KEYS[0].domain,
+            PACKAGE,
+            v("1.0.0"),
+            b"1".to_vec(),
+            &signer,
+            &[],
+            None,
+            false,
+        )
+        .unwrap();
+
+        let result = prepare_publication(
+            FAKE_KEYS[0].domain,
+            PACKAGE,
+            v("2.0.0"),
+            b"2".to_vec(),
+            &signer,
+            &first.proof,
+            Some(v("1.5.0")),
+            false,
+        );
+
+        assert!(matches!(result, Err(PublishError::PreviousNotFound)));
+    }
+
+    #[test]
+    fn naming_the_latest_as_previous_is_the_normal_update() {
+        let signer = FAKE_KEYS[0].signing_key().unwrap();
+        let first = prepare_publication(
+            FAKE_KEYS[0].domain,
+            PACKAGE,
+            v("1.0.0"),
+            b"1".to_vec(),
+            &signer,
+            &[],
+            None,
+            false,
+        )
+        .unwrap();
+        let implicit = prepare_publication(
+            FAKE_KEYS[0].domain,
+            PACKAGE,
+            v("2.0.0"),
+            b"2".to_vec(),
+            &signer,
+            &first.proof,
+            None,
+            false,
+        )
+        .unwrap();
+        let explicit = prepare_publication(
+            FAKE_KEYS[0].domain,
+            PACKAGE,
+            v("2.0.0"),
+            b"2".to_vec(),
+            &signer,
+            &first.proof,
+            Some(v("1.0.0")),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(implicit.proof, explicit.proof);
+        assert_eq!(implicit.pointer, explicit.pointer);
+    }
+}

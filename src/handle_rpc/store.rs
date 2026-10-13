@@ -656,3 +656,228 @@ mod tests {
         assert_eq!(context.values.get(&blob.key()).as_deref(), Some(&blob));
     }
 }
+
+/// What a node that wants to plant or replace a package might send, end to
+/// end through the STORE handler.
+#[cfg(test)]
+mod attack_tests {
+    use super::*;
+    use crate::close_nodes::{RecommendedCloseNodes, recommended};
+    use crate::dns_data::fake_dns::{FAKE_KEYS, FakeDns};
+    use crate::package::{LATEST_POINTER_TAG, VERSION_RECORD_TAG, latest_key, sign};
+    use ed25519_dalek::SigningKey;
+    use std::sync::Arc;
+
+    type Ctx = Arc<Context<RecommendedCloseNodes, FakeDns>>;
+
+    fn context() -> Ctx {
+        Context::new([0u8; 32], recommended([0u8; 32]), FakeDns::new())
+    }
+
+    fn from() -> SocketAddr {
+        "127.0.0.1:9000".parse().unwrap()
+    }
+
+    fn domain() -> &'static str {
+        FAKE_KEYS[0].domain
+    }
+
+    fn owner() -> SigningKey {
+        FAKE_KEYS[0].signing_key().unwrap()
+    }
+
+    /// A publication of `version` continuing `older` (newest first), signed
+    /// by `signer`: the pointer and its full proof.
+    fn publish(
+        version: &str,
+        older: &[Signed<VersionRecord>],
+        signer: &SigningKey,
+        package: &str,
+    ) -> (Signed<LatestPointer>, Vec<Signed<VersionRecord>>) {
+        let record = sign(
+            VersionRecord {
+                tag: VERSION_RECORD_TAG.to_string(),
+                domain: domain().to_string(),
+                package: package.to_string(),
+                version: version.parse().unwrap(),
+                blob_hash: crate::hashing::key_for_value(version.as_bytes()),
+                prev: older.first().and_then(record_key).unwrap_or([0; 32]),
+            },
+            signer,
+        )
+        .unwrap();
+        let pointer = sign(
+            LatestPointer {
+                tag: LATEST_POINTER_TAG.to_string(),
+                domain: domain().to_string(),
+                package: package.to_string(),
+                version: version.parse().unwrap(),
+                version_record_hash: record_key(&record).unwrap(),
+            },
+            signer,
+        )
+        .unwrap();
+        let mut proof = vec![record];
+        proof.extend_from_slice(older);
+        (pointer, proof)
+    }
+
+    async fn send(
+        context: &Ctx,
+        key: Key,
+        value: Value,
+        proof: Vec<Signed<VersionRecord>>,
+    ) -> bool {
+        let body = encode_request_with_proof(key, value, proof).unwrap();
+        handle(context, 1, from(), &body).await.as_deref() == Some(STORED)
+    }
+
+    async fn store_pointer(
+        context: &Ctx,
+        pointer: &Signed<LatestPointer>,
+        proof: &[Signed<VersionRecord>],
+    ) -> bool {
+        let value = Value::Latest(pointer.clone());
+        send(context, value.key(), value, proof.to_vec()).await
+    }
+
+    fn stored_version(context: &Ctx, package: &str) -> Option<String> {
+        match context
+            .values
+            .get(&latest_key(domain(), package))
+            .as_deref()
+        {
+            Some(Value::Latest(pointer)) => Some(pointer.body.version.to_string()),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn first_pointer_without_its_proof_is_rejected() {
+        let context = context();
+        let (pointer, _) = publish("1.0.0", &[], &owner(), "pkg");
+
+        assert!(!store_pointer(&context, &pointer, &[]).await);
+        assert_eq!(stored_version(&context, "pkg"), None);
+    }
+
+    #[tokio::test]
+    async fn blob_carrying_a_proof_is_rejected() {
+        let context = context();
+        let (_, proof) = publish("1.0.0", &[], &owner(), "pkg");
+        let blob = Value::Blob(b"some package".to_vec());
+
+        assert!(!send(&context, blob.key(), blob.clone(), proof).await);
+        assert!(context.values.get(&blob.key()).is_none());
+    }
+
+    #[tokio::test]
+    async fn pointer_under_another_packages_key_is_rejected() {
+        let context = context();
+        let (pointer, proof) = publish("1.0.0", &[], &owner(), "pkg");
+
+        // Valid pointer for `pkg`, sent for the key of `victim`.
+        let victim = latest_key(domain(), "victim");
+        assert!(!send(&context, victim, Value::Latest(pointer), proof).await);
+        assert!(context.values.get(&victim).is_none());
+    }
+
+    #[tokio::test]
+    async fn proof_of_another_package_does_not_vouch_for_this_one() {
+        let context = context();
+        let (pointer, _) = publish("1.0.0", &[], &owner(), "pkg");
+        let (_, other_proof) = publish("1.0.0", &[], &owner(), "other");
+
+        assert!(!store_pointer(&context, &pointer, &other_proof).await);
+    }
+
+    #[tokio::test]
+    async fn higher_version_on_a_fresh_history_does_not_replace_the_stored_one() {
+        let context = context();
+        let (v1, proof1) = publish("1.0.0", &[], &owner(), "pkg");
+        assert!(store_pointer(&context, &v1, &proof1).await);
+
+        // Validly signed by the owner, higher, but not built on 1.0.0: a
+        // leaked key, or a second publisher with a stale view, cannot rewrite
+        // the history nodes have already accepted.
+        let (fork, fork_proof) = publish("9.0.0", &[], &owner(), "pkg");
+        assert!(!store_pointer(&context, &fork, &fork_proof).await);
+        assert_eq!(stored_version(&context, "pkg").as_deref(), Some("1.0.0"));
+    }
+
+    #[tokio::test]
+    async fn every_step_of_a_long_history_is_accepted_in_order() {
+        let context = context();
+        let mut proof: Vec<Signed<VersionRecord>> = Vec::new();
+        for major in 1..=30 {
+            let (pointer, next) = publish(&format!("{major}.0.0"), &proof, &owner(), "pkg");
+            assert!(
+                store_pointer(&context, &pointer, &next).await,
+                "version {major}"
+            );
+            proof = next;
+        }
+        assert_eq!(stored_version(&context, "pkg").as_deref(), Some("30.0.0"));
+    }
+
+    #[tokio::test]
+    async fn skipping_ahead_is_fine_but_going_back_is_not() {
+        let context = context();
+        let (v1, p1) = publish("1.0.0", &[], &owner(), "pkg");
+        let (v2, p2) = publish("2.0.0", &p1, &owner(), "pkg");
+        let (v3, p3) = publish("3.0.0", &p2, &owner(), "pkg");
+
+        // A node that missed 2.0.0 accepts 3.0.0 straight after 1.0.0: the
+        // proof shows 1.0.0 in its history.
+        assert!(store_pointer(&context, &v1, &p1).await);
+        assert!(store_pointer(&context, &v3, &p3).await);
+        // An older, valid pointer arriving late is turned away.
+        assert!(!store_pointer(&context, &v2, &p2).await);
+        assert_eq!(stored_version(&context, "pkg").as_deref(), Some("3.0.0"));
+        // Republishing the current one is still accepted.
+        assert!(store_pointer(&context, &v3, &p3).await);
+    }
+
+    #[tokio::test]
+    async fn squatted_latest_key_is_taken_back_by_the_owner_but_not_by_a_forger() {
+        let context = context();
+        // Anyone can store the bytes that hash to a package's latest key.
+        let squat_bytes = format!("{}:pkg:latest", domain()).into_bytes();
+        let squat = Value::Blob(squat_bytes);
+        assert_eq!(squat.key(), latest_key(domain(), "pkg"));
+        assert!(send(&context, squat.key(), squat, Vec::new()).await);
+
+        let (forged, forged_proof) =
+            publish("1.0.0", &[], &FAKE_KEYS[1].signing_key().unwrap(), "pkg");
+        assert!(!store_pointer(&context, &forged, &forged_proof).await);
+
+        let (real, proof) = publish("1.0.0", &[], &owner(), "pkg");
+        assert!(store_pointer(&context, &real, &proof).await);
+        assert_eq!(stored_version(&context, "pkg").as_deref(), Some("1.0.0"));
+    }
+
+    #[tokio::test]
+    async fn garbage_bodies_are_ignored() {
+        // Truncations of a valid request, and random bytes: never stored,
+        // never a panic.
+        use rand::{RngExt, SeedableRng};
+        let context = context();
+        let (pointer, proof) = publish("1.0.0", &[], &owner(), "pkg");
+        let value = Value::Latest(pointer);
+        let body = encode_request_with_proof(value.key(), value, proof).unwrap();
+
+        for len in 0..body.len() {
+            assert!(
+                handle(&context, 1, from(), &body[..len]).await.is_none(),
+                "prefix {len}"
+            );
+        }
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        for _ in 0..2000 {
+            let len = rng.random_range(0..512);
+            let junk: Vec<u8> = (0..len).map(|_| rng.random()).collect();
+            let _ = handle(&context, 1, from(), &junk).await;
+        }
+        assert!(context.values.get(&latest_key(domain(), "pkg")).is_none());
+    }
+}

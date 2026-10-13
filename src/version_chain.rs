@@ -470,3 +470,338 @@ mod tests {
         assert_eq!(result, Err(ChainError::UnexpectedRecords));
     }
 }
+
+/// Forged and malformed histories: each must be refused, with the error that
+/// names what is wrong with it.
+#[cfg(test)]
+mod adversarial_tests {
+    use super::*;
+    use crate::package::{LATEST_POINTER_TAG, sign};
+    use ed25519_dalek::SigningKey;
+    use std::collections::HashMap;
+
+    const DOMAIN: &str = "node0.d7024e.test";
+    const PACKAGE: &str = "calculator";
+
+    fn owner() -> SigningKey {
+        SigningKey::from_bytes(&[1; 32])
+    }
+
+    fn imposter() -> SigningKey {
+        SigningKey::from_bytes(&[2; 32])
+    }
+
+    fn record_body(version: &str, prev: Key) -> VersionRecord {
+        VersionRecord {
+            tag: VERSION_RECORD_TAG.to_string(),
+            domain: DOMAIN.to_string(),
+            package: PACKAGE.to_string(),
+            version: version.parse().unwrap(),
+            blob_hash: [7; 32],
+            prev,
+        }
+    }
+
+    fn record(version: &str, prev: Key) -> Signed<VersionRecord> {
+        sign(record_body(version, prev), &owner()).unwrap()
+    }
+
+    fn pointer_to(version: &str, head: Key, signer: &SigningKey) -> Signed<LatestPointer> {
+        sign(
+            LatestPointer {
+                tag: LATEST_POINTER_TAG.to_string(),
+                domain: DOMAIN.to_string(),
+                package: PACKAGE.to_string(),
+                version: version.parse().unwrap(),
+                version_record_hash: head,
+            },
+            signer,
+        )
+        .unwrap()
+    }
+
+    fn key(record: &Signed<VersionRecord>) -> Key {
+        record_key(record).unwrap()
+    }
+
+    /// A valid history of `versions`, oldest first in the argument, returned
+    /// newest first as a proof is.
+    fn history(versions: &[&str]) -> Vec<Signed<VersionRecord>> {
+        let mut prev = END_OF_CHAIN;
+        let mut chain = Vec::new();
+        for version in versions {
+            let next = record(version, prev);
+            prev = key(&next);
+            chain.push(next);
+        }
+        chain.reverse();
+        chain
+    }
+
+    async fn validate(
+        pointer: &Signed<LatestPointer>,
+        proof: &[Signed<VersionRecord>],
+    ) -> Result<Vec<Signed<VersionRecord>>, ChainError> {
+        validate_chain_proof(pointer, &owner().verifying_key(), proof).await
+    }
+
+    /// Walk from `pointer` fetching from `store`, as a lookup would.
+    async fn walk(
+        pointer: &Signed<LatestPointer>,
+        store: &HashMap<Key, Vec<u8>>,
+    ) -> Result<Vec<Signed<VersionRecord>>, ChainError> {
+        walk_chain(pointer, &owner().verifying_key(), DOMAIN, PACKAGE, |key| {
+            std::future::ready(store.get(&key).cloned())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn long_valid_history_is_accepted_newest_first() {
+        let names: Vec<String> = (1..=200).map(|v| format!("{v}.0.0")).collect();
+        let versions: Vec<&str> = names.iter().map(String::as_str).collect();
+        let proof = history(&versions);
+        let pointer = pointer_to("200.0.0", key(&proof[0]), &owner());
+
+        let validated = validate(&pointer, &proof).await.unwrap();
+
+        assert_eq!(validated, proof);
+        assert_eq!(validated.last().unwrap().body.prev, END_OF_CHAIN);
+    }
+
+    #[tokio::test]
+    async fn pointer_signed_by_another_key_is_rejected() {
+        let proof = history(&["1.0.0"]);
+        let pointer = pointer_to("1.0.0", key(&proof[0]), &imposter());
+
+        assert_eq!(
+            validate(&pointer, &proof).await,
+            Err(ChainError::InvalidLatestPointer)
+        );
+    }
+
+    #[tokio::test]
+    async fn pointer_to_end_of_chain_is_rejected() {
+        let pointer = pointer_to("1.0.0", END_OF_CHAIN, &owner());
+
+        assert_eq!(
+            validate(&pointer, &[]).await,
+            Err(ChainError::InvalidLatestPointer)
+        );
+    }
+
+    #[tokio::test]
+    async fn pointer_for_another_package_is_rejected_by_the_walk() {
+        let mut store = HashMap::new();
+        let first = record("1.0.0", END_OF_CHAIN);
+        store.insert(key(&first), bincode::serialize(&first).unwrap());
+        let mut other = pointer_to("1.0.0", key(&first), &owner());
+        other.body.package = "other".to_string();
+        let other = sign(other.body, &owner()).unwrap();
+
+        // Validly signed, but not the package the walk was asked about.
+        assert_eq!(
+            walk(&other, &store).await,
+            Err(ChainError::InvalidLatestPointer)
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_proof_is_missing_the_head() {
+        let head = record("1.0.0", END_OF_CHAIN);
+        let pointer = pointer_to("1.0.0", key(&head), &owner());
+
+        assert_eq!(
+            validate(&pointer, &[]).await,
+            Err(ChainError::MissingRecord(key(&head)))
+        );
+    }
+
+    #[tokio::test]
+    async fn pointer_claiming_another_version_than_its_record_is_rejected() {
+        // The pointer says 2.0.0; the record it names is 1.0.0.
+        let proof = history(&["1.0.0"]);
+        let pointer = pointer_to("2.0.0", key(&proof[0]), &owner());
+
+        assert_eq!(
+            validate(&pointer, &proof).await,
+            Err(ChainError::HeadVersionMismatch)
+        );
+    }
+
+    #[tokio::test]
+    async fn history_that_goes_up_while_walking_back_is_rejected() {
+        // 1.0.0 claims 2.0.0 as its predecessor.
+        let older = record("2.0.0", END_OF_CHAIN);
+        let newer = record("1.0.0", key(&older));
+        let pointer = pointer_to("1.0.0", key(&newer), &owner());
+
+        assert_eq!(
+            validate(&pointer, &[newer, older]).await,
+            Err(ChainError::NonDecreasingVersion)
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_version_number_is_rejected() {
+        let older = record("1.0.0", END_OF_CHAIN);
+        let newer = record("1.0.0", key(&older));
+        // Not the same record twice: same version, different predecessor.
+        assert_ne!(key(&older), key(&newer));
+        let pointer = pointer_to("1.0.0", key(&newer), &owner());
+
+        assert_eq!(
+            validate(&pointer, &[newer, older]).await,
+            Err(ChainError::NonDecreasingVersion)
+        );
+    }
+
+    #[tokio::test]
+    async fn record_signed_by_another_key_is_rejected() {
+        let first = sign(record_body("1.0.0", END_OF_CHAIN), &imposter()).unwrap();
+        let second = record("2.0.0", key(&first));
+        let pointer = pointer_to("2.0.0", key(&second), &owner());
+
+        assert_eq!(
+            validate(&pointer, &[second, first.clone()]).await,
+            Err(ChainError::InvalidRecord(key(&first)))
+        );
+    }
+
+    #[tokio::test]
+    async fn record_from_another_package_is_rejected() {
+        let mut body = record_body("1.0.0", END_OF_CHAIN);
+        body.package = "other".to_string();
+        let foreign = sign(body, &owner()).unwrap();
+        let second = record("2.0.0", key(&foreign));
+        let pointer = pointer_to("2.0.0", key(&second), &owner());
+
+        assert_eq!(
+            validate(&pointer, &[second, foreign.clone()]).await,
+            Err(ChainError::InvalidRecord(key(&foreign)))
+        );
+    }
+
+    #[tokio::test]
+    async fn record_from_another_domain_is_rejected() {
+        let mut body = record_body("1.0.0", END_OF_CHAIN);
+        body.domain = "node1.d7024e.test".to_string();
+        let foreign = sign(body, &owner()).unwrap();
+        let pointer = pointer_to("1.0.0", key(&foreign), &owner());
+
+        assert_eq!(
+            validate(&pointer, std::slice::from_ref(&foreign)).await,
+            Err(ChainError::InvalidRecord(key(&foreign)))
+        );
+    }
+
+    #[tokio::test]
+    async fn record_with_wrong_tag_is_rejected() {
+        let mut body = record_body("1.0.0", END_OF_CHAIN);
+        body.tag = LATEST_POINTER_TAG.to_string();
+        let mistagged = sign(body, &owner()).unwrap();
+        let pointer = pointer_to("1.0.0", key(&mistagged), &owner());
+
+        assert_eq!(
+            validate(&pointer, std::slice::from_ref(&mistagged)).await,
+            Err(ChainError::InvalidRecord(key(&mistagged)))
+        );
+    }
+
+    #[tokio::test]
+    async fn bytes_that_do_not_hash_to_the_key_are_rejected() {
+        let first = record("1.0.0", END_OF_CHAIN);
+        let pointer = pointer_to("1.0.0", key(&first), &owner());
+        // A node answers for the record's key with another record's bytes.
+        let other = record("1.0.1", END_OF_CHAIN);
+        let store = HashMap::from([(key(&first), bincode::serialize(&other).unwrap())]);
+
+        assert_eq!(
+            walk(&pointer, &store).await,
+            Err(ChainError::HashMismatch(key(&first)))
+        );
+    }
+
+    #[tokio::test]
+    async fn bytes_that_are_not_a_record_are_rejected() {
+        // The pointer names the hash of something that is not a record.
+        let junk = b"not a version record".to_vec();
+        let junk_key = key_for_value(&junk);
+        let pointer = pointer_to("1.0.0", junk_key, &owner());
+        let store = HashMap::from([(junk_key, junk)]);
+
+        assert_eq!(
+            walk(&pointer, &store).await,
+            Err(ChainError::InvalidEncoding(junk_key))
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_record_in_proof_is_rejected() {
+        let proof = history(&["1.0.0", "2.0.0"]);
+        let pointer = pointer_to("2.0.0", key(&proof[0]), &owner());
+        let mut padded = proof.clone();
+        padded.push(proof[1].clone());
+
+        assert_eq!(
+            validate(&pointer, &padded).await,
+            Err(ChainError::UnexpectedRecords)
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_proof_is_refused_before_any_work() {
+        let first = record("1.0.0", END_OF_CHAIN);
+        let pointer = pointer_to("1.0.0", key(&first), &owner());
+        let huge = vec![first; MAX_CHAIN_LENGTH + 1];
+
+        assert_eq!(
+            validate(&pointer, &huge).await,
+            Err(ChainError::TooManyVersions)
+        );
+    }
+
+    #[tokio::test]
+    async fn tampering_with_any_byte_of_a_record_is_detected() {
+        // Flip each byte of the encoded head record in turn. Whatever still
+        // decodes is a different record, so it can never pass for the one the
+        // pointer names.
+        let proof = history(&["1.0.0", "2.0.0"]);
+        let pointer = pointer_to("2.0.0", key(&proof[0]), &owner());
+        let bytes = bincode::serialize(&proof[0]).unwrap();
+
+        for i in 0..bytes.len() {
+            let mut tampered = bytes.clone();
+            tampered[i] ^= 0x01;
+            let Ok(record) = bincode::deserialize::<Signed<VersionRecord>>(&tampered) else {
+                continue;
+            };
+            let forged = vec![record, proof[1].clone()];
+            assert!(
+                validate(&pointer, &forged).await.is_err(),
+                "flipping byte {i} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn comparing_empty_histories_is_an_error() {
+        let chain = history(&["1.0.0"]);
+
+        assert_eq!(compare_chains(&[], &chain), Err(ChainError::EmptyChain));
+        assert_eq!(compare_chains(&chain, &[]), Err(ChainError::EmptyChain));
+    }
+
+    #[test]
+    fn comparing_histories_of_different_packages_is_an_error() {
+        let ours = history(&["1.0.0"]);
+        let mut body = record_body("1.0.0", END_OF_CHAIN);
+        body.package = "other".to_string();
+        let theirs = vec![sign(body, &owner()).unwrap()];
+
+        assert_eq!(
+            compare_chains(&ours, &theirs),
+            Err(ChainError::DifferentPackage)
+        );
+    }
+}
