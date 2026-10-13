@@ -16,5 +16,4 @@ pub mod registry;
 pub mod rpc;
 pub mod rpc_transport;
 pub mod value;
-#[allow(dead_code)]
-mod version_chain;
+pub mod version_chain;

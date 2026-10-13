@@ -14,7 +14,7 @@ use crate::version_chain::{ChainError, load_chain_from_pointer};
 use ed25519_dalek::SigningKey;
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum PublishError {
+pub enum PublishError {
     VersionNotNewer,
     PreviousNotFound,
     PreviousNotLatest,
@@ -37,23 +37,23 @@ impl std::fmt::Display for PublishError {
 impl std::error::Error for PublishError {}
 
 #[derive(Debug)]
-pub(crate) struct PreparedPublication {
-    pub(crate) blob: Vec<u8>,
-    pub(crate) record: Signed<VersionRecord>,
-    pub(crate) pointer: Signed<LatestPointer>,
-    pub(crate) proof: Vec<Signed<VersionRecord>>,
+pub struct PreparedPublication {
+    pub blob: Vec<u8>,
+    pub record: Signed<VersionRecord>,
+    pub pointer: Signed<LatestPointer>,
+    pub proof: Vec<Signed<VersionRecord>>,
 }
 #[derive(Debug)]
-pub(crate) struct PublishReceipt {
-    pub(crate) blob_key: Key,
-    pub(crate) record_key: Key,
-    pub(crate) latest_key: Key,
-    pub(crate) blob_accepted: usize,
-    pub(crate) record_accepted: usize,
-    pub(crate) latest_accepted: usize,
+pub struct PublishReceipt {
+    pub blob_key: Key,
+    pub record_key: Key,
+    pub latest_key: Key,
+    pub blob_accepted: usize,
+    pub record_accepted: usize,
+    pub latest_accepted: usize,
 }
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum InstallError {
+pub enum InstallError {
     InvalidHistory(ChainError),
     VersionNotFound(Version),
     BlobUnavailable(Key),
@@ -68,18 +68,18 @@ impl std::fmt::Display for InstallError {
 impl std::error::Error for InstallError {}
 
 #[derive(Debug)]
-pub(crate) struct InstalledPackage {
-    pub(crate) version: Version,
-    pub(crate) blob_key: Key,
-    pub(crate) blob: Vec<u8>,
+pub struct InstalledPackage {
+    pub version: Version,
+    pub blob_key: Key,
+    pub blob: Vec<u8>,
 }
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct PublishedVersion {
-    pub(crate) version: Version,
-    pub(crate) blob_key: Key,
-    pub(crate) is_latest: bool,
+pub struct PublishedVersion {
+    pub version: Version,
+    pub blob_key: Key,
+    pub is_latest: bool,
 }
-pub(crate) fn prepare_publication(
+pub fn prepare_publication(
     domain: &str,
     package: &str,
     version: Version,
@@ -170,7 +170,7 @@ pub(crate) fn prepare_publication(
     })
 }
 
-pub(crate) async fn publish_package<T, U, A, D>(
+pub async fn publish_package<T, U, A, D>(
     rpc: &Rpc<T, U, A>,
     dns: &D,
     domain: &str,
@@ -248,7 +248,7 @@ where
     })
 }
 
-pub(crate) async fn install_package<T, U, A, D>(
+pub async fn install_package<T, U, A, D>(
     rpc: &Rpc<T, U, A>,
     dns: &D,
     domain: &str,
@@ -296,7 +296,7 @@ where
 /// List all verified versions of a package, newest first.
 ///
 /// Version records are authenticated, but package blobs are not downloaded here.
-pub(crate) async fn show_package<T, U, A, D>(
+pub async fn show_package<T, U, A, D>(
     rpc: &Rpc<T, U, A>,
     dns: &D,
     domain: &str,

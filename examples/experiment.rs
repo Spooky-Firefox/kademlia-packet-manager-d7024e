@@ -31,6 +31,17 @@
 //!    node lookups, alternating: `--concurrency` at a time, or, with
 //!    `--duration-secs`, started at an even pace over that long.
 //!
+//! # The package workload
+//!
+//! With `--workload packages`, step 4 instead **publishes** `--packages`
+//! packages of `--versions` versions each (`registry::publish_package`, each
+//! package from one random node, its versions in order; with
+//! `--lossy-publish` under the measure phase's loss and latency), and step 5
+//! runs `--lookups` **installs** (`registry::install_package`) from random
+//! nodes: half of the latest version, half of a random published one. An
+//! install fetches the latest pointer, walks and verifies the whole version
+//! chain, then fetches the blob, so its cost grows with the chain.
+//!
 //! # What is and is not repeatable
 //!
 //! The seed fixes the topology, the join order and seeds, the values, which
@@ -41,8 +52,10 @@
 //! configuration is run with several seeds.
 
 use kademlia_packet_manager_d7024e::close_nodes::{CloseNodes, K, Key, NodeId, xor_distance_cmp};
+use kademlia_packet_manager_d7024e::dns_data::fake_dns::FAKE_KEYS;
 use kademlia_packet_manager_d7024e::instrumentation::RpcEvents;
 use kademlia_packet_manager_d7024e::node::FakeNode;
+use kademlia_packet_manager_d7024e::package::{Version, latest_key};
 use kademlia_packet_manager_d7024e::rpc_transport::networked_debug_transport::{
     Network, NetworkConfig,
 };
@@ -51,7 +64,7 @@ use kademlia_packet_manager_d7024e::rpc_transport::retry_transport::{
 };
 use kademlia_packet_manager_d7024e::rpc_transport::stream_framing::STREAM_DEADLINE;
 use kademlia_packet_manager_d7024e::{
-    bootstrap, hashing, instrumentation, logging, lookup, maintenance,
+    bootstrap, hashing, instrumentation, logging, lookup, maintenance, registry,
 };
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -68,6 +81,9 @@ const JOIN_BATCH: usize = 50;
 
 /// How big each stored value is.
 const VALUE_LEN: usize = 64;
+
+/// Where the op ids of publishes start, clear of the measured ops' 1, 2, ...
+const PUBLISH_OP_BASE: u64 = 10_000_000;
 
 /// The most latency the network is built and the values stored under. The
 /// requested `--latency-ms` only applies once measuring starts, so a latency
@@ -102,7 +118,23 @@ struct Config {
     /// instead of run `concurrency` at a time as fast as they finish.
     duration: Option<Duration>,
     rpc_events: RpcEvents,
+    workload: Workload,
+    /// Package workload: how many packages, versions of each, bytes per blob.
+    packages: usize,
+    versions: usize,
+    package_bytes: usize,
+    /// Publish under the measure phase's loss and latency instead of a clean
+    /// wire.
+    lossy_publish: bool,
     out: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Workload {
+    /// Store blobs, then measure value and node lookups.
+    Lookups,
+    /// Publish packages, then measure installs.
+    Packages,
 }
 
 impl Default for Config {
@@ -124,6 +156,11 @@ impl Default for Config {
             refresh: 0,
             duration: None,
             rpc_events: RpcEvents::Ops,
+            workload: Workload::Lookups,
+            packages: 20,
+            versions: 3,
+            package_bytes: 1024,
+            lossy_publish: false,
             out: PathBuf::from("experiment-out"),
         }
     }
@@ -133,7 +170,9 @@ const USAGE: &str = "\
 usage: experiment [--nodes N] [--seed S] [--loss P] [--latency-ms MS] [--alpha A]
                   [--lookups M] [--values V] [--churn PER_SEC] [--concurrency C]
                   [--threads T] [--liveness-secs S] [--republish-secs S] [--settle-secs S]
-                  [--refresh R] [--duration-secs S] [--rpc-events off|ops|all] [--out DIR]";
+                  [--refresh R] [--duration-secs S] [--rpc-events off|ops|all] [--out DIR]
+                  [--workload lookups|packages] [--packages P] [--versions V]
+                  [--package-bytes B] [--lossy-publish true|false]";
 
 fn parse_args() -> Result<Config, Box<dyn Error>> {
     let mut config = Config::default();
@@ -175,11 +214,27 @@ fn parse_args() -> Result<Config, Box<dyn Error>> {
             "--refresh" => config.refresh = value.parse()?,
             "--duration-secs" => config.duration = Some(Duration::from_secs_f64(value.parse()?)),
             "--out" => config.out = PathBuf::from(value),
+            "--workload" => {
+                config.workload = match value.as_str() {
+                    "lookups" => Workload::Lookups,
+                    "packages" => Workload::Packages,
+                    _ => {
+                        return Err(format!("--workload takes lookups or packages\n{USAGE}").into());
+                    }
+                }
+            }
+            "--packages" => config.packages = value.parse()?,
+            "--versions" => config.versions = value.parse()?,
+            "--package-bytes" => config.package_bytes = value.parse()?,
+            "--lossy-publish" => config.lossy_publish = value.parse()?,
             _ => return Err(format!("unknown flag {flag}\n{USAGE}").into()),
         }
     }
     if config.nodes < 2 {
         return Err("--nodes must be at least 2".into());
+    }
+    if config.workload == Workload::Packages && (config.packages == 0 || config.versions == 0) {
+        return Err("--packages and --versions must be at least 1".into());
     }
     Ok(config)
 }
@@ -358,6 +413,106 @@ impl Experiment {
         values
     }
 
+    /// Publish every package's versions in order, packages `concurrency` at a
+    /// time, each from one random node. Returns what was published, so an
+    /// install can be checked against it; a version whose publish failed is
+    /// left out.
+    async fn publish(&self, rng: &mut StdRng) -> Vec<Package> {
+        let work: Vec<(usize, Arc<FakeNode>, Vec<Vec<u8>>)> = (0..self.config.packages)
+            .map(|i| {
+                let blobs = (0..self.config.versions)
+                    .map(|_| {
+                        (0..self.config.package_bytes)
+                            .map(|_| rng.random())
+                            .collect()
+                    })
+                    .collect();
+                (i, self.nth(rng.random()), blobs)
+            })
+            .collect();
+        let published = Arc::new(Mutex::new(Vec::new()));
+        let publish_start = Instant::now();
+
+        run_concurrently(self.config.concurrency, work, |(i, origin, blobs)| {
+            let published = Arc::clone(&published);
+            async move {
+                let owner = &FAKE_KEYS[i % FAKE_KEYS.len()];
+                let signer = owner.signing_key().expect("fake keys are valid");
+                let mut package = Package {
+                    domain: owner.domain,
+                    name: format!("pkg{i}"),
+                    versions: Vec::new(),
+                };
+                for (j, blob) in blobs.into_iter().enumerate() {
+                    let version = Version {
+                        major: j as u32 + 1,
+                        minor: 0,
+                        patch: 0,
+                    };
+                    let op = PUBLISH_OP_BASE + (i * self.config.versions + j) as u64;
+                    let t_ms = publish_start.elapsed().as_millis();
+                    let started = Instant::now();
+                    let result = instrumentation::with_op(
+                        op,
+                        origin.scoped(registry::publish_package(
+                            origin.rpc(),
+                            origin.dns().as_ref(),
+                            package.domain,
+                            &package.name,
+                            version,
+                            blob.clone(),
+                            &signer,
+                            None,
+                            false,
+                        )),
+                    )
+                    .await;
+                    let took = started.elapsed();
+                    let acks = result.as_ref().map_or((0, 0, 0), |receipt| {
+                        (receipt.blob_accepted, receipt.record_accepted, receipt.latest_accepted)
+                    });
+                    metric!(
+                        "event=publish op={op} package={}:{} version={version} index={j} t_ms={t_ms} origin={} success={} error={} blob_acks={} record_acks={} latest_acks={} duration_us={}",
+                        package.domain,
+                        package.name,
+                        origin.address(),
+                        result.is_ok(),
+                        result.as_ref().err().map_or("none".to_string(), error_kind),
+                        acks.0,
+                        acks.1,
+                        acks.2,
+                        took.as_micros(),
+                    );
+                    if result.is_ok() {
+                        package.versions.push((version, blob));
+                    }
+                }
+                published.lock().unwrap().push((i, package));
+            }
+        })
+        .await;
+
+        let mut published = std::mem::take(&mut *published.lock().unwrap());
+        published.sort_by_key(|(i, _)| *i);
+        let packages: Vec<Package> = published.into_iter().map(|(_, package)| package).collect();
+
+        let nodes = self.snapshot();
+        for package in &packages {
+            let key = latest_key(package.domain, &package.name);
+            let closest = true_closest(&nodes, key);
+            metric!(
+                "event=package_stored package={}:{} versions={} of={} latest_holders={} closest_holders={}",
+                package.domain,
+                package.name,
+                package.versions.len(),
+                self.config.versions,
+                nodes.iter().filter(|node| node.holds(&key)).count(),
+                closest.iter().filter(|node| node.holds(&key)).count(),
+            );
+        }
+        packages
+    }
+
     /// Replace `churn` nodes per second until `done` says to stop.
     async fn churn(self: Arc<Self>, done: Arc<AtomicUsize>) {
         if self.config.churn <= 0.0 {
@@ -389,26 +544,44 @@ impl Experiment {
         }
     }
 
-    async fn measure(self: &Arc<Self>, rng: &mut StdRng, values: &[(Key, Vec<u8>)]) {
+    async fn measure(
+        self: &Arc<Self>,
+        rng: &mut StdRng,
+        values: &[(Key, Vec<u8>)],
+        packages: &[Package],
+    ) {
         // Drawn before anything runs: the same ops in the same order for a
         // seed, whatever churn and scheduling do to the timing.
-        let ops: Vec<Op> = (0..self.config.lookups * 2)
-            .map(|i| Op {
-                id: i as u64 + 1,
-                kind: if i % 2 == 0 {
-                    OpKind::Value
-                } else {
-                    OpKind::Node
-                },
-                origin: rng.random(),
-                target: rng.random(),
-            })
-            .collect();
+        let ops: Vec<Op> = match self.config.workload {
+            Workload::Lookups => (0..self.config.lookups * 2)
+                .map(|i| Op {
+                    id: i as u64 + 1,
+                    kind: if i % 2 == 0 {
+                        OpKind::Value
+                    } else {
+                        OpKind::Node
+                    },
+                    origin: rng.random(),
+                    target: rng.random(),
+                    extra: 0,
+                })
+                .collect(),
+            Workload::Packages => (0..self.config.lookups)
+                .map(|i| Op {
+                    id: i as u64 + 1,
+                    kind: OpKind::Install,
+                    origin: rng.random(),
+                    target: rng.random(),
+                    extra: rng.random(),
+                })
+                .collect(),
+        };
 
         let done = Arc::new(AtomicUsize::new(0));
         let churn = tokio::spawn(Arc::clone(self).churn(Arc::clone(&done)));
 
         let values = Arc::new(values.to_vec());
+        let packages = Arc::new(packages.to_vec());
         let started = Instant::now();
         match self.config.duration {
             None => {
@@ -416,7 +589,8 @@ impl Experiment {
                 run_concurrently(self.config.concurrency, ops, move |op| {
                     let this = Arc::clone(&this);
                     let values = Arc::clone(&values);
-                    async move { this.run_op(op, &values, started).await }
+                    let packages = Arc::clone(&packages);
+                    async move { this.run_op(op, &values, &packages, started).await }
                 })
                 .await;
             }
@@ -429,8 +603,9 @@ impl Experiment {
                     tokio::time::sleep_until((started + gap * i as u32).into()).await;
                     let this = Arc::clone(self);
                     let values = Arc::clone(&values);
+                    let packages = Arc::clone(&packages);
                     running.push(tokio::spawn(async move {
-                        this.run_op(op, &values, started).await
+                        this.run_op(op, &values, &packages, started).await
                     }));
                 }
                 futures::future::join_all(running).await;
@@ -443,10 +618,85 @@ impl Experiment {
 
     /// Run one lookup and log how it went; `t_ms` is when it started,
     /// counted from `measure_start`.
-    async fn run_op(&self, op: Op, values: &[(Key, Vec<u8>)], measure_start: Instant) {
+    async fn run_op(
+        &self,
+        op: Op,
+        values: &[(Key, Vec<u8>)],
+        packages: &[Package],
+        measure_start: Instant,
+    ) {
         let t_ms = measure_start.elapsed().as_millis();
         let origin = self.nth(op.origin);
         match op.kind {
+            OpKind::Install => {
+                let package = &packages[(op.target % packages.len() as u64) as usize];
+                let Some(&(newest, _)) = package.versions.last() else {
+                    metric!(
+                        "event=op op={} kind=install t_ms={} package={}:{} skipped=unpublished",
+                        op.id,
+                        t_ms,
+                        package.domain,
+                        package.name
+                    );
+                    return;
+                };
+                // Half the installs ask for the latest version, half for a
+                // random published one (which may be the latest too).
+                let requested = (op.extra % 2 == 1).then(|| {
+                    package.versions[((op.extra / 2) % package.versions.len() as u64) as usize].0
+                });
+                let expected = requested.unwrap_or(newest);
+                let key = latest_key(package.domain, &package.name);
+                let holders = self
+                    .snapshot()
+                    .iter()
+                    .filter(|node| node.holds(&key))
+                    .count();
+                let started = Instant::now();
+                let result = instrumentation::with_op(
+                    op.id,
+                    origin.scoped(registry::install_package(
+                        origin.rpc(),
+                        origin.dns().as_ref(),
+                        package.domain,
+                        &package.name,
+                        requested,
+                    )),
+                )
+                .await;
+                let took = started.elapsed();
+                let (got, correct) = match &result {
+                    Ok(installed) => {
+                        let right_bytes = package
+                            .versions
+                            .iter()
+                            .any(|(v, blob)| *v == installed.version && *blob == installed.blob);
+                        (
+                            Some(installed.version),
+                            right_bytes && installed.version == expected,
+                        )
+                    }
+                    Err(_) => (None, false),
+                };
+                metric!(
+                    "event=op op={} kind=install t_ms={} origin={} package={}:{} chain={} requested={} expected={} got={} success={} correct={} stale={} error={} latest_holders={} duration_us={}",
+                    op.id,
+                    t_ms,
+                    origin.address(),
+                    package.domain,
+                    package.name,
+                    package.versions.len(),
+                    requested.map_or("latest".to_string(), |v| v.to_string()),
+                    expected,
+                    got.map_or("none".to_string(), |v| v.to_string()),
+                    result.is_ok(),
+                    correct,
+                    requested.is_none() && got.is_some_and(|v| v < newest),
+                    result.as_ref().err().map_or("none".to_string(), error_kind),
+                    holders,
+                    took.as_micros(),
+                );
+            }
             OpKind::Value => {
                 let (key, value) = &values[(op.target % values.len() as u64) as usize];
                 let nodes = self.snapshot();
@@ -506,6 +756,30 @@ impl Experiment {
 enum OpKind {
     Value,
     Node,
+    Install,
+}
+
+/// A package the publish phase put in the network, with every version whose
+/// publish succeeded, oldest first.
+#[derive(Clone)]
+struct Package {
+    domain: &'static str,
+    name: String,
+    versions: Vec<(Version, Vec<u8>)>,
+}
+
+/// An error's variant names, outermost first and dot-joined, without the
+/// payload: `InvalidHistory(MissingRecord([1, 2, ..]))` is
+/// `InvalidHistory.MissingRecord`, one token for a `key=value` line.
+fn error_kind(error: impl std::fmt::Debug) -> String {
+    format!("{error:?}")
+        .split('(')
+        .map(|part| part.trim_end_matches(')'))
+        .take_while(|part| {
+            !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 #[derive(Clone, Copy)]
@@ -516,6 +790,8 @@ struct Op {
     kind: OpKind,
     origin: u64,
     target: u64,
+    /// Install ops: which version to ask for.
+    extra: u64,
 }
 
 /// A random address in 10.0.0.0/8 on a non-privileged port.
@@ -564,7 +840,7 @@ async fn run(config: Config) {
     });
 
     metric!(
-        "event=run_config nodes={} seed={} loss={} latency_ms={} alpha={} k={} lookups={} values={} churn={} concurrency={} threads={} liveness_s={} republish_s={} refresh={} duration_s={} setup_latency_ms={} resend_ms={} max_attempts={} stream_deadline_ms={}",
+        "event=run_config nodes={} seed={} loss={} latency_ms={} alpha={} k={} lookups={} values={} churn={} concurrency={} threads={} liveness_s={} republish_s={} refresh={} duration_s={} setup_latency_ms={} resend_ms={} max_attempts={} stream_deadline_ms={} workload={:?} packages={} versions={} package_bytes={} lossy_publish={}",
         config.nodes,
         config.seed,
         config.loss,
@@ -584,6 +860,11 @@ async fn run(config: Config) {
         RESEND_INTERVAL.as_millis(),
         MAX_ATTEMPTS,
         STREAM_DEADLINE.as_millis(),
+        config.workload,
+        config.packages,
+        config.versions,
+        config.package_bytes,
+        config.lossy_publish,
     );
 
     let experiment = Arc::new(Experiment {
@@ -627,14 +908,30 @@ async fn run(config: Config) {
         tables.iter().max().unwrap(),
     );
 
-    experiment.phase("store");
-    let values = experiment.store(&mut work_rng).await;
+    let (values, packages) = match config.workload {
+        Workload::Lookups => {
+            experiment.phase("store");
+            (experiment.store(&mut work_rng).await, Vec::new())
+        }
+        Workload::Packages => {
+            if config.lossy_publish {
+                experiment.network.set_loss(config.loss);
+                experiment.network.set_latency(config.latency);
+            }
+            // Publishes are measured too, under op ids of their own.
+            instrumentation::set_rpc_events(config.rpc_events);
+            experiment.phase("publish");
+            let packages = experiment.publish(&mut work_rng).await;
+            instrumentation::set_rpc_events(RpcEvents::Off);
+            (Vec::new(), packages)
+        }
+    };
 
     experiment.network.set_loss(config.loss);
     experiment.network.set_latency(config.latency);
     instrumentation::set_rpc_events(config.rpc_events);
     experiment.phase("measure");
-    experiment.measure(&mut work_rng, &values).await;
+    experiment.measure(&mut work_rng, &values, &packages).await;
     instrumentation::set_rpc_events(RpcEvents::Off);
     experiment.phase("done");
 }

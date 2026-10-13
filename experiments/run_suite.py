@@ -15,6 +15,7 @@ started again with the same command: finished runs are skipped.
     python3 experiments/run_suite.py                    # everything
     python3 experiments/run_suite.py --only loss,alpha  # some experiments
     python3 experiments/run_suite.py --suite quick      # a few minutes, for a smoke test
+    python3 experiments/run_suite.py --suite packages   # part 2: publish and install
 
 Runs are started largest first and only while the estimated memory of what
 is running stays under --mem-budget-mb (about 0.26 MB per node), so a 16k
@@ -60,6 +61,21 @@ DEFAULT_NODES = 5000
 
 # Network sizes for the heatmaps that put N on an axis: doubling from 250.
 HEAT_SIZES = [250, 500, 1000, 2000, 4000, 8000, 16000]
+
+# The package workload (--suite packages): instead of blobs and lookups, publish
+# packages and measure installs. An install is several lookups in a row (the
+# latest pointer, one per version record in the chain, then the blob), so
+# these runs are smaller than the lookup ones.
+PACKAGES = {
+    "workload": "packages",
+    "packages": 20,
+    "versions": 5,
+    "package-bytes": 1024,
+    "lossy-publish": "false",
+    "lookups": 500,          # installs
+    "values": 0,
+}
+PKG_NODES = 1000
 
 
 @dataclass
@@ -113,6 +129,8 @@ class Run:
     def seconds(self) -> float:
         """A rough guess, for ordering and for the --dry-run estimate."""
         p = self.params
+        if p.get("workload") == "packages":
+            return self.package_seconds()
         # Measured: each join refreshes ~log2(N) buckets, 106 s for 5000 nodes.
         build = 0.0018 * p["nodes"] * math.log2(max(2, p["nodes"]))
         build += 0.01 * p["nodes"] * p["refresh"] / max(1, p["concurrency"])
@@ -128,6 +146,29 @@ class Run:
             measure = 2 * p["lookups"] * per_lookup / p["concurrency"]
         return 5 + build + p["settle-secs"] + measure
 
+    @staticmethod
+    def per_lookup(loss: float, latency_ms: float, alpha: int) -> float:
+        q = (1 - loss) ** 2
+        sends = (1 - (1 - q) ** 5) / q if q > 0 else 5
+        per_probe = min(1.0, 2 * latency_ms / 1000 + 0.2 * (sends - 1)) + 0.002
+        return 2 * (15 / alpha + 1) * per_probe  # a node lookup, then the value probes
+
+    def package_seconds(self) -> float:
+        p = self.params
+        build = 0.0018 * p["nodes"] * math.log2(max(2, p["nodes"]))
+        clean = self.per_lookup(0.0, min(5, p["latency-ms"]), p["alpha"])
+        measured = self.per_lookup(p["loss"], p["latency-ms"], p["alpha"])
+        v = p["versions"]
+        # Publishing version j walks the j - 1 before it, then stores 3 values.
+        per_publish = clean if p["lossy-publish"] == "false" else measured
+        publish = p["packages"] * sum(j + 4 for j in range(1, v + 1)) * per_publish
+        publish /= min(p["concurrency"], p["packages"])
+        if "duration-secs" in p:
+            measure = p["duration-secs"] + 10
+        else:
+            measure = p["lookups"] * (v + 3) * measured / p["concurrency"]
+        return 5 + build + p["settle-secs"] + publish + measure
+
     def command(self, threads: int, out: Path) -> list:
         args = [str(BINARY), "--seed", str(self.seed), "--threads", str(threads), "--out", str(out)]
         for flag, value in self.params.items():
@@ -135,7 +176,77 @@ class Run:
         return args
 
 
+def package_experiments(quick: bool):
+    if quick:
+        return [
+            Experiment("pkg_scalability", "install cost vs N", {"nodes": [64, 256]}, 1,
+                       {**PACKAGES, "lookups": 50}),
+            Experiment("pkg_chain", "install cost vs chain", {"versions": [1, 4]}, 1,
+                       {**PACKAGES, "nodes": 200, "packages": 5, "lookups": 50}),
+            Experiment("pkg_loss", "install success vs loss", {"loss": [0.0, 0.5]}, 1,
+                       {**PACKAGES, "nodes": 200, "lookups": 50}),
+            Experiment("pkg_churn", "installs under churn", {"churn": [0, 5], "republish-secs": [15, 3600]}, 1,
+                       {**PACKAGES, "nodes": 200, "lookups": 100, "duration-secs": 30, "liveness-secs": 10}),
+        ]
+    return [
+        # ---- Install cost as the network grows ----------------------------
+        # 20 packages x 5 versions; 500 installs, half latest, half a random
+        # published version.
+        Experiment("pkg_scalability", "Install and publish cost as a function of N",
+                   {"nodes": [64, 128, 256, 512, 1024, 2048, 4096, 8192]}, 6, PACKAGES),
+
+        # ---- Install cost vs length of the version chain ------------------
+        # Every install walks the whole chain from the latest pointer, and
+        # publishing version j first walks the j - 1 before it.
+        Experiment("pkg_chain", "Install and publish cost vs number of versions",
+                   {"versions": [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64]}, 5,
+                   {**PACKAGES, "nodes": PKG_NODES, "packages": 10, "lookups": 300}),
+
+        # ---- Install reliability vs loss (published on a clean wire) ------
+        Experiment("pkg_loss", "Install success as a function of packet loss",
+                   {"loss": [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]}, 6,
+                   {**PACKAGES, "nodes": PKG_NODES}),
+
+        # ---- Publish reliability vs loss ----------------------------------
+        # Publishing itself under loss: how many replicas acknowledge, and
+        # whether the publish goes through at all.
+        Experiment("pkg_publish_loss", "Publish success and replication vs packet loss",
+                   {"loss": [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]}, 5,
+                   {**PACKAGES, "nodes": PKG_NODES, "packages": 40, "versions": 3, "lookups": 100,
+                    "lossy-publish": "true"}),
+
+        # ---- Install time vs latency --------------------------------------
+        Experiment("pkg_latency", "Install time vs one-way latency",
+                   {"latency-ms": [0, 5, 20, 50, 100, 200, 300, 400, 500, 600], "loss": [0.0, 0.3]}, 3,
+                   {**PACKAGES, "nodes": PKG_NODES, "lookups": 300}),
+
+        # ---- Package availability under churn -----------------------------
+        # 5 minutes each, liveness every 10 s; republishing off (1 h) or on.
+        # 20 nodes/s turns the whole 1000-node network over in 50 s.
+        Experiment("pkg_churn", "Install success under churn, with and without republishing",
+                   {"churn": [0, 1, 2, 5, 10, 20], "republish-secs": [3600, 60, 15]}, 3,
+                   {**PACKAGES, "nodes": PKG_NODES, "lookups": 600, "duration-secs": 300,
+                    "liveness-secs": 10}),
+
+        # ---- Package size -------------------------------------------------
+        Experiment("pkg_size", "Install time vs package size",
+                   {"package-bytes": [256, 1024, 4096, 16384, 65536, 262144]}, 3,
+                   {**PACKAGES, "nodes": PKG_NODES, "packages": 10, "versions": 3, "lookups": 300}),
+
+        # ---- Heatmaps -----------------------------------------------------
+        Experiment("heat_pkg_chain_loss", "Install success and time over chain length and loss",
+                   {"versions": [1, 2, 4, 8, 16, 32], "loss": [0.0, 0.2, 0.4, 0.6, 0.8]}, 3,
+                   {**PACKAGES, "nodes": PKG_NODES, "packages": 10, "lookups": 300}),
+        Experiment("heat_pkg_churn_chain", "Install success over churn and chain length",
+                   {"churn": [0, 2, 5, 10, 20], "versions": [1, 3, 8, 16]}, 2,
+                   {**PACKAGES, "nodes": PKG_NODES, "packages": 10, "lookups": 600, "duration-secs": 300,
+                    "liveness-secs": 10, "republish-secs": 60}),
+    ]
+
+
 def experiments(suite: str):
+    if suite in ("packages", "packages-quick"):
+        return package_experiments(suite == "packages-quick")
     if suite == "quick":
         # A few minutes in all: every code path, tiny networks.
         return [
@@ -258,7 +369,7 @@ def finish(run: Run, directory: Path, code: int, took: float):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--suite", choices=["full", "quick"], default="full")
+    parser.add_argument("--suite", choices=["full", "quick", "packages", "packages-quick"], default="full")
     parser.add_argument("--only", help="comma-separated experiment names")
     parser.add_argument("--jobs", type=int, default=8, help="runs at once, memory allowing (default 8)")
     parser.add_argument("--threads", type=int, default=2, help="tokio worker threads per run (default 2)")
