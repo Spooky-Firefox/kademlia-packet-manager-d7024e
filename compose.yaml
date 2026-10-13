@@ -12,7 +12,7 @@ services:
       - dns
     <<: *common #reuses common
     build: . # build the seed, calls it kademlia
-    command: sh -c 'exec kademlia "$$(hostname -i):4000"'
+    command: sh -c 'exec kademlia --fake-dns "$$(hostname -i):4000"'
     networks:
       kademlia:
         ipv4_address: 172.28.0.10 #fixed ip outside ip range
@@ -20,7 +20,7 @@ services:
   node: 
     <<: *common
     # replaces shell with node and bootstraps from seed
-    command: sh -c 'sleep $$(shuf -i 0-5 -n 1) && exec kademlia "$$(hostname -i):4000" 172.28.0.10:4000'
+    command: sh -c 'sleep $$(shuf -i 0-5 -n 1) && exec kademlia --fake-dns "$$(hostname -i):4000" 172.28.0.10:4000'
     depends_on:
       - seed
       - dns
@@ -40,7 +40,7 @@ services:
 
   publisher:
     <<: *common
-    command: sh -c 'exec kademlia "$$(hostname -i):4000" 172.28.0.10:4000'
+    command: sh -c 'exec kademlia --fake-dns "$$(hostname -i):4000" 172.28.0.10:4000'
     depends_on:
       - seed
       - dns
