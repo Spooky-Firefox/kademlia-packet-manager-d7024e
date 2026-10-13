@@ -1,5 +1,6 @@
 use crate::close_nodes::{CloseNodes, Contact, K, Key, NodeId};
 use crate::handle_rpc::Method;
+use crate::package::{Signed, VersionRecord};
 use crate::rpc_transport::RpcTransport;
 use crate::value::Value;
 use log::trace;
@@ -168,11 +169,23 @@ impl<T: RpcTransport, U: RpcTransport, A: CloseNodes> Rpc<T, U, A> {
     }
 
     /// Ask `peer` to store `value` under `key`.
+
     pub async fn store(&self, peer: &Contact, key: Key, value: Value) -> bool {
-        // NOTE lab spec allows for tcp transport of values, not forcing udp only
-        let Some(body) = crate::handle_rpc::store::encode_request(key, value) else {
+        self.store_with_proof(peer, key, value, Vec::new()).await
+    }
+
+    pub(crate) async fn store_with_proof(
+        &self,
+        peer: &Contact,
+        key: Key,
+        value: Value,
+        proof: Vec<Signed<VersionRecord>>,
+    ) -> bool {
+        let Some(body) = crate::handle_rpc::store::encode_request_with_proof(key, value, proof)
+        else {
             return false;
         };
+
         let reply = self
             .call(
                 &self.robust_transport,
@@ -183,7 +196,11 @@ impl<T: RpcTransport, U: RpcTransport, A: CloseNodes> Rpc<T, U, A> {
             )
             .await;
 
-        matches!(reply, Some(bytes) if bytes == crate::handle_rpc::store::STORED)
+        matches!(
+            reply,
+            Some(bytes)
+                if bytes == crate::handle_rpc::store::STORED
+        )
     }
 
     /// Ask `peer` for the contacts it knows closest to `target`.

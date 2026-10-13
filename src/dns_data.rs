@@ -13,6 +13,20 @@ pub trait DnsData: Send + Sync {
     fn get_dns_vk(&self, domain: &str) -> impl Future<Output = Option<VerifyingKey>> + Send;
 }
 
+pub enum DnsBackend {
+    Real(dns::Dns),
+    Fake(fake_dns::FakeDns),
+}
+
+impl DnsData for DnsBackend {
+    async fn get_dns_vk(&self, domain: &str) -> Option<VerifyingKey> {
+        match self {
+            DnsBackend::Real(dns) => dns.get_dns_vk(domain).await,
+            DnsBackend::Fake(dns) => dns.get_dns_vk(domain).await,
+        }
+    }
+}
+
 impl<T: DnsData> DnsData for std::sync::Arc<T> {
     fn get_dns_vk(&self, domain: &str) -> impl Future<Output = Option<VerifyingKey>> + Send {
         self.as_ref().get_dns_vk(domain)

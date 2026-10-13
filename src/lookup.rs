@@ -1,7 +1,7 @@
 use crate::close_nodes::{CloseNodes, Contact, K, Key, NodeId, xor_distance_cmp};
 use crate::dns_data::DnsData;
 use crate::hashing::key_for_value;
-use crate::package::{LatestPointer, Signed, latest_is_valid, latest_key};
+use crate::package::{LatestPointer, Signed, VersionRecord, latest_is_valid, latest_key};
 use crate::rpc::{FindValue, Rpc};
 use crate::rpc_transport::RpcTransport;
 use crate::value::Value;
@@ -240,27 +240,50 @@ where
     U: RpcTransport,
     A: CloseNodes,
 {
+    store_value_with_proof(rpc, value, &[]).await.0
+}
+
+/// Replicate a value to the K closest nodes, optionally including
+/// a signed version history required for latest pointers.
+///
+/// Returns the value's key and how many nodes acknowledged STORE.
+pub(crate) async fn store_value_with_proof<T, U, A>(
+    rpc: &Rpc<T, U, A>,
+    value: Value,
+    proof: &[Signed<VersionRecord>],
+) -> (Key, usize)
+where
+    T: RpcTransport,
+    U: RpcTransport,
+    A: CloseNodes,
+{
     let key = value.key();
 
-    // Find the nodes closest to the key.
+    // Find the K closest nodes to this key.
     let mut targets = lookup_node(rpc, key).await;
 
-    // Our routing table does not contain ourselves, but we may still
-    // be one of the K closest nodes to this key.
+    // Include ourselves as a possible storage target.
     targets.push(rpc.my_contact());
 
-    // Select the actual K closest nodes, including ourselves.
     targets.sort_by(|a, b| xor_distance_cmp(a.id, b.id, key));
     targets.dedup_by_key(|contact| contact.id);
     targets.truncate(K);
 
-    // Replicate the value to each of the K closest nodes.
+    // Count how many nodes actually accepted the value.
+    let mut accepted = 0;
+
     for target in targets {
-        rpc.store(&target, key, value.clone()).await;
+        if rpc
+            .store_with_proof(&target, key, value.clone(), proof.to_vec())
+            .await
+        {
+            accepted += 1;
+        }
     }
 
-    key
+    (key, accepted)
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;

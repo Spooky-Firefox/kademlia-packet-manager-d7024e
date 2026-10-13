@@ -1,7 +1,7 @@
 use crate::close_nodes::{Contact, Key, NodeId, RecommendedCloseNodes, recommended};
-use crate::dns_data::DnsData;
 use crate::dns_data::dns::Dns;
 use crate::dns_data::fake_dns::FakeDns;
+use crate::dns_data::{DnsBackend, DnsData};
 use crate::handle_rpc::{self, Context};
 use crate::hashing::node_id_from_address;
 use crate::maintenance;
@@ -35,7 +35,7 @@ where
     context: Arc<Context<Arc<RecommendedCloseNodes>, Arc<D>>>,
     _server_tasks: Vec<JoinHandle<()>>,
 }
-pub type RealNode = Node<UdpTransport, TcpTransport, Dns>;
+pub type RealNode = Node<UdpTransport, TcpTransport, DnsBackend>;
 pub type FakeNode = Node<NetworkedDebugTransport, NetworkedStreamTransport, FakeDns>;
 
 impl<T, U, D> Node<T, U, D>
@@ -77,12 +77,12 @@ where
         (siblings, buckets)
     }
 
-    pub fn datastore_snapshot(&self) -> Vec<(Key, usize)> {
+    pub fn datastore_snapshot(&self) -> Vec<(Key, Value)> {
         let mut values: Vec<_> = self
             .context
             .values
             .iter()
-            .map(|entry| (*entry.key(), entry.value().len()))
+            .map(|entry| (*entry.key(), entry.value().clone()))
             .collect();
 
         values.sort_by_key(|(key, _)| *key);
@@ -123,7 +123,7 @@ where
                     .map(|entry| (*entry.key(), entry.value().clone()))
                     .collect();
 
-                maintenance::republish_values(&rpc, values).await;
+                maintenance::republish_values(&rpc, context.dns.as_ref(), values).await;
             }
         });
     }
@@ -131,6 +131,11 @@ where
 
 impl RealNode {
     pub async fn bind(bind_address: SocketAddr) -> io::Result<Self> {
+        Self::bind_with_dns(bind_address, DnsBackend::Real(Dns::new())).await // create node using real DNS by default
+    }
+
+    pub async fn bind_with_dns(bind_address: SocketAddr, dns: DnsBackend) -> io::Result<Self> {
+        // create node using passed DNS
         let udp_socket = UdpSocket::bind(bind_address).await?;
         let address = udp_socket.local_addr()?;
 
@@ -140,7 +145,7 @@ impl RealNode {
 
         let routing = Arc::new(recommended(id));
 
-        let context = Context::new(id, Arc::clone(&routing), Arc::new(Dns::new()));
+        let context = Context::new(id, Arc::clone(&routing), Arc::new(dns));
 
         let (request_tx, request_rx) = mpsc::channel(64);
 
@@ -169,6 +174,7 @@ impl RealNode {
         })
     }
 }
+
 impl FakeNode {
     pub fn new(network: &Network) -> Self {
         let endpoint = network.bind_any();
@@ -436,15 +442,21 @@ mod tests {
     /// A package's latest pointer, end to end over the fake network: a
     /// forged one is refused by every node, the owner's is stored, and a
     /// reader on another node finds it through its DNS record.
+
     #[tokio::test]
     async fn latest_pointer_round_trips_and_forgery_is_refused() {
         use crate::dns_data::fake_dns::FAKE_KEYS;
-        use crate::value::signed_latest;
+        use crate::package::{
+            LATEST_POINTER_TAG, LatestPointer, VERSION_RECORD_TAG, VersionRecord, record_key, sign,
+        };
 
         let network = Network::new();
+
         let a = FakeNode::new(&network);
         let b = FakeNode::new(&network);
         let c = FakeNode::new(&network);
+
+        // Let the nodes discover each other.
         assert_eq!(b.rpc().ping(a.address()).await, Some(a.id()));
         assert_eq!(c.rpc().ping(b.address()).await, Some(b.id()));
 
@@ -452,16 +464,69 @@ mod tests {
         let owner = FAKE_KEYS[0].signing_key().unwrap();
         let imposter = FAKE_KEYS[1].signing_key().unwrap();
 
-        let forged = signed_latest(domain, "pkg", "9.0.0", &imposter);
-        let key = crate::lookup::store_value(a.rpc(), Value::Latest(forged)).await;
+        // Helper: create a signed first publication.
+        let publication = |signer: &ed25519_dalek::SigningKey, version: &str| {
+            let record = sign(
+                VersionRecord {
+                    tag: VERSION_RECORD_TAG.to_string(),
+                    domain: domain.to_string(),
+                    package: "pkg".to_string(),
+                    version: version.parse().unwrap(),
+                    blob_hash: [7; 32],
+                    prev: [0; 32],
+                },
+                signer,
+            )
+            .unwrap();
+
+            let pointer = sign(
+                LatestPointer {
+                    tag: LATEST_POINTER_TAG.to_string(),
+                    domain: domain.to_string(),
+                    package: "pkg".to_string(),
+                    version: record.body.version,
+                    version_record_hash: record_key(&record).unwrap(),
+                },
+                signer,
+            )
+            .unwrap();
+
+            (pointer, vec![record])
+        };
+
+        // Attempt 1: a forged publication.
+        let (forged, forged_proof) = publication(&imposter, "9.0.0");
+
+        let (key, accepted) =
+            crate::lookup::store_value_with_proof(a.rpc(), Value::Latest(forged), &forged_proof)
+                .await;
+
+        // Nobody should accept the impostor's publication.
+        assert_eq!(accepted, 0);
+
         for node in [&a, &b, &c] {
             assert!(node.context.values.get(&key).is_none(), "forgery stored");
         }
 
-        let genuine = signed_latest(domain, "pkg", "1.0.0", &owner);
-        crate::lookup::store_value(a.rpc(), Value::Latest(genuine.clone())).await;
+        // Attempt 2: a real publication by the domain owner.
+        let (genuine, genuine_proof) = publication(&owner, "1.0.0");
 
+        let (genuine_key, accepted) = crate::lookup::store_value_with_proof(
+            a.rpc(),
+            Value::Latest(genuine.clone()),
+            &genuine_proof,
+        )
+        .await;
+
+        // The key is based on domain + package, not version.
+        assert_eq!(genuine_key, key);
+
+        // At least one node must acknowledge the publication.
+        assert!(accepted > 0, "no node accepted the publication");
+
+        // Node C should now find the genuine latest pointer.
         let found = crate::lookup::get_latest(c.rpc(), c.dns(), domain, "pkg").await;
+
         assert_eq!(found, Some(genuine));
     }
 }
