@@ -23,8 +23,8 @@ impl DnsData for Dns {
     /// Returns the first TXT record on `domain` that parses as a verifying key.
     async fn get_dns_vk(&self, domain: &str) -> Option<VerifyingKey> {
         let name: Name<Vec<u8>> = Name::from_str(domain).ok()?;
-        let response = self.resolver.query((name, Rtype::TXT)).await.ok()?;
-
+        //let response = self.resolver.query((name, Rtype::TXT)).await.ok()?;
+        let response = StubResolver::new().query((name, Rtype::TXT)).await.ok()?;
         response
             .answer()
             .ok()?
