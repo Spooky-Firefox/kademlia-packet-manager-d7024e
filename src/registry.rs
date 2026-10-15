@@ -188,10 +188,12 @@ where
     D: DnsData,
 {
     // verify signing key belongs to domain
-    let owner = dns.get_dns_vk(domain).await.ok_or(PublishError::NoDnsKey)?;
+    if !force {
+        let owner = dns.get_dns_vk(domain).await.ok_or(PublishError::NoDnsKey)?;
 
-    if signer.verifying_key() != owner {
-        return Err(PublishError::WrongSigningKey);
+        if signer.verifying_key() != owner {
+            return Err(PublishError::WrongSigningKey);
+        }
     }
 
     // get currently published latest pointer
